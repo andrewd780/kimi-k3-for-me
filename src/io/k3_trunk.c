@@ -19,6 +19,7 @@
 #include "json.h"
 #include "k3_st.h"
 #include "k3_trunk.h"
+#include "k3_zfile.h"
 
 static int k3_alloc_direct(void **out, size_t bytes);   /* defined below */
 
@@ -40,7 +41,8 @@ static void *trunk_io_main(void *arg);
 /* WHERE THE TIME IN A BIND ACTUALLY GOES.
  *
  * k3_trunk_report divides bytes_read by load_seconds, but load_seconds brackets ONLY the
- * pread loop. It therefore reports a DEVICE rate, and everything else the bind does --
+ * read loop. For ordinary files it reports a DEVICE rate; compressed files include
+ * decoding and report logical bytes per second. Everything else the bind does --
  * widening bf16 tensors to fp32, resolving names, kernel page bookkeeping -- is invisible
  * to it while still being paid on every layer of every token. That residual is large
  * enough to change conclusions drawn from the device rate alone.
@@ -163,6 +165,21 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     if (tr->fd < 0) {
         tr->direct = 0;
         tr->fd = open(p, O_RDONLY);
+    }
+    /* Capture immediately. errno is process-global, so any call inserted between the
+     * open above and this test would silently disable compressed-trunk support: the
+     * user would see "cannot open trunk.bin" with trunk.bin.k3z sitting next to it. */
+    const int open_err = tr->fd < 0 ? errno : 0;
+    if (tr->fd < 0 && open_err == ENOENT) {
+        snprintf(p, sizeof p, "%s/trunk.bin.k3z", dir);
+        tr->fd = open(p, O_RDONLY);
+        if (tr->fd >= 0 && k3_zopen(tr->fd, &tr->zfile)) {
+            /* The archive opened but its index is unusable. k3_zopen already said why;
+             * close here because a caller that gets -1 need not call k3_trunk_close. */
+            close(tr->fd);
+            tr->fd = -1;
+            return -1;
+        }
     }
     if (tr->fd < 0) { fprintf(stderr, "k3_trunk: cannot open %s\n", p); return -1; }
     {
@@ -345,6 +362,7 @@ void k3_trunk_close(K3Trunk *tr)
         free(io);
     }
     if (tr->fd >= 0) close(tr->fd);
+    k3_zfree(tr->zfile);
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) k3_aligned_free(tr->pin[i]); free(tr->pin); }
     k3_aligned_free(tr->arena); free(tr->layer_of); free(tr->slot_of);
     if (tr->lay) { for (int i = 0; i < tr->n_layers; i++) free(tr->lay[i].t); free(tr->lay); }
@@ -413,8 +431,10 @@ static int load_run(K3Trunk *tr, int L, unsigned char *dst)
         while (got < len) {
             int64_t want = len - got;
             if (want > K3_PREAD_MAX) want = K3_PREAD_MAX;
-            ssize_t r = pread(tr->fd, dst + base + got, (size_t)want,
-                              (off_t)(lay->file_off + base + got));
+            int64_t r = tr->zfile
+                ? k3_zread(tr->zfile, dst + base + got, want, lay->file_off + base + got)
+                : pread(tr->fd, dst + base + got, (size_t)want,
+                        (off_t)(lay->file_off + base + got));
             if (r <= 0) { failed = 1; break; }
             got += r;
         }

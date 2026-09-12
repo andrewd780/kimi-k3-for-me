@@ -143,12 +143,28 @@ LDFLAGS  ?= -lm $(OMP_LDFLAGS) -pthread
 INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
             -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer
 
+# Optional native offline decompression. Use a separate BUILD/BIN when switching
+# options: make does not track changes to command-line compiler flags.
+ifeq ($(ZSTD),1)
+  ifeq ($(UNAME_S),Darwin)
+    ZSTD_PREFIX := $(shell brew --prefix zstd 2>/dev/null)
+    ZSTD_CFLAGS ?= -I$(ZSTD_PREFIX)/include
+    ZSTD_LIBS ?= -L$(ZSTD_PREFIX)/lib -lzstd
+  else
+    ZSTD_CFLAGS ?=
+    ZSTD_LIBS ?= -lzstd
+  endif
+  INCLUDES += -DK3_WITH_ZSTD $(ZSTD_CFLAGS)
+  override LDFLAGS += $(ZSTD_LIBS)
+endif
+
 # ----------------------------------------------------------------------------- files --
 ENGINE_SRC := src/core/k3_ops.c \
               src/io/k3_st.c src/io/k3_load.c src/io/k3_trunk.c \
               src/cache/k3_cache.c \
               src/model/k3_bind.c
 ENGINE_OBJ := $(patsubst %.c,$(BUILD)/%.o,$(ENGINE_SRC))
+ENGINE_HEADERS := $(wildcard include/*.h include/k3/*.h third_party/*.h src/*/*.h)
 
 CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
@@ -174,7 +190,7 @@ TOK_FILES  ?= $(HOME)/k3model
 
 all: $(CLI_BIN)
 
-$(BUILD)/%.o: %.c
+$(BUILD)/%.o: %.c $(ENGINE_HEADERS) Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 

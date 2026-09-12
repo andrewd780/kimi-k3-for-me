@@ -1,3 +1,12 @@
+> **This fork: offline lossless compression and prompt rereading (experimental).**
+> `make ZSTD=1` enables native C reads from compressed weights, decoding only needed
+> blocks with no network or Python process during inference. `--reread-prompt`
+> processes the prompt twice before generating. **[Setup: offline storage](docs/OFFLINE_STORAGE.md).**
+> **This does not get the full model below 1 TB:** real samples saved 5.7% on packed
+> expert weights and 29.1% on dense BF16 weights. Full-model speed is unmeasured.
+> The earlier [bounded remote cache](docs/REMOTE_STORAGE.md) needs internet on misses.
+> The upstream measurements below describe the original full local checkpoint.
+
 <div align="center">
 
 <h1>kimi-k3-in-c</h1>

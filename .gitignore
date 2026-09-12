@@ -10,6 +10,8 @@ compile_commands.json
 # Model weights and derived data. Hundreds of gigabytes; never commit these.
 # The patterns are broad on purpose; test fixtures are re-included at the bottom.
 *.safetensors
+*.k3z
+*.k3z.part
 trunk.bin
 trunk.json
 k3model/

@@ -1,0 +1,31 @@
+name: Remote storage
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref, a push to a busy PR should not queue builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+jobs:
+  range-storage:
+    name: Range storage (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compile C readers and exercise HTTP/cache failures and parity
+        run: python3 -m unittest discover -s tests -p test_remote_storage.py -v
+      - name: Probe pinned public model header and 4 KiB payload
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 3
+        run: python3 tools/probe_remote_source.py
