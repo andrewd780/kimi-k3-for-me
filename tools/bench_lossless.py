@@ -61,7 +61,9 @@ def main():
     revision = info["sha"]
     names = sorted(x["rfilename"] for x in info["siblings"]
                    if x["rfilename"].endswith(".safetensors"))
-    chosen = sorted({min(i, len(names) - 1) for i in (1, 12, 24, 36, 48, 60, 72, 94)})
+    if not names:
+        raise ValueError("model has no safetensors shards")
+    chosen = sorted({min(i, len(names) - 1) for i in (1, 12, 24, 36, 48, 60, 72, 92)})
     zstd = Zstd()
     results = []
     for index in chosen:
@@ -78,7 +80,8 @@ def main():
         dense = sorted(k for k, v in header.items() if k != "__metadata__"
                        and ".block_sparse_moe.experts." not in k and v["dtype"] == "BF16"
                        and v["data_offsets"][1] - v["data_offsets"][0] >= (1 << 20))
-        sampled = [experts[i] for i in sorted({0, len(experts) // 2, len(experts) - 1})]
+        sampled = ([experts[i] for i in sorted({0, len(experts) // 2, len(experts) - 1})]
+                   if experts else [])
         if dense:
             sampled.append(dense[len(dense) // 2])
         for name in sampled:
@@ -95,6 +98,8 @@ def main():
     summary = {}
     for kind in ("expert", "dense"):
         rows = [r for r in results if r["kind"] == kind]
+        if not rows:
+            raise ValueError("no samples for " + kind)
         n = sum(r["bytes"] for r in rows)
         summary[kind] = {codec: sum(r["codecs"][codec]["bytes"] for r in rows) / n
                          for codec in rows[0]["codecs"]}

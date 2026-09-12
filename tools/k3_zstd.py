@@ -30,6 +30,7 @@ class Zstd:
             "ZSTD_CCtx_setParameter": (size, [ptr, ctypes.c_int, ctypes.c_int]),
             "ZSTD_compress2": (size, [ptr, ptr, size, ptr, size]),
             "ZSTD_decompress": (size, [ptr, size, ptr, size]),
+            "ZSTD_findFrameCompressedSize": (size, [ptr, size]),
             "ZSTD_isError": (ctypes.c_uint, [size]),
             "ZSTD_getErrorName": (ctypes.c_char_p, [size]),
             "ZSTD_versionString": (ctypes.c_char_p, []),
@@ -58,6 +59,10 @@ class Zstd:
             self.lib.ZSTD_freeCCtx(ctx)
 
     def decompress(self, data, size):
+        if (len(data) < 9 or data[:4] != b"\x28\xb5\x2f\xfd" or not data[4] & 4
+                or self.check(self.lib.ZSTD_findFrameCompressedSize(data, len(data)))
+                != len(data)):
+            raise ValueError("expected one checksummed Zstandard frame")
         output = ctypes.create_string_buffer(size)
         got = self.check(self.lib.ZSTD_decompress(output, size, data, len(data)))
         if got != size:

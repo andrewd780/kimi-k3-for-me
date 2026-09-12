@@ -5,6 +5,48 @@ on:
 permissions:
   contents: read
 jobs:
+  native:
+    name: Native offline storage (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install Linux build dependency
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y libzstd-dev
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install zstd libomp
+          echo "ZSTD_CFLAGS=-I$(brew --prefix zstd)/include" >> "$GITHUB_ENV"
+          echo "ZSTD_LIBS=-L$(brew --prefix zstd)/lib -lzstd" >> "$GITHUB_ENV"
+          echo "TEST_OMP_FLAGS=-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib -lomp" >> "$GITHUB_ENV"
+      - name: Compile and check native ranges, corruption, concurrency and byte parity
+        run: python3 -m unittest discover -s tests -p test_offline_storage.py -v
+      - name: Build compressed engine and run existing C tests
+        run: make ZSTD=1 BUILD=build/zstd BIN=bin/zstd -j4 all test
+      - name: Check CMake compressed build
+        if: runner.os == 'Linux'
+        run: |
+          cmake -S . -B build/cmake-zstd -DK3_ZSTD=ON
+          cmake --build build/cmake-zstd -j4
+          ctest --test-dir build/cmake-zstd --output-on-failure
+      - name: Install synthetic model generator dependencies
+        if: runner.os == 'Linux'
+        run: pip install numpy==2.3.5 torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+      - name: Check actual generation, compressed trunk, reread and saved sessions
+        if: runner.os == 'Linux'
+        env:
+          K3_TEST_BIN: bin/zstd/k3
+        run: python3 -m unittest discover -s tests -p test_offline_cli.py -v
+
   measure:
     runs-on: ubuntu-latest
     timeout-minutes: 10

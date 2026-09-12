@@ -45,6 +45,8 @@
 #endif
 
 #include <math.h>
+#include <errno.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -345,6 +347,9 @@ static void usage(FILE *f)
 "  --prompt-file PATH    read the prompt from a file; use this for non-ASCII, since\n"
 "                        argv is re-encoded by the shell\n"
 "  --ids 1,2,3           raw token ids; the reproducible channel used by the tests\n"
+"  --reread-prompt       process an exact second copy of the prompt before generation\n"
+"                        Uses twice the prompt context and adds prefill work.\n"
+"                        Does not verify or guarantee the answer.\n"
 "\n"
 "memory:\n"
 "  --preset NAME         auto | ultra | laptop | desktop | workstation | server | max\n"
@@ -684,6 +689,7 @@ int main(int argc, char **argv)
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
+    int reread_prompt = 0;
     /* --stop-id, repeatable. Generation halts AFTER emitting a listed id, so the state
      * written by --save-state still contains it and a later --load-state continues the
      * sequence the model actually produced. Without this the engine always runs to
@@ -703,6 +709,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
+        else if (!strcmp(argv[i], "--reread-prompt")) reread_prompt = 1;
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
@@ -926,17 +933,47 @@ int main(int argc, char **argv)
         free(ptext);
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
-        for (const char *p = ids_s; *p && np < K3_MAX_PROMPT; ) {
-            prompt[np++] = (int)strtol(p, (char **)&p, 10);
-            while (*p == ',' || *p == ' ') p++;
+        for (const char *p = ids_s; *p; ) {
+            while (*p == ',' || isspace((unsigned char)*p)) p++;
+            if (!*p) break;
+            if (np == K3_MAX_PROMPT) {
+                fprintf(stderr, "prompt exceeds the %d-id ceiling\n", K3_MAX_PROMPT);
+                return 2;
+            }
+            char *end = NULL;
+            errno = 0;
+            long id = strtol(p, &end, 10);
+            if (end == p || errno == ERANGE || id < 0 || id >= c.vocab ||
+                (*end && *end != ',' && !isspace((unsigned char)*end))) {
+                fprintf(stderr, "--ids contains an invalid token id\n");
+                return 2;
+            }
+            prompt[np++] = (int)id;
+            p = end;
         }
     }
-    if (np == 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
+    if (np <= 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
     for (int i = 0; i < np; i++)
         if (prompt[i] < 0 || prompt[i] >= c.vocab) {
             fprintf(stderr, "token id %d is outside the vocabulary of %d\n", prompt[i], c.vocab);
             return 2;
         }
+
+    const int original_prompt_tokens = np;
+    if (reread_prompt) {
+        if (np > K3_MAX_PROMPT / 2) {
+            fprintf(stderr, "--reread-prompt needs twice the prompt context: "
+                            "%d original ids exceed the %d-id reread limit\n",
+                    np, K3_MAX_PROMPT / 2);
+            return 2;
+        }
+        /* Copy token IDs: concatenating text and tokenizing again can merge across
+         * the boundary. A resumed session repeats only this request, not history. */
+        memcpy(prompt + np, prompt, (size_t)np * sizeof *prompt);
+        np *= 2;
+        printf("reread prompt: %d original ids, %d processed before generation\n",
+               original_prompt_tokens, np);
+    }
 
     /* Validate the request before allocating anything.
      *
@@ -962,9 +999,20 @@ int main(int argc, char **argv)
                 np, K3_MAX_PROMPT, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
-    if (np + gen + 1 > K3_MAX_PROMPT + K3_MAX_GEN) {
-        fprintf(stderr, "prompt %d + gen %d + 1 exceeds the %d-position ceiling\n",
-                np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
+    K3StateHdr shd;
+    int prior = 0;
+    if (load_state) {
+        if (!incremental) {
+            fprintf(stderr, "--load-state needs --incremental\n");
+            return 2;
+        }
+        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        prior = shd.nseq;
+    }
+    if (prior < 0 || prior > K3_MAX_PROMPT + K3_MAX_GEN - np - gen - 1) {
+        fprintf(stderr, "history %d + prompt %d + gen %d + 1 exceeds the "
+                        "%d-position ceiling\n",
+                prior, np, gen, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
     /* THE REAL CONTEXT LIMIT is the MLA KV cache, not any array size. Check it against
@@ -972,13 +1020,13 @@ int main(int argc, char **argv)
      * than letting a long prompt get 40 minutes into a run and then be OOM-killed. Only
      * incremental decode allocates the KV cache; full recompute carries no cache. */
     if (incremental) {
-        const double kv_need = (double)(np + gen + 1) * K3_KV_BYTES_PER_POS;
+        const double kv_need = (double)(prior + np + gen + 1) * K3_KV_BYTES_PER_POS;
         const double avail   = mem_available_bytes();
         char kb[32], ab[32];
         human(kv_need, kb, sizeof kb);
         human(avail, ab, sizeof ab);
         printf("  KV cache : %s for %d positions (%.2f MB/position)\n",
-               kb, np + gen + 1, K3_KV_BYTES_PER_POS / 1e6);
+               kb, prior + np + gen + 1, K3_KV_BYTES_PER_POS / 1e6);
         if (avail > 0.0 && kv_need > avail * 0.9) {
             fprintf(stderr,
                 "\nREFUSING: the KV cache for %d positions needs %s but only %s is\n"
@@ -986,7 +1034,7 @@ int main(int argc, char **argv)
                 "expanded k and v in fp32 across 24 layers, so context costs ~2.37 MB per\n"
                 "position regardless of budget. Shorten the request, or use full\n"
                 "recompute (drop --incremental), which carries no KV cache at all.\n",
-                np + gen + 1, kb, ab);
+                prior + np + gen + 1, kb, ab);
             return 2;
         }
     }
@@ -1156,17 +1204,9 @@ int main(int argc, char **argv)
 
     /* ---- buffers ----
      * A resumed session must hold the saved history as well as the new tokens, so the
-     * KV cache and every per-position buffer are sized for both. The header is read
-     * here, before anything is allocated; the payload is restored after. */
-    K3StateHdr shd;
-    int prior = 0;
+     * KV cache and every per-position buffer are sized for both. The header was
+     * validated with the prompt before loading weights; the payload is restored after. */
     if (load_state) {
-        if (!incremental) {
-            fprintf(stderr, "--load-state needs --incremental\n");
-            return 2;
-        }
-        if (k3_state_peek(load_state, &shd) != 0) return 1;
-        prior = shd.nseq;
         printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
     }
     const int Tmax = prior + np + gen + 1;
@@ -1611,7 +1651,9 @@ int main(int argc, char **argv)
     if (f) {
         fprintf(f, "{\"prompt_ids\":[");
         for (int i = 0; i < np; i++) fprintf(f, "%s%d", i ? "," : "", prompt[i]);
-        fprintf(f, "],\"generated_ids\":[");
+        fprintf(f, "],\"original_prompt_tokens\":%d,\"reread_prompt\":%s,"
+                   "\"generated_ids\":[", original_prompt_tokens,
+                reread_prompt ? "true" : "false");
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);

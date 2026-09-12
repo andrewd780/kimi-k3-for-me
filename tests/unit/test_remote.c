@@ -1,4 +1,4 @@
-/* Compare actual local and socket-backed read paths, including float widening. */
+/* Compare local and optional storage read paths, including float widening. */
 #define _POSIX_C_SOURCE 200809L
 #include "k3_portable_io.h"
 #include <stdint.h>
@@ -12,7 +12,8 @@ int main(int argc, char **argv)
     if (argc != 3) return 2;
     K3St local, remote;
     if (k3_st_open(&local, argv[1]) || k3_st_open(&remote, argv[2])) return 1;
-    if (local.nt != remote.nt || !remote.remote_socket || local.remote_socket) return 1;
+    if (local.nt != remote.nt || local.remote_socket ||
+        (!remote.remote_socket && (!remote.zfile || !remote.zfile[0]))) return 1;
     int bad = 0;
     for (int i = 0; i < local.nt; i++) {
         const K3Tensor *a = &local.t[i];
@@ -50,6 +51,6 @@ int main(int argc, char **argv)
     unsigned char byte = 123;
     if (k3_st_read(&remote, &broken, &byte) != 0 || byte != 123) bad++;
     k3_st_close(&remote); k3_st_close(&local);
-    printf("remote/local byte parity: %s\n", bad ? "FAILED" : "PASSED");
+    printf("stored/local byte parity: %s\n", bad ? "FAILED" : "PASSED");
     return bad ? 1 : 0;
 }

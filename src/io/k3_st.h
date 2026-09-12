@@ -51,6 +51,7 @@ typedef struct {
 typedef struct {
     int       *fd;            /* one open descriptor per shard             */
     int       *dfd;           /* the same shards opened O_DIRECT, or -1    */
+    struct K3ZFile **zfile;   /* optional native compressed reader per shard */
     char     **path;
     int        nshard;
 

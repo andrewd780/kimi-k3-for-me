@@ -1,0 +1,1331 @@
+{
+  "revision": "f831ab66814297da540d832a5235f8e904f29d06",
+  "zstd": "1.5.5",
+  "samples": [
+    {
+      "shard": "model-00002-of-000096.safetensors",
+      "tensor": "language_model.model.layers.1.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 1270791184,
+      "bytes": 1048576,
+      "sha256": "c290f3206f2d9766c8643163d56097663c1ce2c1be5099abab97b14d7e60d5bf",
+      "byte_entropy_bits": 7.510935605525883,
+      "codecs": {
+        "zstd3": {
+          "bytes": 989205,
+          "ratio": 0.9433794021606445,
+          "decode_MBps_runs": [
+            409.8338934827775,
+            504.12647007898823,
+            752.6363691121284
+          ],
+          "decode_MBps_median": 504.12647007898823
+        },
+        "zlib1": {
+          "bytes": 995766,
+          "ratio": 0.9496364593505859,
+          "decode_MBps_runs": [
+            135.1804028031784,
+            174.11709850648305,
+            156.44926345961105
+          ],
+          "decode_MBps_median": 156.44926345961105
+        },
+        "shuffle2_zstd3": {
+          "bytes": 989174,
+          "ratio": 0.9433498382568359,
+          "decode_MBps_runs": [
+            510.04276072995077,
+            455.154769611054,
+            504.0087057195096
+          ],
+          "decode_MBps_median": 504.0087057195096
+        }
+      }
+    },
+    {
+      "shard": "model-00002-of-000096.safetensors",
+      "tensor": "language_model.model.layers.1.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 9131965456,
+      "bytes": 1048576,
+      "sha256": "756edd289be915550faff90efa6954cb8c5aa31b1ad880bdbc08ed33d59f8690",
+      "byte_entropy_bits": 7.517501701566313,
+      "codecs": {
+        "zstd3": {
+          "bytes": 990100,
+          "ratio": 0.9442329406738281,
+          "decode_MBps_runs": [
+            453.82802268494214,
+            544.8917180777836,
+            607.426811405046
+          ],
+          "decode_MBps_median": 544.8917180777836
+        },
+        "zlib1": {
+          "bytes": 996605,
+          "ratio": 0.9504365921020508,
+          "decode_MBps_runs": [
+            141.19427017745105,
+            124.08036606372168,
+            137.14152384969967
+          ],
+          "decode_MBps_median": 137.14152384969967
+        },
+        "shuffle2_zstd3": {
+          "bytes": 990105,
+          "ratio": 0.9442377090454102,
+          "decode_MBps_runs": [
+            429.40636875481425,
+            265.3312250091846,
+            209.22385869170773
+          ],
+          "decode_MBps_median": 265.3312250091846
+        }
+      }
+    },
+    {
+      "shard": "model-00002-of-000096.safetensors",
+      "tensor": "language_model.model.layers.1.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16987290640,
+      "bytes": 1048576,
+      "sha256": "b2a8d1c81f88699e3045877636113bdd032c8b0cf6f49194ad681271cca84493",
+      "byte_entropy_bits": 7.517792202825601,
+      "codecs": {
+        "zstd3": {
+          "bytes": 990088,
+          "ratio": 0.9442214965820312,
+          "decode_MBps_runs": [
+            492.0674249999377,
+            580.5766477582108,
+            751.9115526306513
+          ],
+          "decode_MBps_median": 580.5766477582108
+        },
+        "zlib1": {
+          "bytes": 996642,
+          "ratio": 0.9504718780517578,
+          "decode_MBps_runs": [
+            161.36508817371197,
+            177.05679151267094,
+            197.3334718447626
+          ],
+          "decode_MBps_median": 177.05679151267094
+        },
+        "shuffle2_zstd3": {
+          "bytes": 990006,
+          "ratio": 0.9441432952880859,
+          "decode_MBps_runs": [
+            408.7781324148829,
+            434.6901093651784,
+            457.31332087655727
+          ],
+          "decode_MBps_median": 434.6901093651784
+        }
+      }
+    },
+    {
+      "shard": "model-00002-of-000096.safetensors",
+      "tensor": "language_model.model.layers.1.self_attn.f_a_proj.weight",
+      "kind": "dense",
+      "offset": 383171600,
+      "bytes": 1048576,
+      "sha256": "af6149644f8c98ac0b68d95e7758fe9adf5f3b7cda3c9f299293428cb0b10f41",
+      "byte_entropy_bits": 6.237483129018033,
+      "codecs": {
+        "zstd3": {
+          "bytes": 821248,
+          "ratio": 0.783203125,
+          "decode_MBps_runs": [
+            476.9465262527866,
+            596.8520824652702,
+            776.5170421004515
+          ],
+          "decode_MBps_median": 596.8520824652702
+        },
+        "zlib1": {
+          "bytes": 841808,
+          "ratio": 0.8028106689453125,
+          "decode_MBps_runs": [
+            151.06197442757312,
+            139.9144908886818,
+            115.80729560642507
+          ],
+          "decode_MBps_median": 139.9144908886818
+        },
+        "shuffle2_zstd3": {
+          "bytes": 745335,
+          "ratio": 0.7108068466186523,
+          "decode_MBps_runs": [
+            465.89566559634613,
+            526.3259340180743,
+            602.0772888409771
+          ],
+          "decode_MBps_median": 526.3259340180743
+        }
+      }
+    },
+    {
+      "shard": "model-00013-of-000096.safetensors",
+      "tensor": "language_model.model.layers.12.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 1270796592,
+      "bytes": 1048576,
+      "sha256": "38019569bff07691befb249fc7c4cdb1b42036eb044ee5393d0efb1a06897d2f",
+      "byte_entropy_bits": 7.493208336138929,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987086,
+          "ratio": 0.9413585662841797,
+          "decode_MBps_runs": [
+            690.829792179441,
+            164.7027593749748,
+            671.2050538040913
+          ],
+          "decode_MBps_median": 671.2050538040913
+        },
+        "zlib1": {
+          "bytes": 993465,
+          "ratio": 0.9474420547485352,
+          "decode_MBps_runs": [
+            83.16470931108236,
+            148.63873935056986,
+            87.38839722899495
+          ],
+          "decode_MBps_median": 87.38839722899495
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987042,
+          "ratio": 0.9413166046142578,
+          "decode_MBps_runs": [
+            204.5140398399746,
+            455.6993271588806,
+            170.65089034511152
+          ],
+          "decode_MBps_median": 204.5140398399746
+        }
+      }
+    },
+    {
+      "shard": "model-00013-of-000096.safetensors",
+      "tensor": "language_model.model.layers.12.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 9131970864,
+      "bytes": 1048576,
+      "sha256": "95ae0b6f5b06fad6bfc27563ffb6d1dce1515d999e1ac03d74dffaf55766d4ec",
+      "byte_entropy_bits": 7.497103800928131,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987602,
+          "ratio": 0.9418506622314453,
+          "decode_MBps_runs": [
+            509.662470910459,
+            574.2701793227782,
+            725.1121646985698
+          ],
+          "decode_MBps_median": 574.2701793227782
+        },
+        "zlib1": {
+          "bytes": 993826,
+          "ratio": 0.9477863311767578,
+          "decode_MBps_runs": [
+            111.84733119217132,
+            180.69743292142192,
+            202.33545926119132
+          ],
+          "decode_MBps_median": 180.69743292142192
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987526,
+          "ratio": 0.9417781829833984,
+          "decode_MBps_runs": [
+            446.32676498816056,
+            405.06767248469714,
+            496.2992062732464
+          ],
+          "decode_MBps_median": 446.32676498816056
+        }
+      }
+    },
+    {
+      "shard": "model-00013-of-000096.safetensors",
+      "tensor": "language_model.model.layers.12.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16987296048,
+      "bytes": 1048576,
+      "sha256": "eb60fd63153f9a39445e656cbbf6e3312cda835e747eff578c81a13edba880ad",
+      "byte_entropy_bits": 7.496064812503282,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987590,
+          "ratio": 0.9418392181396484,
+          "decode_MBps_runs": [
+            621.879559249488,
+            701.203829885755,
+            715.8590368558305
+          ],
+          "decode_MBps_median": 701.203829885755
+        },
+        "zlib1": {
+          "bytes": 993658,
+          "ratio": 0.9476261138916016,
+          "decode_MBps_runs": [
+            192.58849750494355,
+            192.25727787971903,
+            188.90235419929147
+          ],
+          "decode_MBps_median": 192.25727787971903
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987540,
+          "ratio": 0.9417915344238281,
+          "decode_MBps_runs": [
+            312.463421923546,
+            421.9253288424754,
+            501.80656410422057
+          ],
+          "decode_MBps_median": 421.9253288424754
+        }
+      }
+    },
+    {
+      "shard": "model-00013-of-000096.safetensors",
+      "tensor": "language_model.model.layers.12.self_attn.f_a_proj.weight",
+      "kind": "dense",
+      "offset": 383177008,
+      "bytes": 1048576,
+      "sha256": "eaa7a075045667f284be1cd50a85094f8cab21c1d7130cf19a10af32eb654c46",
+      "byte_entropy_bits": 6.24391546377619,
+      "codecs": {
+        "zstd3": {
+          "bytes": 821692,
+          "ratio": 0.7836265563964844,
+          "decode_MBps_runs": [
+            511.1230047764902,
+            627.0824985833015,
+            776.1072512500151
+          ],
+          "decode_MBps_median": 627.0824985833015
+        },
+        "zlib1": {
+          "bytes": 843686,
+          "ratio": 0.8046016693115234,
+          "decode_MBps_runs": [
+            124.67435124998559,
+            139.03629439420789,
+            124.39162549618577
+          ],
+          "decode_MBps_median": 124.67435124998559
+        },
+        "shuffle2_zstd3": {
+          "bytes": 746524,
+          "ratio": 0.7119407653808594,
+          "decode_MBps_runs": [
+            560.0754190792483,
+            579.6398367647307,
+            650.768825959099
+          ],
+          "decode_MBps_median": 579.6398367647307
+        }
+      }
+    },
+    {
+      "shard": "model-00025-of-000096.safetensors",
+      "tensor": "language_model.model.layers.24.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 1270796592,
+      "bytes": 1048576,
+      "sha256": "ed5b70e4292952329a869f25873a5b4be7ec274bdd9415dbe2035e873a050a5a",
+      "byte_entropy_bits": 7.508108491037402,
+      "codecs": {
+        "zstd3": {
+          "bytes": 988801,
+          "ratio": 0.9429941177368164,
+          "decode_MBps_runs": [
+            449.7911207355631,
+            604.0567086751003,
+            707.6481195579199
+          ],
+          "decode_MBps_median": 604.0567086751003
+        },
+        "zlib1": {
+          "bytes": 995395,
+          "ratio": 0.9492826461791992,
+          "decode_MBps_runs": [
+            170.2266374577641,
+            197.22401688961344,
+            195.2514054359241
+          ],
+          "decode_MBps_median": 195.2514054359241
+        },
+        "shuffle2_zstd3": {
+          "bytes": 988832,
+          "ratio": 0.943023681640625,
+          "decode_MBps_runs": [
+            390.43745188257924,
+            423.71894419297746,
+            492.37033895281996
+          ],
+          "decode_MBps_median": 423.71894419297746
+        }
+      }
+    },
+    {
+      "shard": "model-00025-of-000096.safetensors",
+      "tensor": "language_model.model.layers.24.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 9131970864,
+      "bytes": 1048576,
+      "sha256": "bae4709798651ac4f227e081703e5ec0059a192a4b157cf21e7e351e6c1016a1",
+      "byte_entropy_bits": 7.503269178755827,
+      "codecs": {
+        "zstd3": {
+          "bytes": 988140,
+          "ratio": 0.9423637390136719,
+          "decode_MBps_runs": [
+            488.8251983461478,
+            592.4168233064573,
+            700.1578495949601
+          ],
+          "decode_MBps_median": 592.4168233064573
+        },
+        "zlib1": {
+          "bytes": 994917,
+          "ratio": 0.948826789855957,
+          "decode_MBps_runs": [
+            179.38420164803426,
+            199.02859825387787,
+            198.7661657620766
+          ],
+          "decode_MBps_median": 198.7661657620766
+        },
+        "shuffle2_zstd3": {
+          "bytes": 988305,
+          "ratio": 0.9425210952758789,
+          "decode_MBps_runs": [
+            417.7500422292125,
+            446.43412901823615,
+            523.5714924131619
+          ],
+          "decode_MBps_median": 446.43412901823615
+        }
+      }
+    },
+    {
+      "shard": "model-00025-of-000096.safetensors",
+      "tensor": "language_model.model.layers.24.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16987296048,
+      "bytes": 1048576,
+      "sha256": "8a46c2804ce3d8e71406f8e6818bb3236d2901643ed330ff14bef702ddedf885",
+      "byte_entropy_bits": 7.510202040071704,
+      "codecs": {
+        "zstd3": {
+          "bytes": 989097,
+          "ratio": 0.9432764053344727,
+          "decode_MBps_runs": [
+            500.1848427239493,
+            557.1287923503241,
+            756.7787595105881
+          ],
+          "decode_MBps_median": 557.1287923503241
+        },
+        "zlib1": {
+          "bytes": 995732,
+          "ratio": 0.9496040344238281,
+          "decode_MBps_runs": [
+            151.18943651151284,
+            187.27310297770762,
+            186.83700832956418
+          ],
+          "decode_MBps_median": 186.83700832956418
+        },
+        "shuffle2_zstd3": {
+          "bytes": 989104,
+          "ratio": 0.9432830810546875,
+          "decode_MBps_runs": [
+            372.16341351145684,
+            446.9307650637331,
+            465.28126286963993
+          ],
+          "decode_MBps_median": 446.9307650637331
+        }
+      }
+    },
+    {
+      "shard": "model-00025-of-000096.safetensors",
+      "tensor": "language_model.model.layers.24.self_attn.f_a_proj.weight",
+      "kind": "dense",
+      "offset": 383177008,
+      "bytes": 1048576,
+      "sha256": "7e7062fa555acdf8b1fd5be5c0d834034a6077be38f418462292ab31d5a3ca22",
+      "byte_entropy_bits": 6.236605196693928,
+      "codecs": {
+        "zstd3": {
+          "bytes": 821219,
+          "ratio": 0.7831754684448242,
+          "decode_MBps_runs": [
+            502.4866132899127,
+            226.43928066652992,
+            560.8186020988896
+          ],
+          "decode_MBps_median": 502.4866132899127
+        },
+        "zlib1": {
+          "bytes": 841550,
+          "ratio": 0.8025646209716797,
+          "decode_MBps_runs": [
+            139.08544254493472,
+            147.50956210505154,
+            161.72661222456304
+          ],
+          "decode_MBps_median": 147.50956210505154
+        },
+        "shuffle2_zstd3": {
+          "bytes": 744898,
+          "ratio": 0.7103900909423828,
+          "decode_MBps_runs": [
+            523.5463965277684,
+            540.8206158193229,
+            615.2282751045838
+          ],
+          "decode_MBps_median": 540.8206158193229
+        }
+      }
+    },
+    {
+      "shard": "model-00037-of-000096.safetensors",
+      "tensor": "language_model.model.layers.36.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 1270796592,
+      "bytes": 1048576,
+      "sha256": "af6d2cec02af33d5d74f2b4a70adcc8a09b5510ee3dfecb4435c7a70a3c9b8d8",
+      "byte_entropy_bits": 7.503913629903157,
+      "codecs": {
+        "zstd3": {
+          "bytes": 988305,
+          "ratio": 0.9425210952758789,
+          "decode_MBps_runs": [
+            669.5725135812754,
+            660.1892846548185,
+            753.2370323307052
+          ],
+          "decode_MBps_median": 669.5725135812754
+        },
+        "zlib1": {
+          "bytes": 994980,
+          "ratio": 0.9488868713378906,
+          "decode_MBps_runs": [
+            197.43193281368363,
+            195.70075576049803,
+            177.08977386983258
+          ],
+          "decode_MBps_median": 195.70075576049803
+        },
+        "shuffle2_zstd3": {
+          "bytes": 988399,
+          "ratio": 0.9426107406616211,
+          "decode_MBps_runs": [
+            359.6967172073103,
+            420.3233348826673,
+            480.31426812851316
+          ],
+          "decode_MBps_median": 420.3233348826673
+        }
+      }
+    },
+    {
+      "shard": "model-00037-of-000096.safetensors",
+      "tensor": "language_model.model.layers.36.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 9131970864,
+      "bytes": 1048576,
+      "sha256": "cbf4305956ef3b3f369b5fea3d87040ed4d48f8aaf29a793b5a6f7150afccfb1",
+      "byte_entropy_bits": 7.504405611653581,
+      "codecs": {
+        "zstd3": {
+          "bytes": 988435,
+          "ratio": 0.9426450729370117,
+          "decode_MBps_runs": [
+            606.7821581372225,
+            649.1512737881449,
+            724.7277716518155
+          ],
+          "decode_MBps_median": 649.1512737881449
+        },
+        "zlib1": {
+          "bytes": 995042,
+          "ratio": 0.9489459991455078,
+          "decode_MBps_runs": [
+            184.61816916187666,
+            181.99654396494836,
+            192.83390305520257
+          ],
+          "decode_MBps_median": 184.61816916187666
+        },
+        "shuffle2_zstd3": {
+          "bytes": 988403,
+          "ratio": 0.9426145553588867,
+          "decode_MBps_runs": [
+            496.24283610927785,
+            511.6956809804415,
+            515.8393255924273
+          ],
+          "decode_MBps_median": 511.6956809804415
+        }
+      }
+    },
+    {
+      "shard": "model-00037-of-000096.safetensors",
+      "tensor": "language_model.model.layers.36.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16987296048,
+      "bytes": 1048576,
+      "sha256": "c9dcbb238addcd6654ec6530e0ea1aefa8e4cd35fb08dc75f8ec2359ac7c645a",
+      "byte_entropy_bits": 7.502992960765175,
+      "codecs": {
+        "zstd3": {
+          "bytes": 988257,
+          "ratio": 0.9424753189086914,
+          "decode_MBps_runs": [
+            645.7894010432892,
+            555.7622029676401,
+            728.828155648683
+          ],
+          "decode_MBps_median": 645.7894010432892
+        },
+        "zlib1": {
+          "bytes": 994843,
+          "ratio": 0.948756217956543,
+          "decode_MBps_runs": [
+            194.29353893539957,
+            199.3042249237126,
+            199.50524003284292
+          ],
+          "decode_MBps_median": 199.3042249237126
+        },
+        "shuffle2_zstd3": {
+          "bytes": 988292,
+          "ratio": 0.9425086975097656,
+          "decode_MBps_runs": [
+            361.5887786880664,
+            457.5286256396293,
+            519.6292638467149
+          ],
+          "decode_MBps_median": 457.5286256396293
+        }
+      }
+    },
+    {
+      "shard": "model-00037-of-000096.safetensors",
+      "tensor": "language_model.model.layers.36.self_attn.f_a_proj.weight",
+      "kind": "dense",
+      "offset": 383177008,
+      "bytes": 1048576,
+      "sha256": "c2b8c94f6568817f5b1ed008658d2e59125f30f7d4e83ccfa8a284de48c06efe",
+      "byte_entropy_bits": 6.2306034395204675,
+      "codecs": {
+        "zstd3": {
+          "bytes": 821190,
+          "ratio": 0.7831478118896484,
+          "decode_MBps_runs": [
+            636.1672322003478,
+            645.8291759349096,
+            720.3376032894538
+          ],
+          "decode_MBps_median": 645.8291759349096
+        },
+        "zlib1": {
+          "bytes": 840412,
+          "ratio": 0.8014793395996094,
+          "decode_MBps_runs": [
+            150.6456533710145,
+            155.82587523546897,
+            146.12468765230545
+          ],
+          "decode_MBps_median": 150.6456533710145
+        },
+        "shuffle2_zstd3": {
+          "bytes": 743937,
+          "ratio": 0.7094736099243164,
+          "decode_MBps_runs": [
+            689.6062787718273,
+            654.4437787052809,
+            697.3945870220838
+          ],
+          "decode_MBps_median": 689.6062787718273
+        }
+      }
+    },
+    {
+      "shard": "model-00049-of-000096.safetensors",
+      "tensor": "language_model.model.layers.48.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 1270796592,
+      "bytes": 1048576,
+      "sha256": "ba9cf95aae4653bb288bb0fa4a2ee9758c4c67cdbb25fa814e2997ea08af1be9",
+      "byte_entropy_bits": 7.502617964425813,
+      "codecs": {
+        "zstd3": {
+          "bytes": 988314,
+          "ratio": 0.9425296783447266,
+          "decode_MBps_runs": [
+            685.7350631975355,
+            653.2642466394828,
+            734.9150090513411
+          ],
+          "decode_MBps_median": 685.7350631975355
+        },
+        "zlib1": {
+          "bytes": 994850,
+          "ratio": 0.9487628936767578,
+          "decode_MBps_runs": [
+            189.63172155914378,
+            193.02861016084864,
+            191.60731260296302
+          ],
+          "decode_MBps_median": 191.60731260296302
+        },
+        "shuffle2_zstd3": {
+          "bytes": 988199,
+          "ratio": 0.9424200057983398,
+          "decode_MBps_runs": [
+            481.10255113515234,
+            452.1700432905505,
+            510.018696914164
+          ],
+          "decode_MBps_median": 481.10255113515234
+        }
+      }
+    },
+    {
+      "shard": "model-00049-of-000096.safetensors",
+      "tensor": "language_model.model.layers.48.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 9131970864,
+      "bytes": 1048576,
+      "sha256": "b37bc48b9ce9954357db8b88f8590835463938ac96d7e7de6c055da895d77968",
+      "byte_entropy_bits": 7.5020199445250775,
+      "codecs": {
+        "zstd3": {
+          "bytes": 988056,
+          "ratio": 0.9422836303710938,
+          "decode_MBps_runs": [
+            630.2152012345707,
+            592.2555421391409,
+            738.1494593527143
+          ],
+          "decode_MBps_median": 630.2152012345707
+        },
+        "zlib1": {
+          "bytes": 994704,
+          "ratio": 0.9486236572265625,
+          "decode_MBps_runs": [
+            188.69166525749654,
+            187.90771989438682,
+            195.6872060818028
+          ],
+          "decode_MBps_median": 188.69166525749654
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987861,
+          "ratio": 0.9420976638793945,
+          "decode_MBps_runs": [
+            500.10850397792444,
+            464.69133613096426,
+            502.6306505216872
+          ],
+          "decode_MBps_median": 500.10850397792444
+        }
+      }
+    },
+    {
+      "shard": "model-00049-of-000096.safetensors",
+      "tensor": "language_model.model.layers.48.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16987296048,
+      "bytes": 1048576,
+      "sha256": "01ed8edc9562bc787651dfff1cb7c7502fbfd99a777a41b86219452f4a2efceb",
+      "byte_entropy_bits": 7.500959584064564,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987909,
+          "ratio": 0.942143440246582,
+          "decode_MBps_runs": [
+            644.1478023249936,
+            669.7581252957342,
+            736.424194539338
+          ],
+          "decode_MBps_median": 669.7581252957342
+        },
+        "zlib1": {
+          "bytes": 994623,
+          "ratio": 0.9485464096069336,
+          "decode_MBps_runs": [
+            190.47037778200956,
+            191.99361349442842,
+            197.29474601621408
+          ],
+          "decode_MBps_median": 191.99361349442842
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987870,
+          "ratio": 0.9421062469482422,
+          "decode_MBps_runs": [
+            443.66816956919723,
+            460.75678155515794,
+            371.23240579396577
+          ],
+          "decode_MBps_median": 443.66816956919723
+        }
+      }
+    },
+    {
+      "shard": "model-00049-of-000096.safetensors",
+      "tensor": "language_model.model.layers.48.self_attn.f_a_proj.weight",
+      "kind": "dense",
+      "offset": 383177008,
+      "bytes": 1048576,
+      "sha256": "7a852464cb2a6656703f2ab9ca7eb4cb7517217c2165c9905dcff13f306ff397",
+      "byte_entropy_bits": 6.224827301019028,
+      "codecs": {
+        "zstd3": {
+          "bytes": 820571,
+          "ratio": 0.782557487487793,
+          "decode_MBps_runs": [
+            471.31798554248786,
+            572.0398876870902,
+            786.5460492191445
+          ],
+          "decode_MBps_median": 572.0398876870902
+        },
+        "zlib1": {
+          "bytes": 839643,
+          "ratio": 0.800745964050293,
+          "decode_MBps_runs": [
+            147.51053741077504,
+            160.9543401737999,
+            153.10998077682106
+          ],
+          "decode_MBps_median": 153.10998077682106
+        },
+        "shuffle2_zstd3": {
+          "bytes": 743483,
+          "ratio": 0.709040641784668,
+          "decode_MBps_runs": [
+            532.8092178208406,
+            527.2556584817067,
+            646.1113202708361
+          ],
+          "decode_MBps_median": 532.8092178208406
+        }
+      }
+    },
+    {
+      "shard": "model-00061-of-000096.safetensors",
+      "tensor": "language_model.model.layers.60.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 1270796592,
+      "bytes": 1048576,
+      "sha256": "ab3d6a39b71066bdff709a13bfbb135f52681b361bb84455907ff0f4e89d1eb9",
+      "byte_entropy_bits": 7.5019348178634155,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987999,
+          "ratio": 0.9422292709350586,
+          "decode_MBps_runs": [
+            687.5286039537959,
+            693.8261557140264,
+            648.9419639998445
+          ],
+          "decode_MBps_median": 687.5286039537959
+        },
+        "zlib1": {
+          "bytes": 994658,
+          "ratio": 0.9485797882080078,
+          "decode_MBps_runs": [
+            179.63290389257355,
+            165.197848880419,
+            193.45571172541554
+          ],
+          "decode_MBps_median": 179.63290389257355
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987974,
+          "ratio": 0.9422054290771484,
+          "decode_MBps_runs": [
+            488.002341865058,
+            428.4788448442486,
+            521.4694575813598
+          ],
+          "decode_MBps_median": 488.002341865058
+        }
+      }
+    },
+    {
+      "shard": "model-00061-of-000096.safetensors",
+      "tensor": "language_model.model.layers.60.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 9131970864,
+      "bytes": 1048576,
+      "sha256": "0ff8465fdf1e7429ec481658b228c1aaa99d789ed74c81df4e408c075141780e",
+      "byte_entropy_bits": 7.495561529542792,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987290,
+          "ratio": 0.9415531158447266,
+          "decode_MBps_runs": [
+            499.4056146525151,
+            588.7724156365383,
+            739.0812796453492
+          ],
+          "decode_MBps_median": 588.7724156365383
+        },
+        "zlib1": {
+          "bytes": 993862,
+          "ratio": 0.9478206634521484,
+          "decode_MBps_runs": [
+            194.02465868202646,
+            198.84060719247523,
+            192.46216056770467
+          ],
+          "decode_MBps_median": 194.02465868202646
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987306,
+          "ratio": 0.9415683746337891,
+          "decode_MBps_runs": [
+            450.21289640774296,
+            441.4168432671105,
+            526.9167878618434
+          ],
+          "decode_MBps_median": 450.21289640774296
+        }
+      }
+    },
+    {
+      "shard": "model-00061-of-000096.safetensors",
+      "tensor": "language_model.model.layers.60.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16987296048,
+      "bytes": 1048576,
+      "sha256": "e8af346ace97262cf5bc984f4068f0bcfbcff637f308cf2868c4b64bd01a65ce",
+      "byte_entropy_bits": 7.499500290378348,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987872,
+          "ratio": 0.942108154296875,
+          "decode_MBps_runs": [
+            717.3537074021586,
+            580.1657986417849,
+            709.6014947386183
+          ],
+          "decode_MBps_median": 709.6014947386183
+        },
+        "zlib1": {
+          "bytes": 994346,
+          "ratio": 0.9482822418212891,
+          "decode_MBps_runs": [
+            160.95065903788492,
+            167.19457630521651,
+            172.94498603702962
+          ],
+          "decode_MBps_median": 167.19457630521651
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987928,
+          "ratio": 0.9421615600585938,
+          "decode_MBps_runs": [
+            525.5274565250414,
+            433.7039437506434,
+            478.5352452089113
+          ],
+          "decode_MBps_median": 478.5352452089113
+        }
+      }
+    },
+    {
+      "shard": "model-00061-of-000096.safetensors",
+      "tensor": "language_model.model.layers.60.self_attn.f_a_proj.weight",
+      "kind": "dense",
+      "offset": 383177008,
+      "bytes": 1048576,
+      "sha256": "41d82ccae961b673e1749cfc5f3f2f88fb4c789b25083e8b255ffa8328b6fa81",
+      "byte_entropy_bits": 6.209506610207224,
+      "codecs": {
+        "zstd3": {
+          "bytes": 818049,
+          "ratio": 0.7801523208618164,
+          "decode_MBps_runs": [
+            485.69514912674356,
+            600.7182889734871,
+            752.4500394319986
+          ],
+          "decode_MBps_median": 600.7182889734871
+        },
+        "zlib1": {
+          "bytes": 838279,
+          "ratio": 0.7994451522827148,
+          "decode_MBps_runs": [
+            144.01322655618984,
+            147.64448433237231,
+            149.96249421681318
+          ],
+          "decode_MBps_median": 147.64448433237231
+        },
+        "shuffle2_zstd3": {
+          "bytes": 741706,
+          "ratio": 0.7073459625244141,
+          "decode_MBps_runs": [
+            481.5740658895856,
+            566.8401210554974,
+            528.9138808097257
+          ],
+          "decode_MBps_median": 528.9138808097257
+        }
+      }
+    },
+    {
+      "shard": "model-00073-of-000096.safetensors",
+      "tensor": "language_model.model.layers.72.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 1270796592,
+      "bytes": 1048576,
+      "sha256": "195104d6f627e7d9528d7b5be7ded91659f16b98a4d6baf639314641b0d092ac",
+      "byte_entropy_bits": 7.495289549250415,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987352,
+          "ratio": 0.9416122436523438,
+          "decode_MBps_runs": [
+            668.2450169190647,
+            642.0345724762781,
+            703.6780535865682
+          ],
+          "decode_MBps_median": 668.2450169190647
+        },
+        "zlib1": {
+          "bytes": 993869,
+          "ratio": 0.9478273391723633,
+          "decode_MBps_runs": [
+            178.7965553508491,
+            194.77603401491544,
+            175.52444274802585
+          ],
+          "decode_MBps_median": 178.7965553508491
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987312,
+          "ratio": 0.9415740966796875,
+          "decode_MBps_runs": [
+            452.1411871837581,
+            453.7522177511168,
+            385.4445229807789
+          ],
+          "decode_MBps_median": 452.1411871837581
+        }
+      }
+    },
+    {
+      "shard": "model-00073-of-000096.safetensors",
+      "tensor": "language_model.model.layers.72.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 9131970864,
+      "bytes": 1048576,
+      "sha256": "b88a66d15ec3806f9d0d18a1f86319be71e21dca2c0fdb232033787b394f044c",
+      "byte_entropy_bits": 7.493989234276515,
+      "codecs": {
+        "zstd3": {
+          "bytes": 987188,
+          "ratio": 0.9414558410644531,
+          "decode_MBps_runs": [
+            575.1644598725453,
+            668.4367109229979,
+            728.8960440867953
+          ],
+          "decode_MBps_median": 668.4367109229979
+        },
+        "zlib1": {
+          "bytes": 993667,
+          "ratio": 0.9476346969604492,
+          "decode_MBps_runs": [
+            196.71541891147268,
+            198.15387266854438,
+            178.47063200499733
+          ],
+          "decode_MBps_median": 196.71541891147268
+        },
+        "shuffle2_zstd3": {
+          "bytes": 987053,
+          "ratio": 0.9413270950317383,
+          "decode_MBps_runs": [
+            474.80328901999115,
+            481.6293647136548,
+            523.9948249105893
+          ],
+          "decode_MBps_median": 481.6293647136548
+        }
+      }
+    },
+    {
+      "shard": "model-00073-of-000096.safetensors",
+      "tensor": "language_model.model.layers.72.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16987296048,
+      "bytes": 1048576,
+      "sha256": "4758e14be04ed20b889d529daac845959004ba158372023a419561de4b4bd052",
+      "byte_entropy_bits": 7.492653346585062,
+      "codecs": {
+        "zstd3": {
+          "bytes": 986944,
+          "ratio": 0.94122314453125,
+          "decode_MBps_runs": [
+            615.6888580662602,
+            629.9906694860548,
+            536.4891034442562
+          ],
+          "decode_MBps_median": 615.6888580662602
+        },
+        "zlib1": {
+          "bytes": 993506,
+          "ratio": 0.9474811553955078,
+          "decode_MBps_runs": [
+            186.647608688326,
+            167.22017289789204,
+            191.2702451748832
+          ],
+          "decode_MBps_median": 186.647608688326
+        },
+        "shuffle2_zstd3": {
+          "bytes": 986994,
+          "ratio": 0.9412708282470703,
+          "decode_MBps_runs": [
+            472.5818721967304,
+            435.1936357197141,
+            362.0110960301471
+          ],
+          "decode_MBps_median": 435.1936357197141
+        }
+      }
+    },
+    {
+      "shard": "model-00073-of-000096.safetensors",
+      "tensor": "language_model.model.layers.72.self_attn.f_a_proj.weight",
+      "kind": "dense",
+      "offset": 383177008,
+      "bytes": 1048576,
+      "sha256": "40af77a82237fbd6e2bdf3edfe47e8cedb4f8b2342936f17e1ccc85d07422378",
+      "byte_entropy_bits": 6.1934621104382375,
+      "codecs": {
+        "zstd3": {
+          "bytes": 816011,
+          "ratio": 0.7782087326049805,
+          "decode_MBps_runs": [
+            510.3294683837517,
+            577.3394317422059,
+            796.2433100884866
+          ],
+          "decode_MBps_median": 577.3394317422059
+        },
+        "zlib1": {
+          "bytes": 837283,
+          "ratio": 0.7984952926635742,
+          "decode_MBps_runs": [
+            138.14897480194315,
+            141.08404703322478,
+            146.8149485862588
+          ],
+          "decode_MBps_median": 141.08404703322478
+        },
+        "shuffle2_zstd3": {
+          "bytes": 740194,
+          "ratio": 0.7059040069580078,
+          "decode_MBps_runs": [
+            449.801539726036,
+            449.05029643088295,
+            646.788436247513
+          ],
+          "decode_MBps_median": 449.801539726036
+        }
+      }
+    },
+    {
+      "shard": "model-00093-of-000096.safetensors",
+      "tensor": "language_model.model.layers.92.block_sparse_moe.experts.0.w1.weight_packed",
+      "kind": "expert",
+      "offset": 847386856,
+      "bytes": 1048576,
+      "sha256": "8770d41d0fdbaa45af53b6c91b171d3d56838aaff7994a3da417c6234c698134",
+      "byte_entropy_bits": 7.528497349690474,
+      "codecs": {
+        "zstd3": {
+          "bytes": 991432,
+          "ratio": 0.9455032348632812,
+          "decode_MBps_runs": [
+            630.9060803437214,
+            599.3208760325793,
+            582.0697755832898
+          ],
+          "decode_MBps_median": 599.3208760325793
+        },
+        "zlib1": {
+          "bytes": 998049,
+          "ratio": 0.9518136978149414,
+          "decode_MBps_runs": [
+            142.75769913236635,
+            160.93613378020945,
+            177.07655553063813
+          ],
+          "decode_MBps_median": 160.93613378020945
+        },
+        "shuffle2_zstd3": {
+          "bytes": 991470,
+          "ratio": 0.9455394744873047,
+          "decode_MBps_runs": [
+            297.56097145921603,
+            384.94813213658995,
+            478.79264414796364
+          ],
+          "decode_MBps_median": 384.94813213658995
+        }
+      }
+    },
+    {
+      "shard": "model-00093-of-000096.safetensors",
+      "tensor": "language_model.model.layers.92.block_sparse_moe.experts.501.w1.weight_packed",
+      "kind": "expert",
+      "offset": 8708561128,
+      "bytes": 1048576,
+      "sha256": "ceb07cbf29a1baca81301be4ba4873e2c925038c6216c4b1680512ee11e848f5",
+      "byte_entropy_bits": 7.512710052122101,
+      "codecs": {
+        "zstd3": {
+          "bytes": 989413,
+          "ratio": 0.943577766418457,
+          "decode_MBps_runs": [
+            509.5626583209154,
+            478.1756129520823,
+            541.4763546870171
+          ],
+          "decode_MBps_median": 509.5626583209154
+        },
+        "zlib1": {
+          "bytes": 995951,
+          "ratio": 0.9498128890991211,
+          "decode_MBps_runs": [
+            169.1418572277433,
+            115.04117100213304,
+            120.04597249923958
+          ],
+          "decode_MBps_median": 120.04597249923958
+        },
+        "shuffle2_zstd3": {
+          "bytes": 989291,
+          "ratio": 0.9434614181518555,
+          "decode_MBps_runs": [
+            500.82772680180915,
+            434.16922969219854,
+            475.1186804362572
+          ],
+          "decode_MBps_median": 475.1186804362572
+        }
+      }
+    },
+    {
+      "shard": "model-00093-of-000096.safetensors",
+      "tensor": "language_model.model.layers.92.block_sparse_moe.experts.99.w3.weight_packed",
+      "kind": "expert",
+      "offset": 16563886312,
+      "bytes": 1048576,
+      "sha256": "7e833ad2aa3963c7dd64e8d48db0bbbbc7fc9f1c8c4bcd5e2861e4ed4dabbeea",
+      "byte_entropy_bits": 7.514166272355298,
+      "codecs": {
+        "zstd3": {
+          "bytes": 989666,
+          "ratio": 0.9438190460205078,
+          "decode_MBps_runs": [
+            663.9448063025313,
+            601.6513371888263,
+            663.1314865784009
+          ],
+          "decode_MBps_median": 663.1314865784009
+        },
+        "zlib1": {
+          "bytes": 996219,
+          "ratio": 0.950068473815918,
+          "decode_MBps_runs": [
+            190.00464965894255,
+            162.26235355918388,
+            178.42122359205064
+          ],
+          "decode_MBps_median": 178.42122359205064
+        },
+        "shuffle2_zstd3": {
+          "bytes": 989575,
+          "ratio": 0.9437322616577148,
+          "decode_MBps_runs": [
+            240.18012776876978,
+            440.39829112381403,
+            508.7253290892034
+          ],
+          "decode_MBps_median": 440.39829112381403
+        }
+      }
+    },
+    {
+      "shard": "model-00093-of-000096.safetensors",
+      "tensor": "language_model.model.layers.92.self_attn.g_proj.weight",
+      "kind": "dense",
+      "offset": 468322536,
+      "bytes": 1048576,
+      "sha256": "03391ddc641d2ad60ad362550f865ed73d0ae714a552bd773942b383d2e45927",
+      "byte_entropy_bits": 6.240024330661474,
+      "codecs": {
+        "zstd3": {
+          "bytes": 822553,
+          "ratio": 0.7844476699829102,
+          "decode_MBps_runs": [
+            506.12592422960034,
+            584.4644609411204,
+            743.2176119118128
+          ],
+          "decode_MBps_median": 584.4644609411204
+        },
+        "zlib1": {
+          "bytes": 840431,
+          "ratio": 0.8014974594116211,
+          "decode_MBps_runs": [
+            114.0747235901494,
+            113.69116474928646,
+            142.71530312683345
+          ],
+          "decode_MBps_median": 114.0747235901494
+        },
+        "shuffle2_zstd3": {
+          "bytes": 745113,
+          "ratio": 0.7105951309204102,
+          "decode_MBps_runs": [
+            529.4097748222595,
+            561.2760945712765,
+            643.9464516813819
+          ],
+          "decode_MBps_median": 561.2760945712765
+        }
+      }
+    }
+  ],
+  "summary_ratios": {
+    "expert": {
+      "zstd3": 0.9426331917444865,
+      "zlib1": 0.9488731622695923,
+      "shuffle2_zstd3": 0.9426101446151733
+    },
+    "dense": {
+      "zstd3": 0.7823148965835571,
+      "zlib1": 0.801455020904541,
+      "shuffle2_zstd3": 0.7094371318817139
+    }
+  },
+  "limits": "Stratified tensor samples, not a census or a full-model speed test; scales and metadata are not represented by the expert samples."
+}

@@ -74,6 +74,7 @@ typedef struct {
 
 typedef struct {
     int          fd;
+    struct K3ZFile *zfile;       /* optional offline compressed trunk */
     int          direct;        /* 1 when the file was opened O_DIRECT */
     int          n_layers;
     K3TrunkLayer *lay;

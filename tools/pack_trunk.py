@@ -33,12 +33,14 @@ import struct
 import sys
 import time
 
+from offline_model import open_weight
+
 CHUNK = 64 << 20
 ALIGN = 4096        # O_DIRECT needs offset, length and buffer all aligned
 
 
 def shard_header(path):
-    with open(path, "rb") as f:
+    with open_weight(path) as f:
         n = struct.unpack("<Q", f.read(8))[0]
         hdr = json.loads(f.read(n).decode("utf-8"))
     return hdr, 8 + n
@@ -50,6 +52,8 @@ def main(argv=None):
         print("usage: pack_trunk.py <shard_dir> <out_dir> [n_layers]")
         return 2
     src, out = argv[0], argv[1]
+    if os.path.exists(os.path.join(src, ".k3-incomplete")):
+        raise ValueError("source offline conversion is incomplete")
     nlayers = int(argv[2]) if len(argv) > 2 else 93
     if nlayers <= 0:
         raise ValueError("n_layers must be positive")
@@ -63,7 +67,8 @@ def main(argv=None):
                 raise ValueError("remote packing needs a fresh output directory: " + out)
     os.makedirs(out, exist_ok=True)
 
-    shard_names = sorted(fn for fn in os.listdir(src) if fn.endswith(".safetensors"))
+    shard_names = sorted(fn for fn in os.listdir(src)
+                         if fn.endswith((".safetensors", ".safetensors.k3z")))
     print("indexing %d safetensors shards..." % len(shard_names))
     # name -> (shard_path, absolute_offset, nbytes, dtype, shape)
     where = {}
@@ -141,7 +146,7 @@ def main(argv=None):
                 dst.write(b"\0" * pad)
             file_off = dst.tell()
             assert file_off % ALIGN == 0
-            reader = (remote.reader(os.path.basename(sp)) if remote else open(sp, "rb"))
+            reader = (remote.reader(os.path.basename(sp)) if remote else open_weight(sp))
             with reader as f:
                 f.seek(lo)
                 left = own
