@@ -9,6 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>   /* pread, lseek. k3_trunk.c includes <unistd.h> only inside
+                       * #ifndef _WIN32, so a ZSTD=1 MinGW build reaches lseek() here
+                       * with no declaration. k3_st.c already includes it unguarded
+                       * and builds under MinGW, so doing the same is safe. */
 #ifdef K3_WITH_ZSTD
 #include <zstd.h>
 #endif

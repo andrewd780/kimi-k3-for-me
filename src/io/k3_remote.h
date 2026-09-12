@@ -5,7 +5,13 @@
 #ifndef K3_REMOTE_H
 #define K3_REMOTE_H
 
+/* Include k3_st.h before this header: k3_remote_request takes a K3St. The libc
+ * headers below are declared here rather than inherited from whichever .c file
+ * includes this one, so the order of the remaining includes cannot matter. */
 #include <errno.h>
+#include <stdint.h>   /* uint64_t, INT64_MAX */
+#include <stdio.h>    /* fprintf, stderr */
+#include <string.h>   /* memcpy, memset, strlen, strrchr, strerror */
 
 #define K3_REMOTE_CHUNK (8 << 20)
 
@@ -13,6 +19,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <unistd.h>   /* close */
 
 static void k3_remote_put64(unsigned char *p, uint64_t v)
 {
