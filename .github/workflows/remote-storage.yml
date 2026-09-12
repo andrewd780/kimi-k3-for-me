@@ -19,3 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Compile C readers and exercise HTTP/cache failures and parity
         run: python3 -m unittest discover -s tests -p test_remote_storage.py -v
+      - name: Probe pinned public model header and 4 KiB payload
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 3
+        run: python3 tools/probe_remote_source.py

@@ -115,10 +115,14 @@ snapshot mismatch, missing daemon, and byte-identical trunk packing. It uses a l
 HTTP server and synthetic/repository fixtures, never the released checkpoint.
 GitHub Actions runs it on Linux and macOS.
 
-At the time this change was authored, the editing environment could not execute
-C/Python, and no full-model run or live Hugging Face range transfer had been performed.
-Check the fork's Remote storage workflow for actual test results. Passing fixtures
-does not establish full-model generation speed, answer quality, or service availability.
+The 19 fixture tests passed on Linux and macOS in
+[the initial CI run](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/34696996154).
+The editing environment itself could not execute C/Python, so validation ran on GitHub.
+A separate Linux CI step probes a pinned public shard header and 4 KiB payload using
+tools/probe_remote_source.py; it never downloads the full shard. Check the latest
+workflow for that live probe's result. No full-model generation has been run.
+Passing fixtures and a small network probe do not establish full-model generation
+speed, answer quality, or long-term service availability.
 
 The engineering contribution here is the integration into this fork: header-only
 checkpoint setup, direct trunk extraction, and one bounded cache across the C read
