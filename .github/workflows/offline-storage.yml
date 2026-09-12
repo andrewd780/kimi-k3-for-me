@@ -1,7 +1,15 @@
 name: Offline storage
 on:
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Cancel superseded runs on the same ref, a push to a busy PR should not queue builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 jobs:
