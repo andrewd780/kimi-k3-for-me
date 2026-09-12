@@ -115,9 +115,16 @@ def validate_header(raw, total):
     for name, entry in header.items():
         if name == "__metadata__":
             continue
-        shape = entry["shape"]
-        start, end = entry["data_offsets"]
-        if (entry["dtype"] not in sizes or len(shape) > 4
+        # Structure first, and as ValueError: these bytes came from the origin, and
+        # main() catches ValueError/KeyError but not the TypeError that indexing or
+        # unpacking a non-object would raise (entry=5 -> 'int' not subscriptable).
+        if not isinstance(entry, dict):
+            raise ValueError("invalid tensor entry: " + str(name))
+        shape, offsets = entry.get("shape"), entry.get("data_offsets")
+        if not isinstance(shape, list) or not isinstance(offsets, list) or len(offsets) != 2:
+            raise ValueError("invalid tensor span: " + str(name))
+        start, end = offsets
+        if (entry.get("dtype") not in sizes or len(shape) > 4
                 or any(type(n) is not int or n < 0 for n in shape)
                 or type(start) is not int or type(end) is not int
                 or start < 0 or end < start
@@ -264,31 +271,49 @@ class DiskCache:
         need = length + 32
         if not 0 < length <= BLOCK or not re.fullmatch(r"[0-9a-f]{64}", key):
             raise ValueError("invalid cache block")
-        with self.cv:
-            while True:
-                if key in self.pending:
+        path = self.root / (key + ".blk")
+        while True:
+            with self.cv:
+                while key in self.pending:
                     self.cv.wait()
-                    continue
-                if key in self.entries:
-                    path = self.root / (key + ".blk")
-                    try:
-                        raw = path.read_bytes()
-                    except FileNotFoundError:
-                        raw = b""
-                    if (len(raw) == need
-                            and raw[:32] == hashlib.sha256(raw[32:]).digest()):
-                        self.entries.move_to_end(key)
-                        os.utime(path, None)
-                        self.hits += length
-                        return raw[32:]
-                    self.used -= self.entries.pop(key)
-                    path.unlink(missing_ok=True)
-                self._evict(need)
-                if self.used + self.reserved + need <= self.limit:
+                cached = key in self.entries
+                if cached:
+                    # Claim recency before releasing: an evictor running while we read
+                    # must not pick this key as its LRU victim.
+                    self.entries.move_to_end(key)
+                else:
+                    self._evict(need)
+                    if self.used + self.reserved + need > self.limit:
+                        self.cv.wait()
+                        continue
                     self.reserved += need
                     self.pending.add(key)
-                    break
-                self.cv.wait()
+            if not cached:
+                break
+            # Read and verify OUTSIDE the lock. Holding it across an 8 MiB read plus its
+            # SHA-256 serializes every bridge worker on each hit, which is precisely the
+            # warm-cache path the concurrency exists for. Racing an evictor is safe: an
+            # unlink after our open still reads the old inode, the key IS the content
+            # digest, and fills land via an atomic replace -- so the check below accepts
+            # only the block actually asked for, whichever version it read.
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                raw = b""
+            if len(raw) == need and raw[:32] == hashlib.sha256(raw[32:]).digest():
+                with self.cv:
+                    if key in self.entries:
+                        self.entries.move_to_end(key)
+                    self.hits += length
+                # Advisory only, and the block may have been evicted while we read it.
+                with contextlib.suppress(OSError):
+                    os.utime(path, None)
+                return raw[32:]
+            with self.cv:
+                stale = self.entries.pop(key, None)
+                if stale is not None:
+                    self.used -= stale
+            path.unlink(missing_ok=True)
         partial = self.root / (key + ".part")
         committed = False
         try:
@@ -511,8 +536,6 @@ def main(argv=None):
             return pack_trunk.main([str(Path(args.directory).expanduser()),
                                     str(Path(args.trunk_directory).expanduser()),
                                     str(args.layers)])
-        if os.name != "posix":
-            raise ValueError("remote run needs Linux, macOS, or WSL")
         return run(args)
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         print("ERROR: %s" % exc, file=sys.stderr)
