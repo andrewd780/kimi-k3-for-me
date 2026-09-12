@@ -1,0 +1,19 @@
+name: Offline storage
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update -qq && sudo apt-get install -y libzstd-dev
+      - name: Measure exact round trips on stratified K3 samples
+        run: python3 tools/bench_lossless.py --out lossless-samples.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lossless-samples
+          path: lossless-samples.json
