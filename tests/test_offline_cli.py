@@ -74,7 +74,9 @@ class OfflineCliTests(unittest.TestCase):
         report = json.loads(out.read_text(errors="replace"))
         self.assertEqual(report["expert_drops"], 0)
         self.assertEqual(report["layers_completed"], 13)
-        return report, logits.read_bytes()
+        raw_logits = logits.read_bytes()
+        self.assertEqual(len(raw_logits), 256 * 4, "expected a complete vocabulary vector")
+        return report, raw_logits
 
     def assert_same(self, a, b):
         self.assertEqual(a[0]["generated_ids"], b[0]["generated_ids"])

@@ -279,7 +279,7 @@ class RemoteStorageTests(unittest.TestCase):
                                     env=dict(os.environ, K3_REMOTE_SOCKET=path),
                                     capture_output=True, text=True, timeout=180)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("remote/local byte parity: PASSED", result.stdout)
+        self.assertIn("stored/local byte parity: PASSED", result.stdout)
         self.assertLess(sum(p.stat().st_size for p in remote.glob("*.safetensors")), 4096)
 
     def test_c_streamed_logits_match_fixture(self):
