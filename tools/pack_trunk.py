@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import struct
 import sys
 import time
@@ -43,12 +44,23 @@ def shard_header(path):
     return hdr, 8 + n
 
 
-def main():
-    if len(sys.argv) < 3:
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) < 2:
         print("usage: pack_trunk.py <shard_dir> <out_dir> [n_layers]")
         return 2
-    src, out = sys.argv[1], sys.argv[2]
-    nlayers = int(sys.argv[3]) if len(sys.argv) > 3 else 93
+    src, out = argv[0], argv[1]
+    nlayers = int(argv[2]) if len(argv) > 2 else 93
+    if nlayers <= 0:
+        raise ValueError("n_layers must be positive")
+    remote = None
+    if os.path.exists(os.path.join(src, ".k3-remote")):
+        from remote_model import Source
+        # Read directly to the trunk: do not duplicate its ~109 GB in the range cache.
+        remote = Source(src)
+        for name in ("trunk.bin", "trunk.json", "trunk.bin.part"):
+            if os.path.exists(os.path.join(out, name)):
+                raise ValueError("remote packing needs a fresh output directory: " + out)
     os.makedirs(out, exist_ok=True)
 
     shard_names = sorted(fn for fn in os.listdir(src) if fn.endswith(".safetensors"))
@@ -76,11 +88,28 @@ def main():
     print("indexed %d trunk tensors; skipped %d routed-expert metadata entries"
           % (len(where), skipped_routed))
 
+    if remote:
+        # The source checkpoint is never staged locally. Reserve only the exact
+        # aligned trunk output, plus room for metadata, before a lengthy transfer.
+        need = 0
+        for layer in range(nlayers):
+            prefix = "language_model.model.layers.%d." % layer
+            own = sum(value[2] for name, value in where.items() if name.startswith(prefix))
+            if own == 0:
+                raise ValueError("missing trunk tensors for layer %d" % layer)
+            need += (own + ALIGN - 1) & ~(ALIGN - 1)
+        if shutil.disk_usage(out).free < need + (64 << 20):
+            raise OSError("not enough free disk for %.2f GB trunk plus 64 MiB reserve"
+                          % (need / 1e9))
+        print("remote trunk output: %.2f GB; no full-shard staging or cache copy"
+              % (need / 1e9), flush=True)
+
     manifest = {"n_layers": nlayers, "align": ALIGN, "layers": []}
     total = 0
     t0 = time.time()
     outp = os.path.join(out, "trunk.bin")
-    with open(outp, "wb") as dst:
+    write_path = outp + ".part" if remote else outp
+    with open(write_path, "xb" if remote else "wb") as dst:
         for L in range(nlayers):
             pre = "language_model.model.layers.%d." % L
             mine = {k: v for k, v in where.items()
@@ -112,7 +141,8 @@ def main():
                 dst.write(b"\0" * pad)
             file_off = dst.tell()
             assert file_off % ALIGN == 0
-            with open(sp, "rb") as f:
+            reader = (remote.reader(os.path.basename(sp)) if remote else open(sp, "rb"))
+            with reader as f:
                 f.seek(lo)
                 left = own
                 while left:
@@ -156,6 +186,8 @@ def main():
                       % (L + 1, nlayers, total / 1e9, el, total / 1e6 / max(el, 1e-9)))
                 sys.stdout.flush()
 
+    if remote:
+        os.replace(write_path, outp)
     with open(os.path.join(out, "trunk.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f)
 

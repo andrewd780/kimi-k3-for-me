@@ -1,3 +1,10 @@
+> **This fork: storage below 1 TB (experimental).** A new optional mode keeps the
+> ~109 GB dense trunk locally and fetches expert weights through a bounded disk cache.
+> With a 100 GB cache, budget about **210 GB total**, plus filesystem/session overhead.
+> It needs internet on cache misses and can take minutes per token or longer.
+> **[Setup and limitations: remote storage](docs/REMOTE_STORAGE.md).**
+> The upstream measurements below describe the original full local checkpoint.
+
 <div align="center">
 
 <h1>kimi-k3-in-c</h1>

@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "k3_st.h"
+#include "k3_remote.h"
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -207,8 +208,14 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     uint64_t hlen = 0;
     for (int i = 7; i >= 0; i--) hlen = (hlen << 8) | lenbuf[i];   /* little endian */
 
-    off_t fsize = lseek(fd, 0, SEEK_END);
-    if (hlen == 0 || (uint64_t)fsize < 8 + hlen) {
+    int64_t local_size = (int64_t)lseek(fd, 0, SEEK_END);
+    int64_t fsize = s->remote_socket
+        ? k3_remote_request(s, shard, 0, 0, NULL) : local_size;
+    /* Remote files contain ONLY headers. Validate both the physical header and
+     * the logical remote extent before allocating or accepting any tensor. */
+    if (local_size < 8 || fsize < 8 || hlen == 0 ||
+        hlen > (64u << 20) || hlen > (uint64_t)local_size - 8 ||
+        hlen > (uint64_t)fsize - 8) {
         fprintf(stderr, "k3_st: %s header length %llu is impossible (file %lld bytes)\n",
                 path, (unsigned long long)hlen, (long long)fsize);
         close(fd); return -1;
@@ -343,7 +350,7 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     /* A second descriptor on the same file, for streamed expert reads that must not go
      * through the page cache. Optional: if the filesystem refuses O_DIRECT the reader
      * falls back to fd[]. */
-    if (s->dfd) {
+    if (s->dfd && !s->remote_socket) {
         s->dfd[shard] = open(path, O_RDONLY | O_DIRECT);
         k3_set_direct(s->dfd[shard]);   /* no-op off Darwin; advisory, failure is fine */
     }
@@ -386,12 +393,44 @@ int k3_st_open(K3St *s, const char *dir)
     qsort(files, nf, sizeof *files, cmp_str);
 
     s->path = files; s->nshard = nf;
+    size_t marker_len = strlen(dir) + sizeof "/.k3-remote";
+    char *marker = (char *)malloc(marker_len);
+    if (!marker) { k3_st_close(s); return -1; }
+    snprintf(marker, marker_len, "%s/.k3-remote", dir);
+    FILE *remote = fopen(marker, "rb");
+    free(marker);
+    if (remote) {
+        size_t n = fread(s->remote_id, 1, 64, remote);
+        int newline = fgetc(remote), tail = fgetc(remote);
+        fclose(remote);
+        const char *sock = getenv("K3_REMOTE_SOCKET");
+        if (n != 64 || newline != '\n' || tail != EOF || !sock || !*sock) {
+            fprintf(stderr, "k3_st: remote checkpoint needs tools/remote_model.py run\n");
+            k3_st_close(s); return -1;
+        }
+        for (int i = 0; i < 64; i++) {
+            char v = s->remote_id[i];
+            if (!((v >= '0' && v <= '9') || (v >= 'a' && v <= 'f'))) {
+                k3_st_close(s); return -1;
+            }
+        }
+#ifdef _WIN32
+        fprintf(stderr, "k3_st: remote mode needs Linux, macOS, or WSL\n");
+        k3_st_close(s); return -1;
+#else
+        s->remote_socket = strdup(sock);
+        if (!s->remote_socket) { k3_st_close(s); return -1; }
+#endif
+    }
     s->fd  = (int *)malloc(nf * sizeof(int));
     s->dfd = (int *)malloc(nf * sizeof(int));
     /* k3_st_close, not free(files): s->path was aliased to `files` two lines above, so
      * freeing it here leaves s->path dangling and k3_st_close would free it a second
      * time. Let the one function that owns the teardown do all of it. */
-    if (!s->fd || !s->dfd) { k3_st_close(s); return -1; }
+    if (!s->fd || !s->dfd) {
+        free(s->fd); free(s->dfd); s->fd = NULL; s->dfd = NULL;
+        k3_st_close(s); return -1;
+    }
     for (int i = 0; i < nf; i++) { s->fd[i] = -1; s->dfd[i] = -1; }
 
     Build b; memset(&b, 0, sizeof b);
@@ -435,7 +474,7 @@ void k3_st_close(K3St *s)
     if (s->fd)  { for (int i = 0; i < s->nshard; i++) if (s->fd[i]  >= 0) close(s->fd[i]);  free(s->fd); }
     if (s->dfd) { for (int i = 0; i < s->nshard; i++) if (s->dfd[i] >= 0) close(s->dfd[i]); free(s->dfd); }
     if (s->path) { for (int i = 0; i < s->nshard; i++) free(s->path[i]); free(s->path); }
-    free(s->t); free(s->bucket); free(s->strpool);
+    free(s->t); free(s->bucket); free(s->strpool); free(s->remote_socket);
     memset(s, 0, sizeof *s);
 }
 
@@ -457,7 +496,12 @@ const K3Tensor *k3_st_find(const K3St *s, const char *name)
 int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes,
                            void *buf, int64_t bufcap, int64_t *payload_off)
 {
-    if (shard < 0 || shard >= s->nshard) return 0;
+    if (shard < 0 || shard >= s->nshard || off < 0 || nbytes < 0 ||
+        off > INT64_MAX - nbytes - (K3_ST_ALIGN - 1) || bufcap < nbytes) return 0;
+    if (s->remote_socket) {
+        if (payload_off) *payload_off = 0;
+        return k3_remote_read(s, shard, off, nbytes, buf);
+    }
     const int dfd = s->dfd ? s->dfd[shard] : -1;
 
     if (dfd < 0) {                      /* no O_DIRECT: plain buffered read */
@@ -497,6 +541,10 @@ int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes
 
 int64_t k3_st_read(const K3St *s, const K3Tensor *t, void *buf)
 {
+    if (t->shard < 0 || t->shard >= s->nshard || t->off < 0 ||
+        t->nbytes < 0 || t->off > INT64_MAX - t->nbytes) return 0;
+    if (s->remote_socket)
+        return k3_remote_read(s, t->shard, t->off, t->nbytes, buf);
     /* One coalesced pread, looped only because the kernel may return short. This is the
      * call the streaming tier will make per expert: a 17.55 MB contiguous span. */
     int64_t got = 0;
@@ -541,17 +589,14 @@ int64_t k3_st_read_f32(const K3St *s, const K3Tensor *t, float *out)
     while (done < n) {
         const int64_t take = (n - done < chunk_elems) ? (n - done) : chunk_elems;
         const int64_t want = take * esz;
-        int64_t got = 0;
-        while (got < want) {
-            ssize_t r = pread(s->fd[t->shard], (char *)raw + got, (size_t)(want - got),
-                              (off_t)(t->off + done * esz + got));
-            if (r <= 0) {
-                fprintf(stderr, "k3_st: short read widening %s at element %lld\n",
-                        t->name, (long long)done);
-                free(raw);
-                return done;
-            }
-            got += r;
+        K3Tensor slice = *t;
+        slice.off = t->off + done * esz;
+        slice.nbytes = want;
+        if (k3_st_read(s, &slice, raw) != want) {
+            fprintf(stderr, "k3_st: short read widening %s at element %lld\n",
+                    t->name, (long long)done);
+            free(raw);
+            return done;
         }
 
         float *o = out + done;

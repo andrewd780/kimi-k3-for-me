@@ -1,0 +1,21 @@
+name: Remote storage
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  range-storage:
+    name: Range storage (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile C readers and exercise HTTP/cache failures and parity
+        run: python3 -m unittest discover -s tests -p test_remote_storage.py -v

@@ -54,6 +54,9 @@ typedef struct {
     char     **path;
     int        nshard;
 
+    char      *remote_socket; /* optional range bridge; NULL for local shards */
+    char       remote_id[65]; /* immutable manifest identity, including headers */
+
     K3Tensor  *t;             /* every tensor, in discovery order          */
     int        nt;
 
