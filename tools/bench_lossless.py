@@ -13,6 +13,7 @@ import time
 import zlib
 
 from k3_zstd import Zstd
+from offline_model import unshuffle
 from remote_model import MAX_HEADER, decode, digest, read_range, read_small, validate_header
 
 
@@ -37,10 +38,7 @@ def measure(raw, zstd):
             start = time.perf_counter()
             result = restore(packed)
             if name == "shuffle2_zstd3":
-                original = bytearray(len(raw))
-                half = (len(raw) + 1) // 2
-                original[0::2], original[1::2] = result[:half], result[half:]
-                result = bytes(original)
+                result = unshuffle(result)
             elapsed = time.perf_counter() - start
             if result != raw:
                 raise ValueError("codec roundtrip mismatch")
