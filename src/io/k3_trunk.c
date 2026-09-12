@@ -166,10 +166,20 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         tr->direct = 0;
         tr->fd = open(p, O_RDONLY);
     }
-    if (tr->fd < 0 && errno == ENOENT) {
+    /* Capture immediately. errno is process-global, so any call inserted between the
+     * open above and this test would silently disable compressed-trunk support: the
+     * user would see "cannot open trunk.bin" with trunk.bin.k3z sitting next to it. */
+    const int open_err = tr->fd < 0 ? errno : 0;
+    if (tr->fd < 0 && open_err == ENOENT) {
         snprintf(p, sizeof p, "%s/trunk.bin.k3z", dir);
         tr->fd = open(p, O_RDONLY);
-        if (tr->fd >= 0 && k3_zopen(tr->fd, &tr->zfile)) return -1;
+        if (tr->fd >= 0 && k3_zopen(tr->fd, &tr->zfile)) {
+            /* The archive opened but its index is unusable. k3_zopen already said why;
+             * close here because a caller that gets -1 need not call k3_trunk_close. */
+            close(tr->fd);
+            tr->fd = -1;
+            return -1;
+        }
     }
     if (tr->fd < 0) { fprintf(stderr, "k3_trunk: cannot open %s\n", p); return -1; }
     {

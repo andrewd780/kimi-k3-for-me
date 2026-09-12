@@ -376,6 +376,16 @@ static int cmp_str(const void *a, const void *b)
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+/* Discard a half-built shard path list. Used only on allocation failure, where
+ * returning without it would leak every name collected so far. */
+static int shard_list_oom(char **files, int nf)
+{
+    for (int i = 0; i < nf; i++) free(files[i]);
+    free(files);
+    fprintf(stderr, "k3_st: out of memory\n");
+    return -1;
+}
+
 int k3_st_open(K3St *s, const char *dir)
 {
     memset(s, 0, sizeof *s);
@@ -400,9 +410,17 @@ int k3_st_open(K3St *s, const char *dir)
         size_t n = strlen(e->d_name);
         if (!(n >= 12 && !strcmp(e->d_name + n - 12, ".safetensors")) &&
             !(n >= 16 && !strcmp(e->d_name + n - 16, ".safetensors.k3z"))) continue;
-        if (nf == cf) { cf = cf ? cf * 2 : 32; files = (char **)realloc(files, cf * sizeof *files); }
+        if (nf == cf) {
+            const int want = cf ? cf * 2 : 32;
+            char **grown = (char **)realloc(files, (size_t)want * sizeof *files);
+            /* Refuse rather than write through NULL: the next line indexes files[nf],
+             * and a short shard list would load a model missing whole tensors. */
+            if (!grown) { closedir(d); return shard_list_oom(files, nf); }
+            files = grown; cf = want;
+        }
         size_t len = strlen(dir) + 1 + n + 1;
         files[nf] = (char *)malloc(len);
+        if (!files[nf]) { closedir(d); return shard_list_oom(files, nf); }
         snprintf(files[nf], len, "%s/%s", dir, e->d_name);
         nf++;
     }
