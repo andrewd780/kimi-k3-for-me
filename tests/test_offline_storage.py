@@ -247,6 +247,23 @@ class OfflineStorageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "incomplete"):
             pack_trunk.main([str(packed), str(self.path / "trunk"), "1"])
 
+    def test_copied_index_names_files_that_exist(self):
+        # A verbatim copy would advertise .safetensors shards the packed directory does
+        # not contain: an external tool reading the index sees a complete checkpoint and
+        # gets missing files. Assert against the directory, not against a literal, so
+        # this fails if either the index or the shard naming drifts.
+        source = self.model()
+        (source / "model.safetensors.index.json").write_text(json.dumps({
+            "metadata": {"total_size": 1}, "weight_map": {"a": "model.safetensors"}}))
+        packed = self.path / "packed"
+        with contextlib.redirect_stdout(io.StringIO()):
+            om.pack_model(source, packed)
+        index = json.loads((packed / "model.safetensors.index.json").read_text())
+        self.assertEqual(index["weight_map"], {"a": "model.safetensors.k3z"})
+        for target in index["weight_map"].values():
+            self.assertTrue((packed / target).is_file(), target)
+        self.assertEqual(index["metadata"], {"total_size": 1})
+
     def test_missing_shards_and_header_only_source_refused(self):
         source = self.model()
         (source / "model.safetensors.index.json").write_text(json.dumps({

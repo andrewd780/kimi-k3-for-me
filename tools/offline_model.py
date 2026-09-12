@@ -180,13 +180,16 @@ def pack_file(source, destination, *, block=BLOCK, level=3, shuffle="auto", limi
                     sha.update(raw)
                     flags = 0
                     plain = PREFIX.pack(archive_id, index, 0, 0) + raw
-                    packed = codec.compress(plain, level)
+                    # Only "auto" needs both candidates to compare. Under "on" the
+                    # unshuffled one is discarded unconditionally, so compressing it
+                    # would burn a second full pass over every byte for nothing.
+                    packed = None if shuffle == "on" else codec.compress(plain, level)
                     if shuffle != "off":
                         shuffled = (PREFIX.pack(archive_id, index, 1, 0)
                                     + raw[0::2] + raw[1::2])
                         candidate = codec.compress(shuffled, level)
                         # Avoid paying unshuffle CPU for negligible expert-byte savings.
-                        if shuffle == "on" or len(candidate) < len(packed) * 0.98:
+                        if packed is None or len(candidate) < len(packed) * 0.98:
                             packed, plain, flags = candidate, shuffled, 1
                     if codec.decompress(packed, len(plain)) != plain:
                         raise ValueError("lossless roundtrip verification failed")
@@ -250,6 +253,20 @@ def pack_model(source, destination, **options):
                 and p.suffix in (".json", ".model", ".txt")
                 and p.name not in ("remote.json", "trunk.json", "offline.json")]
     for path in sorted(metadata):
+        if path.name == "model.safetensors.index.json":
+            # Copied verbatim this would publish a weight_map naming .safetensors files
+            # the directory does not contain: a checkpoint that looks complete to any
+            # external tool and is not. The check above already proved the values are
+            # exactly the shard names, and each is written as <name>.k3z below.
+            remapped = json.loads(path.read_text())
+            remapped["weight_map"] = {k: v + ".k3z"
+                                      for k, v in remapped["weight_map"].items()}
+            blob = (json.dumps(remapped, indent=2) + "\n").encode()
+            if limit is not None and used + len(blob) > limit:
+                raise OSError("metadata exceeds --max-output-gb")
+            (destination / path.name).write_bytes(blob)
+            used += len(blob)
+            continue
         n = path.stat().st_size
         if limit is not None and used + n > limit:
             raise OSError("metadata exceeds --max-output-gb")
