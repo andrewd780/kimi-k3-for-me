@@ -805,6 +805,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "--expert-profile and --pin-experts must be supplied together\n");
         return 2;
     }
+    if (expert_profile && k3_cache_check_profile(expert_profile, pin_experts)) return 2;
     if (ultra && !trunk_dir) {
         fprintf(stderr, "--ultra-low-memory needs --trunk; resident trunk cannot fit its "
                         "memory contract\n");
@@ -1168,6 +1169,19 @@ int main(int argc, char **argv)
         printf("\n");
     }
 
+    /* Reject checkpoint geometry, missing selected tensors and impossible pin budgets
+     * after metadata indexing but before binding any trunk, embedding or head weights. */
+    K3Cache cache;
+    if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    if (expert_profile) {
+        if (k3_cache_load_profile(&cache, expert_profile, pin_experts)) {
+            k3_cache_free(&cache);
+            return 1;
+        }
+        printf("expert profile: %d lazy pins, %d slots remain evictable\n",
+               cache.profile_pins, cache.nslot - cache.profile_pins);
+    }
+
     Weights w; memset(&w, 0, sizeof w);
     w.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
     if (!w.lay) return 1;
@@ -1215,16 +1229,6 @@ int main(int argc, char **argv)
     else
         printf("embedding, final norm and lm_head: %s in %.1f s\n\n", b1, now_s() - t0);
 
-    K3Cache cache;
-    if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
-    if (expert_profile) {
-        if (k3_cache_load_profile(&cache, expert_profile, pin_experts)) {
-            k3_cache_free(&cache);
-            return 1;
-        }
-        printf("expert profile: %d lazy pins, %d slots remain evictable\n",
-               cache.profile_pins, cache.nslot - cache.profile_pins);
-    }
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);

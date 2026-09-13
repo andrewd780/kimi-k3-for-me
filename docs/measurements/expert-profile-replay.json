@@ -1,4 +1,5 @@
 {
+  "kind": "deterministic replay; one result per arm",
   "source": {
     "path": "tests/fixtures/expert_trace.bin",
     "sha256": "d6a3d7a3353e9028e3a5f2bb74a9acfc792af396e8153839581822bdb2866879",
@@ -95,546 +96,252 @@
       "arena_bytes": 491552768,
       "requested_pin_fraction": 0.0,
       "pins": 0,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 0,
+        "loads": 10304,
+        "projected_expert_payload_bytes": 180807008256
+      }
     },
     {
       "slots": 28,
       "arena_bytes": 491552768,
       "requested_pin_fraction": 0.5,
       "pins": 11,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 45,
-          "loads": 10259,
-          "projected_expert_payload_bytes": 180017381376
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 45,
-          "loads": 10259,
-          "projected_expert_payload_bytes": 180017381376
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 45,
-          "loads": 10259,
-          "projected_expert_payload_bytes": 180017381376
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 45,
+        "loads": 10259,
+        "projected_expert_payload_bytes": 180017381376
+      }
     },
     {
       "slots": 28,
       "arena_bytes": 491552768,
       "requested_pin_fraction": 1.0,
       "pins": 11,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 45,
-          "loads": 10259,
-          "projected_expert_payload_bytes": 180017381376
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 45,
-          "loads": 10259,
-          "projected_expert_payload_bytes": 180017381376
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 45,
-          "loads": 10259,
-          "projected_expert_payload_bytes": 180017381376
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 45,
+        "loads": 10259,
+        "projected_expert_payload_bytes": 180017381376
+      }
     },
     {
       "slots": 455,
       "arena_bytes": 7987732480,
       "requested_pin_fraction": 0.0,
       "pins": 0,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 0,
+        "loads": 10304,
+        "projected_expert_payload_bytes": 180807008256
+      }
     },
     {
       "slots": 455,
       "arena_bytes": 7987732480,
       "requested_pin_fraction": 0.5,
       "pins": 227,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 333,
-          "loads": 9971,
-          "projected_expert_payload_bytes": 174963769344
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 333,
-          "loads": 9971,
-          "projected_expert_payload_bytes": 174963769344
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 333,
-          "loads": 9971,
-          "projected_expert_payload_bytes": 174963769344
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 333,
+        "loads": 9971,
+        "projected_expert_payload_bytes": 174963769344
+      }
     },
     {
       "slots": 455,
       "arena_bytes": 7987732480,
       "requested_pin_fraction": 1.0,
       "pins": 438,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 449,
-          "loads": 9855,
-          "projected_expert_payload_bytes": 172928286720
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 449,
-          "loads": 9855,
-          "projected_expert_payload_bytes": 172928286720
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 449,
-          "loads": 9855,
-          "projected_expert_payload_bytes": 172928286720
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 449,
+        "loads": 9855,
+        "projected_expert_payload_bytes": 172928286720
+      }
     },
     {
       "slots": 615,
       "arena_bytes": 10796605440,
       "requested_pin_fraction": 0.0,
       "pins": 0,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 0,
+        "loads": 10304,
+        "projected_expert_payload_bytes": 180807008256
+      }
     },
     {
       "slots": 615,
       "arena_bytes": 10796605440,
       "requested_pin_fraction": 0.5,
       "pins": 307,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 418,
-          "loads": 9886,
-          "projected_expert_payload_bytes": 173472251904
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 418,
-          "loads": 9886,
-          "projected_expert_payload_bytes": 173472251904
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 418,
-          "loads": 9886,
-          "projected_expert_payload_bytes": 173472251904
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 418,
+        "loads": 9886,
+        "projected_expert_payload_bytes": 173472251904
+      }
     },
     {
       "slots": 615,
       "arena_bytes": 10796605440,
       "requested_pin_fraction": 1.0,
       "pins": 598,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 511,
-          "loads": 9793,
-          "projected_expert_payload_bytes": 171840356352
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 511,
-          "loads": 9793,
-          "projected_expert_payload_bytes": 171840356352
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 511,
-          "loads": 9793,
-          "projected_expert_payload_bytes": 171840356352
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 511,
+        "loads": 9793,
+        "projected_expert_payload_bytes": 171840356352
+      }
     },
     {
       "slots": 1344,
       "arena_bytes": 23594532864,
       "requested_pin_fraction": 0.0,
       "pins": 0,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 0,
-          "loads": 10304,
-          "projected_expert_payload_bytes": 180807008256
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 0,
+        "loads": 10304,
+        "projected_expert_payload_bytes": 180807008256
+      }
     },
     {
       "slots": 1344,
       "arena_bytes": 23594532864,
       "requested_pin_fraction": 0.5,
       "pins": 672,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 549,
-          "loads": 9755,
-          "projected_expert_payload_bytes": 171173560320
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 549,
-          "loads": 9755,
-          "projected_expert_payload_bytes": 171173560320
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 549,
-          "loads": 9755,
-          "projected_expert_payload_bytes": 171173560320
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 549,
+        "loads": 9755,
+        "projected_expert_payload_bytes": 171173560320
+      }
     },
     {
       "slots": 1344,
       "arena_bytes": 23594532864,
       "requested_pin_fraction": 1.0,
       "pins": 1327,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 1015,
-          "loads": 9289,
-          "projected_expert_payload_bytes": 162996535296
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 1015,
-          "loads": 9289,
-          "projected_expert_payload_bytes": 162996535296
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 1015,
-          "loads": 9289,
-          "projected_expert_payload_bytes": 162996535296
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 1015,
+        "loads": 9289,
+        "projected_expert_payload_bytes": 162996535296
+      }
     },
     {
       "slots": 2073,
       "arena_bytes": 36392460288,
       "requested_pin_fraction": 0.0,
       "pins": 0,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 3569,
-          "loads": 6735,
-          "projected_expert_payload_bytes": 118180823040
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 3569,
-          "loads": 6735,
-          "projected_expert_payload_bytes": 118180823040
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 3569,
-          "loads": 6735,
-          "projected_expert_payload_bytes": 118180823040
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 3569,
+        "loads": 6735,
+        "projected_expert_payload_bytes": 118180823040
+      }
     },
     {
       "slots": 2073,
       "arena_bytes": 36392460288,
       "requested_pin_fraction": 0.5,
       "pins": 1036,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 3774,
-          "loads": 6530,
-          "projected_expert_payload_bytes": 114583633920
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 3774,
-          "loads": 6530,
-          "projected_expert_payload_bytes": 114583633920
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 3774,
-          "loads": 6530,
-          "projected_expert_payload_bytes": 114583633920
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 3774,
+        "loads": 6530,
+        "projected_expert_payload_bytes": 114583633920
+      }
     },
     {
       "slots": 2073,
       "arena_bytes": 36392460288,
       "requested_pin_fraction": 1.0,
       "pins": 2056,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 3828,
-          "loads": 6476,
-          "projected_expert_payload_bytes": 113636081664
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 3828,
-          "loads": 6476,
-          "projected_expert_payload_bytes": 113636081664
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 3828,
-          "loads": 6476,
-          "projected_expert_payload_bytes": 113636081664
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 3828,
+        "loads": 6476,
+        "projected_expert_payload_bytes": 113636081664
+      }
     },
     {
       "slots": 3647,
       "arena_bytes": 64024748032,
       "requested_pin_fraction": 0.0,
       "pins": 0,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 4202,
-          "loads": 6102,
-          "projected_expert_payload_bytes": 107073404928
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4202,
-          "loads": 6102,
-          "projected_expert_payload_bytes": 107073404928
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4202,
-          "loads": 6102,
-          "projected_expert_payload_bytes": 107073404928
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 4202,
+        "loads": 6102,
+        "projected_expert_payload_bytes": 107073404928
+      }
     },
     {
       "slots": 3647,
       "arena_bytes": 64024748032,
       "requested_pin_fraction": 0.5,
       "pins": 1823,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 4179,
-          "loads": 6125,
-          "projected_expert_payload_bytes": 107476992000
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4179,
-          "loads": 6125,
-          "projected_expert_payload_bytes": 107476992000
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4179,
-          "loads": 6125,
-          "projected_expert_payload_bytes": 107476992000
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 4179,
+        "loads": 6125,
+        "projected_expert_payload_bytes": 107476992000
+      }
     },
     {
       "slots": 3647,
       "arena_bytes": 64024748032,
       "requested_pin_fraction": 1.0,
       "pins": 3630,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 4212,
-          "loads": 6092,
-          "projected_expert_payload_bytes": 106897932288
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4212,
-          "loads": 6092,
-          "projected_expert_payload_bytes": 106897932288
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4212,
-          "loads": 6092,
-          "projected_expert_payload_bytes": 106897932288
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 4212,
+        "loads": 6092,
+        "projected_expert_payload_bytes": 106897932288
+      }
     },
     {
       "slots": 6208,
       "arena_bytes": 108984270848,
       "requested_pin_fraction": 0.0,
       "pins": 0,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 4396,
+        "loads": 5908,
+        "projected_expert_payload_bytes": 103669235712
+      }
     },
     {
       "slots": 6208,
       "arena_bytes": 108984270848,
       "requested_pin_fraction": 0.5,
       "pins": 3104,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 4396,
+        "loads": 5908,
+        "projected_expert_payload_bytes": 103669235712
+      }
     },
     {
       "slots": 6208,
       "arena_bytes": 108984270848,
       "requested_pin_fraction": 1.0,
       "pins": 5682,
-      "runs": [
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        },
-        {
-          "requests": 10304,
-          "resident_reuses": 4396,
-          "loads": 5908,
-          "projected_expert_payload_bytes": 103669235712
-        }
-      ]
+      "result": {
+        "requests": 10304,
+        "resident_reuses": 4396,
+        "loads": 5908,
+        "projected_expert_payload_bytes": 103669235712
+      }
     }
   ]
 }

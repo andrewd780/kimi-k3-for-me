@@ -1,5 +1,8 @@
 """Adversarial trace conversion and held-out profile replay, without model weights."""
 from collections import OrderedDict
+import contextlib
+import io
+import json
 from pathlib import Path
 import random
 import struct
@@ -70,11 +73,29 @@ class ProfileTests(unittest.TestCase):
         train = [5, 1, 5, 1, 2]
         ranked = ep.rank(train)
         self.assertEqual(ranked, [(1, 2), (5, 2), (2, 1)])
+        self.assertEqual(ep.rank(ep.Counter(train)), ranked)
         self.assertNotIn(99, dict(ranked))
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "profile.txt"
             ep.write_profile(path, ranked, 1, 8, 2)
             self.assertEqual(path.read_text(), "K3EXPERTS 1 1 8 2\n0 1 2\n0 5 2\n0 2 1\n")
+
+    def test_evaluation_reports_one_deterministic_result_per_arm(self):
+        with tempfile.TemporaryDirectory() as temp:
+            trace, out = Path(temp) / "trace.bin", Path(temp) / "result.json"
+            trace.write_bytes(b"".join(struct.pack("<ii", 0, key)
+                                      for key in [0, 1, 0, 2, 0, 1, 0, 2]))
+            args = ["evaluate", str(trace), "--n-layers", "1", "--n-experts", "4",
+                    "--topk", "1", "--slots", "3", "--train-requests", "4",
+                    "--pin-fractions", "0,1", "--out", str(out)]
+            self.assertEqual(ep.main(args), 0)
+            report = json.loads(out.read_text())
+            self.assertEqual(len(report["arms"]), 2)
+            for arm in report["arms"]:
+                self.assertNotIn("runs", arm)
+                self.assertEqual(arm["result"]["requests"], 4)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                ep.main([*args, "--runs", "3"])
 
 
 if __name__ == "__main__":

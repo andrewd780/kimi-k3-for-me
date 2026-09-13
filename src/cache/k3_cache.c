@@ -48,7 +48,7 @@ static void fill_q(const K3Cache *c, int slot, K3ExpertQ *q)
  * handed the SAME slot, several parallel reads wrote into one buffer, and the MoE
  * multiplied garbage. It cost one wrong token (65 instead of 2494) on the real model and
  * nothing at all in the fixtures, because no fixture exercises the streaming cache. */
-static int pick_victim(K3Cache *c, int layer, const int *ids, int n)
+static int pick_victim(K3Cache *c, int protect_batch)
 {
     int best = -1;
     uint64_t oldest = (uint64_t)-1;
@@ -58,13 +58,7 @@ static int pick_victim(K3Cache *c, int layer, const int *ids, int n)
         if (c->pinned[i] || c->hot_key[c->key_of[i]]) continue;
         /* A batch must not evict a resident member of its own requested set. For a
          * prefill union larger than capacity, stop prefetching and let get() stream. */
-        int requested = 0;
-        if (n && c->key_of[i] / c->n_experts == layer) {
-            const int expert = c->key_of[i] % c->n_experts;
-            for (int j = 0; j < n; j++)
-                if (ids[j] == expert) { requested = 1; break; }
-        }
-        if (requested) continue;
+        if (protect_batch && c->requested[c->key_of[i]]) continue;
         if (c->used_at[i] < oldest) { oldest = c->used_at[i]; best = i; }
     }
     return best;
@@ -90,7 +84,7 @@ static int admit(K3Cache *c, int layer, int expert)
         return -1;
     }
 
-    slot = pick_victim(c, 0, NULL, 0);
+    slot = pick_victim(c, 0);
     if (slot < 0) {
         fprintf(stderr, "k3_cache: every slot is pinned, cannot admit L%d expert %d\n",
                 layer, expert);
@@ -152,6 +146,12 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
     int nw = 0;
     const int cap = (int)(sizeof w / sizeof *w);
 
+    /* Mark once, so each victim candidate gets an O(1) membership check even for
+     * a large prefill union. Only this serial reservation phase uses the marks. */
+    for (int i = 0; i < n; i++)
+        if (ids[i] >= 0 && ids[i] < c->n_experts)
+            c->requested[layer * c->n_experts + ids[i]] = 1;
+
     /* ---- phase 1: reserve, serially ---- */
     for (int i = 0; i < n && nw < cap; i++) {
         const int e = ids[i];
@@ -167,7 +167,7 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
         if (k3_expert_ref(c->st, layer, e, &r) != 0) continue;
         if (r.nbytes > c->slot_bytes) continue;
 
-        const int slot = pick_victim(c, layer, ids, n);
+        const int slot = pick_victim(c, 1);
         if (slot < 0) break;
         if (c->key_of[slot] >= 0) { c->slot_of[c->key_of[slot]] = -1; c->evictions++; }
         /* INFLIGHT, not EMPTY. Marking it empty made pick_victim's fast path hand the
@@ -178,6 +178,10 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
         w[nw].slot = slot; w[nw].expert = e; w[nw].r = r; w[nw].got = -1; w[nw].pad = 0;
         nw++;
     }
+    /* Clear even when reservation stopped early or the entire batch was resident. */
+    for (int i = 0; i < n; i++)
+        if (ids[i] >= 0 && ids[i] < c->n_experts)
+            c->requested[layer * c->n_experts + ids[i]] = 0;
     if (nw == 0) return 0;
 
     /* Issue in DISK-OFFSET order. Experts are not stored id-ordered inside a shard, so
@@ -360,12 +364,13 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->used_at = (uint64_t *)calloc((size_t)c->nslot, sizeof(uint64_t));
     c->pinned  = (unsigned char *)calloc((size_t)c->nslot, 1);
     c->hot_key = (unsigned char *)calloc(nkey, 1);
+    c->requested = (unsigned char *)calloc(nkey, 1);
     c->fresh   = (unsigned char *)calloc((size_t)c->nslot, 1);
     c->ref     = (K3ExpertRef *)calloc((size_t)c->nslot, sizeof(K3ExpertRef));
     c->pad     = (int32_t *)calloc((size_t)c->nslot, sizeof(int32_t));
     c->hist    = (uint32_t *)calloc(nkey, sizeof(uint32_t));
     if (!c->slot_of || !c->key_of || !c->used_at || !c->pinned || !c->ref ||
-        !c->pad || !c->hist || !c->hot_key || !c->fresh) {
+        !c->pad || !c->hist || !c->hot_key || !c->fresh || !c->requested) {
         k3_cache_free(c); return -1;
     }
     for (size_t i = 0; i < nkey; i++) c->slot_of[i] = -1;
@@ -379,6 +384,7 @@ void k3_cache_free(K3Cache *c)
     free(c->used_at); free(c->pinned); free(c->ref); free(c->pad); free(c->hist);
     free(c->trace);
     free(c->hot_key); free(c->fresh);
+    free(c->requested);
     memset(c, 0, sizeof *c);
 }
 
@@ -428,13 +434,70 @@ static int profile_fields(const char *s, uint64_t *v, int n)
         char *end;
         errno = 0;
         unsigned long long x = strtoull(s, &end, 10);
-        if (errno == ERANGE || x > UINT64_MAX) return -1;
+        if (errno == ERANGE) return -1;
         v[i] = (uint64_t)x;
         s = end;
         if (i + 1 < n && *s != ' ' && *s != '\t') return -1;
     }
     while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
     return *s ? -1 : 0;
+}
+
+static int read_profile(K3Cache *c, const char *path, int count)
+{
+    if (count <= 0) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "k3_cache: cannot open profile %s\n", path); return -1; }
+    unsigned char *selected = NULL, *seen = NULL;
+    int ok = 0, rows = 0;
+    char line[192];
+    uint64_t v[4], prev_count = UINT64_MAX;
+    int prev_key = -1;
+    if (!fgets(line, sizeof line, f) || strncmp(line, "K3EXPERTS ", 10) ||
+        !strchr(line, '\n') || profile_fields(line + 10, v, 4) ||
+        v[0] != 1 || !v[1] || v[1] > 4096 || !v[2] || v[2] > 65536 ||
+        !v[3] || v[3] > K3_MAX_TOPK || v[3] > v[2]) goto done;
+    /* Bounds match the producer and keep key products within int32. Preflight has
+     * no checkpoint config yet; installation checks the declared geometry again. */
+    const int n_layers = (int)v[1], n_experts = (int)v[2];
+    if (c && (n_layers != c->n_layers || n_experts != c->n_experts ||
+              v[3] != (uint64_t)c->topk)) goto done;
+    const size_t nkey = (size_t)n_layers * n_experts;
+    if ((size_t)count > nkey) goto done;
+    seen = (unsigned char *)calloc(nkey, 1);
+    if (c) selected = (unsigned char *)calloc(nkey, 1);
+    if (!seen || (c && !selected)) goto done;
+    while (fgets(line, sizeof line, f)) {
+        if (!strchr(line, '\n') || profile_fields(line, v, 3) ||
+            v[0] >= (uint64_t)n_layers || v[1] >= (uint64_t)n_experts ||
+            !v[2] || v[2] > prev_count) goto done;
+        const int key = (int)v[0] * n_experts + (int)v[1];
+        if (seen[key] || (v[2] == prev_count && key <= prev_key)) goto done;
+        seen[key] = 1;
+        prev_key = key; prev_count = v[2];
+        if (c && rows < count) {
+            K3ExpertRef ref;
+            if (k3_expert_ref(c->st, (int)v[0], (int)v[1], &ref)) goto done;
+            selected[key] = 1;
+        }
+        rows++;
+    }
+    if (ferror(f) || rows < count) goto done;
+    if (c) {
+        memcpy(c->hot_key, selected, nkey);
+        c->profile_pins = count;
+    }
+    ok = 1;
+done:
+    free(selected); free(seen); fclose(f);
+    if (!ok) fprintf(stderr, "k3_cache: invalid/incompatible profile %s "
+                            "or fewer than %d ranked experts\n", path, count);
+    return ok ? 0 : -1;
+}
+
+int k3_cache_check_profile(const char *path, int count)
+{
+    return read_profile(NULL, path, count);
 }
 
 int k3_cache_load_profile(K3Cache *c, const char *path, int count)
@@ -445,44 +508,7 @@ int k3_cache_load_profile(K3Cache *c, const char *path, int count)
                 c->nslot - c->topk - 1, c->topk);
         return -1;
     }
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "k3_cache: cannot open profile %s\n", path); return -1; }
-    const size_t nkey = (size_t)c->n_layers * c->n_experts;
-    unsigned char *selected = (unsigned char *)calloc(nkey, 1);
-    unsigned char *seen = (unsigned char *)calloc(nkey, 1);
-    int ok = 0, rows = 0;
-    char line[192];
-    uint64_t v[4], prev_count = UINT64_MAX;
-    int prev_key = -1;
-    if (!selected || !seen) goto done;
-    if (!fgets(line, sizeof line, f) || strncmp(line, "K3EXPERTS ", 10) ||
-        !strchr(line, '\n') || profile_fields(line + 10, v, 4) ||
-        v[0] != 1 || v[1] != (uint64_t)c->n_layers ||
-        v[2] != (uint64_t)c->n_experts || v[3] != (uint64_t)c->topk) goto done;
-    while (fgets(line, sizeof line, f)) {
-        if (!strchr(line, '\n') || profile_fields(line, v, 3) ||
-            v[0] >= (uint64_t)c->n_layers || v[1] >= (uint64_t)c->n_experts ||
-            !v[2] || v[2] > prev_count) goto done;
-        const int key = (int)v[0] * c->n_experts + (int)v[1];
-        if (seen[key] || (v[2] == prev_count && key <= prev_key)) goto done;
-        seen[key] = 1;
-        prev_key = key; prev_count = v[2];
-        if (rows < count) {
-            K3ExpertRef ref;
-            if (k3_expert_ref(c->st, (int)v[0], (int)v[1], &ref)) goto done;
-            selected[key] = 1;
-        }
-        rows++;
-    }
-    if (ferror(f) || rows < count) goto done;
-    memcpy(c->hot_key, selected, nkey);
-    c->profile_pins = count;
-    ok = 1;
-done:
-    free(selected); free(seen); fclose(f);
-    if (!ok) fprintf(stderr, "k3_cache: invalid/incompatible profile %s "
-                            "or fewer than %d ranked experts\n", path, count);
-    return ok ? 0 : -1;
+    return read_profile(c, path, count);
 }
 
 void k3_cache_reset_stats(K3Cache *c)

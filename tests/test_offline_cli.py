@@ -225,6 +225,8 @@ class OfflineCliTests(unittest.TestCase):
                 result = self.run_cli(self.plain, ["--ids", "1", "--expert-profile",
                                                   profile, "--pin-experts", "1"], ok=False)
                 self.assertIn("profile", result.stderr)
+                self.assertNotIn("bound 13/13", result.stdout)
+                self.assertNotIn("embedding, final norm and lm_head:", result.stdout)
         profile.write_text(header + "1 0 3\n")
         for value in ("0", "-1", "2.5", "99999999999999999999", "100000"):
             with self.subTest(value=value):
@@ -234,6 +236,21 @@ class OfflineCliTests(unittest.TestCase):
         self.run_cli(self.plain, ["--ids", "1", "--pin-experts", "1"], ok=False)
         self.run_cli(self.plain, ["--ids", "1", "--expert-profile", profile,
                                   "--pin-experts", "2"], ok=False)
+
+    def test_profile_preflight_precedes_even_config_or_shard_access(self):
+        absent_model = self.path / "no-model-directory"
+        profile = self.path / "profile.txt"
+        for text in (None, "not a profile\n", "K3EXPERTS 1 4294967296 8 2\n",
+                     "K3EXPERTS 1 13 4294967296 2\n", "K3EXPERTS 1 13 8 0\n",
+                     "K3EXPERTS 1 13 8 65\n", "K3EXPERTS 1 13 8 2\n1 0 2\n1 0 1\n"):
+            with self.subTest(text=text):
+                if text is not None:
+                    profile.write_text(text)
+                result = self.run_cli(absent_model, ["--ids", "1", "--expert-profile",
+                                                     profile, "--pin-experts", "1"], ok=False)
+                self.assertIn("profile", result.stderr)
+                self.assertNotIn("config:", result.stdout)
+                self.assertNotIn("indexed", result.stdout)
 
 
 if __name__ == "__main__":

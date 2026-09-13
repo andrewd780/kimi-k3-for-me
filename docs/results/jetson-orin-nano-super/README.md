@@ -41,13 +41,30 @@ previous layer has finished consuming it.
 
 - NVIDIA Jetson Orin Nano Super, six visible CPU cores;
 - Ubuntu 22.04.5 LTS, Jetson Linux R36.4.4, Linux 5.15.148-tegra, `aarch64`;
-- scalar/ARM C path with OpenMP; no CUDA inference implementation;
+- ARM CPU path with OpenMP; no CUDA inference implementation;
 - official checkpoint and routed experts on `/dev/sda2`, a rotating external HDD;
 - packed 93-layer dense trunk on `/dev/nvme0n1p1`, the internal NVMe.
 
 The expert loader used serial reads (`K3_NOPREFETCH=1`) to avoid multi-stream seeks on
 the HDD. That changes I/O scheduling only; routing, weights, accumulation and output are
 unchanged.
+
+### SIMD provenance is not fully captured
+
+The original description called this the "scalar/ARM C path". That does not establish
+that NEON was disabled. The published runtime snapshot `b2f5b5bc6f1f575f6506e658299366b643dad053`
+already contains BF16, MXFP4 and q8 NEON paths guarded by
+`defined(__ARM_NEON) && defined(__aarch64__)` in `src/core/k3_ops.c`; its Linux aarch64
+Makefile defaults to `-mcpu=native`. The NEON addition is commit
+`f46c8cd18b904bd520f6b7993b7163e24e0ce8b8`, an ancestor of the snapshot.
+
+Those defaults point toward NEON, but the actual compiler invocation, macro dump and
+executable from the experiment are not included here. The source manifest claim below
+cannot recover overridden build flags. Until a build log or the recorded binary is
+available, the executed SIMD path remains **unconfirmed**. Do not label 949 s as a
+scalar-only measurement or an Apple Silicon estimate. It is also first-token latency
+including the five-position prompt: the recorded expert payload is 99.70 GB, not the
+25.83 GB of a cold one-position decode step.
 
 ## Checkpoint identity
 
