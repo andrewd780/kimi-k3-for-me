@@ -62,7 +62,7 @@ jobs:
           K3_PROFILE_REPORT: expert-profile-tiny-ci.json
         run: python3 -m unittest discover -s tests -p test_offline_cli.py -v
       - name: Preserve CI fixture measurements
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: expert-profile-ci

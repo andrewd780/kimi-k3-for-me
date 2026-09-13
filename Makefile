@@ -143,6 +143,11 @@ LDFLAGS  ?= -lm $(OMP_LDFLAGS) -pthread
 INCLUDES := -Iinclude -Iinclude/k3 -Ithird_party \
             -Isrc/core -Isrc/io -Isrc/cache -Isrc/model -Isrc/tokenizer
 
+# Experimental KDA SIMD; current CI timing does not justify enabling it by default.
+ifeq ($(KDA_SIMD),1)
+  INCLUDES += -DK3_KDA_SIMD
+endif
+
 # Optional native offline decompression. Use a separate BUILD/BIN when switching
 # options: make does not track changes to command-line compiler flags.
 ifeq ($(ZSTD),1)

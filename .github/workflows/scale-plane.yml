@@ -1,0 +1,43 @@
+name: E8M0 scale samples
+on:
+  pull_request:
+    paths:
+      - tools/bench_lossless.py
+      - tests/test_lossless_sampling.py
+      - .github/workflows/scale-plane.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - run: sudo apt-get update -qq && sudo apt-get install -y libzstd-dev
+      - name: Validate matched tensor selection without network
+        run: python3 -m unittest discover -s tests -p test_lossless_sampling.py -v
+      # The large sample is explicit: avoid another GB on every later PR edit.
+      - name: Check measurement request
+        id: request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          subject=$(git log -1 --format=%s)
+          requested=false
+          case "$subject" in *'[measure-scales]'*) requested=true ;; esac
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then requested=true; fi
+          echo "measure=$requested" >> "$GITHUB_OUTPUT"
+      - name: Sample eight shards, 32 experts each, all three matrices
+        if: steps.request.outputs.measure == 'true'
+        run: python3 tools/bench_lossless.py --experts-per-shard 32 --max-sample-bytes 1125000000 --out scale-plane.json
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.request.outputs.measure == 'true'
+        with:
+          name: scale-plane
+          path: scale-plane.json

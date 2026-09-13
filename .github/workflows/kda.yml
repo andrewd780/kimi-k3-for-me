@@ -33,7 +33,7 @@ jobs:
           arch=""
           if [ "$(uname -m)" = x86_64 ]; then arch="-mavx2 -mfma"; fi
           make BUILD=build/kda-asan BIN=bin/kda-asan \
-            CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -ffp-contract=off $arch -fsanitize=address,undefined -fno-omit-frame-pointer" \
+            CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -ffp-contract=off -DK3_KDA_SIMD $arch -fsanitize=address,undefined -fno-omit-frame-pointer" \
             LDFLAGS="-lm -fsanitize=address,undefined" bin/kda-asan/test_kda_exact
           ./bin/kda-asan/test_kda_exact
       - uses: actions/upload-artifact@v4

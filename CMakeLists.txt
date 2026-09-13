@@ -26,6 +26,7 @@ endif()
 # the build machine. Off by default so a packaged build is portable.
 option(K3_NATIVE_ARCH "Optimise for the building CPU (-march/-mcpu=native)" OFF)
 option(K3_SANITIZE    "Build with ASan + UBSan"                        OFF)
+option(K3_KDA_SIMD "Enable experimental exact KDA SIMD (not a proven speedup)" OFF)
 option(K3_ZSTD        "Read offline lossless .k3z weights with libzstd" OFF)
 
 find_package(OpenMP)
@@ -75,6 +76,9 @@ target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer)
 
 target_link_libraries(k3 PUBLIC k3_flags m Threads::Threads)
+if(K3_KDA_SIMD)
+  target_compile_definitions(k3 PUBLIC K3_KDA_SIMD)
+endif()
 if(K3_ZSTD)
   find_path(K3_ZSTD_INCLUDE_DIR zstd.h)
   find_library(K3_ZSTD_LIBRARY NAMES zstd)

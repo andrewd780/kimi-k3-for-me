@@ -1,0 +1,686 @@
+[
+  {
+    "head_commit": "6152391e57c8a655945d516d88f72532015978d5",
+    "job_id": 103752899990,
+    "schema": 1,
+    "kind": "synthetic KDA kernel; no model I/O or s/token claim",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "isa": "AVX2",
+    "compiler": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "ci_run": "34768209265",
+    "revision": "5090b47ef2622c63615c987cef5a51394a89e6c9",
+    "threads": 1,
+    "heads": 96,
+    "head_dim": 128,
+    "order": [
+      {
+        "arm": "original_c",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 3
+      },
+      {
+        "arm": "simd",
+        "run": 3
+      }
+    ],
+    "arms": {
+      "original_c": {
+        "arch_flags": "-mavx2 -mfma -DK3_KDA_FORCE_SCALAR",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "8e3aff89aaef846810f95d8f35d25546c87b9f2499fc8874192d6062bcb2bcd9",
+        "ops_log_sha256": "f44360a98d3cbc345ac7c65e359e5f0c974c7496f07755a51d278de4fd0de738",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.235562306,
+            "ms_per_96_heads": 0.460082629,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.236125071,
+            "ms_per_96_heads": 0.461181779,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.23418787,
+            "ms_per_96_heads": 0.457398184,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          }
+        ],
+        "median_ms_per_96_heads": 0.460082629,
+        "spread_fraction": 0.008271993926412329
+      },
+      "simd": {
+        "arch_flags": "-mavx2 -mfma",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "8e3aff89aaef846810f95d8f35d25546c87b9f2499fc8874192d6062bcb2bcd9",
+        "ops_log_sha256": "f44360a98d3cbc345ac7c65e359e5f0c974c7496f07755a51d278de4fd0de738",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.319575695,
+            "ms_per_96_heads": 0.624171279,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.316205125,
+            "ms_per_96_heads": 0.617588135,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.319205083,
+            "ms_per_96_heads": 0.623447428,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          }
+        ],
+        "median_ms_per_96_heads": 0.623447428,
+        "spread_fraction": 0.010659440534750625
+      }
+    },
+    "median_speed_ratio": 0.7379653974609067,
+    "limits": "Original C allows compiler auto-vectorisation. One serial batch of 96 heads, repeated warm synthetic inputs. Not an end-to-end decode benchmark."
+  },
+  {
+    "head_commit": "6152391e57c8a655945d516d88f72532015978d5",
+    "job_id": 103752900070,
+    "schema": 1,
+    "kind": "synthetic KDA kernel; no model I/O or s/token claim",
+    "platform": "macOS-14.8.9-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu": "Apple M1 (Virtual)",
+    "isa": "NEON",
+    "compiler": "Apple clang version 15.0.0 (clang-1500.3.9.4)",
+    "ci_run": "34768209265",
+    "revision": "5090b47ef2622c63615c987cef5a51394a89e6c9",
+    "threads": 1,
+    "heads": 96,
+    "head_dim": 128,
+    "order": [
+      {
+        "arm": "original_c",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 3
+      },
+      {
+        "arm": "simd",
+        "run": 3
+      }
+    ],
+    "arms": {
+      "original_c": {
+        "arch_flags": "-DK3_KDA_FORCE_SCALAR",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "10a43b66de7789bbde5666c400b4f862bbda9e5317627f1e5a0ccc1f3b43eec5",
+        "ops_log_sha256": "a60b3781943ccc0470a2365c2789cfb11fcd8ebf9e6223bfd94831221bba16e8",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.303374,
+            "ms_per_96_heads": 0.592527344,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.273906,
+            "ms_per_96_heads": 0.534972656,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.293293,
+            "ms_per_96_heads": 0.572837891,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          }
+        ],
+        "median_ms_per_96_heads": 0.572837891,
+        "spread_fraction": 0.10758435474130096
+      },
+      "simd": {
+        "arch_flags": "",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "10a43b66de7789bbde5666c400b4f862bbda9e5317627f1e5a0ccc1f3b43eec5",
+        "ops_log_sha256": "a60b3781943ccc0470a2365c2789cfb11fcd8ebf9e6223bfd94831221bba16e8",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.499714,
+            "ms_per_96_heads": 0.976003906,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.503295,
+            "ms_per_96_heads": 0.982998047,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 512,
+            "seconds": 0.52617,
+            "ms_per_96_heads": 1.027675781,
+            "state_output_fnv1a": "70632fdf14cc76f6"
+          }
+        ],
+        "median_ms_per_96_heads": 0.982998047,
+        "spread_fraction": 0.05294228299942882
+      }
+    },
+    "median_speed_ratio": 0.5827457061061689,
+    "limits": "Original C allows compiler auto-vectorisation. One serial batch of 96 heads, repeated warm synthetic inputs. Not an end-to-end decode benchmark."
+  },
+  {
+    "head_commit": "0cf1109ee7844fa13cd3eeaa8803874f91d8265e",
+    "job_id": 103753224337,
+    "schema": 1,
+    "kind": "synthetic KDA kernel; no model I/O or s/token claim",
+    "platform": "macOS-14.8.9-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu": "Apple M1 (Virtual)",
+    "isa": "NEON",
+    "compiler": "Apple clang version 15.0.0 (clang-1500.3.9.4)",
+    "ci_run": "34768330364",
+    "revision": "e02aca440ddcf6d00a7127842fe407dff33ee086",
+    "threads": 1,
+    "heads": 96,
+    "head_dim": 128,
+    "order": [
+      {
+        "arm": "original_c",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 3
+      },
+      {
+        "arm": "simd",
+        "run": 3
+      }
+    ],
+    "arms": {
+      "original_c": {
+        "arch_flags": "-DK3_KDA_FORCE_SCALAR",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "10a43b66de7789bbde5666c400b4f862bbda9e5317627f1e5a0ccc1f3b43eec5",
+        "ops_log_sha256": "a60b3781943ccc0470a2365c2789cfb11fcd8ebf9e6223bfd94831221bba16e8",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.57031,
+            "ms_per_96_heads": 0.62751709,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.820668,
+            "ms_per_96_heads": 0.688639648,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.584837,
+            "ms_per_96_heads": 0.631063721,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 0.631063721,
+        "spread_fraction": 0.09740381413357203
+      },
+      "simd": {
+        "arch_flags": "",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "10a43b66de7789bbde5666c400b4f862bbda9e5317627f1e5a0ccc1f3b43eec5",
+        "ops_log_sha256": "a60b3781943ccc0470a2365c2789cfb11fcd8ebf9e6223bfd94831221bba16e8",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 3.461228,
+            "ms_per_96_heads": 0.845026367,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 3.165246,
+            "ms_per_96_heads": 0.772765137,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 3.572348,
+            "ms_per_96_heads": 0.872155273,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 0.845026367,
+        "spread_fraction": 0.12861622664015174
+      }
+    },
+    "median_speed_ratio": 0.746797668859012,
+    "limits": "Original C allows compiler auto-vectorisation. One serial batch of 96 heads, repeated warm synthetic inputs. Not an end-to-end decode benchmark."
+  },
+  {
+    "head_commit": "0cf1109ee7844fa13cd3eeaa8803874f91d8265e",
+    "job_id": 103753224461,
+    "schema": 1,
+    "kind": "synthetic KDA kernel; no model I/O or s/token claim",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "isa": "AVX2",
+    "compiler": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "ci_run": "34768330364",
+    "revision": "e02aca440ddcf6d00a7127842fe407dff33ee086",
+    "threads": 1,
+    "heads": 96,
+    "head_dim": 128,
+    "order": [
+      {
+        "arm": "original_c",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 3
+      },
+      {
+        "arm": "simd",
+        "run": 3
+      }
+    ],
+    "arms": {
+      "original_c": {
+        "arch_flags": "-mavx2 -mfma -DK3_KDA_FORCE_SCALAR",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "8e3aff89aaef846810f95d8f35d25546c87b9f2499fc8874192d6062bcb2bcd9",
+        "ops_log_sha256": "f44360a98d3cbc345ac7c65e359e5f0c974c7496f07755a51d278de4fd0de738",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.390328365,
+            "ms_per_96_heads": 0.583576261,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.402600845,
+            "ms_per_96_heads": 0.586572472,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.382656506,
+            "ms_per_96_heads": 0.581703249,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 0.583576261,
+        "spread_fraction": 0.008370630572152645
+      },
+      "simd": {
+        "arch_flags": "-mavx2 -mfma",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "8e3aff89aaef846810f95d8f35d25546c87b9f2499fc8874192d6062bcb2bcd9",
+        "ops_log_sha256": "f44360a98d3cbc345ac7c65e359e5f0c974c7496f07755a51d278de4fd0de738",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.034089089,
+            "ms_per_96_heads": 0.496603781,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.03467456,
+            "ms_per_96_heads": 0.496746719,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 1.942488829,
+            "ms_per_96_heads": 0.474240437,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 0.496603781,
+        "spread_fraction": 0.04745753471039414
+      }
+    },
+    "median_speed_ratio": 1.1751345505764483,
+    "limits": "Original C allows compiler auto-vectorisation. One serial batch of 96 heads, repeated warm synthetic inputs. Not an end-to-end decode benchmark."
+  },
+  {
+    "head_commit": "0ea476753d0fb6e653ed472256a95e9a08c58def",
+    "job_id": 103753936025,
+    "schema": 1,
+    "kind": "synthetic KDA kernel; no model I/O or s/token claim",
+    "platform": "macOS-14.8.9-arm64-arm-64bit",
+    "machine": "arm64",
+    "cpu": "Apple M1 (Virtual)",
+    "isa": "NEON",
+    "compiler": "Apple clang version 15.0.0 (clang-1500.3.9.4)",
+    "ci_run": "34768596191",
+    "revision": "ee9d1b15a52e540a7e44a312f4c112508884e089",
+    "threads": 1,
+    "heads": 96,
+    "head_dim": 128,
+    "order": [
+      {
+        "arm": "original_c",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 3
+      },
+      {
+        "arm": "simd",
+        "run": 3
+      }
+    ],
+    "arms": {
+      "original_c": {
+        "arch_flags": "-DK3_KDA_FORCE_SCALAR",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "10a43b66de7789bbde5666c400b4f862bbda9e5317627f1e5a0ccc1f3b43eec5",
+        "ops_log_sha256": "a60b3781943ccc0470a2365c2789cfb11fcd8ebf9e6223bfd94831221bba16e8",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.322592,
+            "ms_per_96_heads": 0.567039062,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 3.143585,
+            "ms_per_96_heads": 0.767476807,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 3.014392,
+            "ms_per_96_heads": 0.735935547,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 0.735935547,
+        "spread_fraction": 0.3534813709183231
+      },
+      "simd": {
+        "arch_flags": "",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "10a43b66de7789bbde5666c400b4f862bbda9e5317627f1e5a0ccc1f3b43eec5",
+        "ops_log_sha256": "a60b3781943ccc0470a2365c2789cfb11fcd8ebf9e6223bfd94831221bba16e8",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 3.900067,
+            "ms_per_96_heads": 0.952164795,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 4.213382,
+            "ms_per_96_heads": 1.028657715,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 4.274166,
+            "ms_per_96_heads": 1.043497559,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 1.028657715,
+        "spread_fraction": 0.09592117297300412
+      }
+    },
+    "median_speed_ratio": 0.7154328755508337,
+    "limits": "Original C allows compiler auto-vectorisation. One serial batch of 96 heads, repeated warm synthetic inputs. Not an end-to-end decode benchmark."
+  },
+  {
+    "head_commit": "0ea476753d0fb6e653ed472256a95e9a08c58def",
+    "job_id": 103753936062,
+    "schema": 1,
+    "kind": "synthetic KDA kernel; no model I/O or s/token claim",
+    "platform": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "machine": "x86_64",
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "isa": "AVX2",
+    "compiler": "cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "ci_run": "34768596191",
+    "revision": "ee9d1b15a52e540a7e44a312f4c112508884e089",
+    "threads": 1,
+    "heads": 96,
+    "head_dim": 128,
+    "order": [
+      {
+        "arm": "original_c",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 1
+      },
+      {
+        "arm": "simd",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 2
+      },
+      {
+        "arm": "original_c",
+        "run": 3
+      },
+      {
+        "arm": "simd",
+        "run": 3
+      }
+    ],
+    "arms": {
+      "original_c": {
+        "arch_flags": "-mavx2 -mfma -DK3_KDA_FORCE_SCALAR",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "8e3aff89aaef846810f95d8f35d25546c87b9f2499fc8874192d6062bcb2bcd9",
+        "ops_log_sha256": "f44360a98d3cbc345ac7c65e359e5f0c974c7496f07755a51d278de4fd0de738",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.944650988,
+            "ms_per_96_heads": 0.718908933,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.402541522,
+            "ms_per_96_heads": 0.586557989,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.40349446,
+            "ms_per_96_heads": 0.58679064,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 0.58679064,
+        "spread_fraction": 0.22563999891236675
+      },
+      "simd": {
+        "arch_flags": "-mavx2 -mfma",
+        "oracle_bytes": 526336,
+        "oracle_sha256": "8e3aff89aaef846810f95d8f35d25546c87b9f2499fc8874192d6062bcb2bcd9",
+        "ops_log_sha256": "f44360a98d3cbc345ac7c65e359e5f0c974c7496f07755a51d278de4fd0de738",
+        "runs": [
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.167956354,
+            "ms_per_96_heads": 0.529286219,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.168699766,
+            "ms_per_96_heads": 0.529467716,
+            "state_output_fnv1a": "54c6dff35547292d"
+          },
+          {
+            "heads": 96,
+            "head_dim": 128,
+            "batches": 4096,
+            "seconds": 2.179402865,
+            "ms_per_96_heads": 0.532080778,
+            "state_output_fnv1a": "54c6dff35547292d"
+          }
+        ],
+        "median_ms_per_96_heads": 0.529467716,
+        "spread_fraction": 0.005279863521253007
+      }
+    },
+    "median_speed_ratio": 1.1082651921311857,
+    "limits": "Original C allows compiler auto-vectorisation. One serial batch of 96 heads, repeated warm synthetic inputs. Not an end-to-end decode benchmark."
+  }
+]

@@ -190,7 +190,7 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
-#if !defined(K3_KDA_FORCE_SCALAR) && defined(__AVX2__)
+#if defined(K3_KDA_SIMD) && !defined(K3_KDA_FORCE_SCALAR) && defined(__AVX2__)
 typedef __m256 KdaVec;
 #define KDA_WIDTH 8
 #define kda_load _mm256_loadu_ps
@@ -199,7 +199,7 @@ typedef __m256 KdaVec;
 #define kda_add _mm256_add_ps
 #define kda_sub _mm256_sub_ps
 #define kda_mul _mm256_mul_ps
-#elif !defined(K3_KDA_FORCE_SCALAR) && defined(__ARM_NEON) && defined(__aarch64__)
+#elif defined(K3_KDA_SIMD) && !defined(K3_KDA_FORCE_SCALAR) && defined(__ARM_NEON) && defined(__aarch64__)
 typedef float32x4_t KdaVec;
 #define KDA_WIDTH 4
 #define kda_load vld1q_f32

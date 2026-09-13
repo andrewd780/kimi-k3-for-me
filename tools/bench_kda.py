@@ -36,7 +36,7 @@ def main():
     for name in ("original_c", "simd"):
         directory = Path("build") / ("kda-" + name)
         binary = directory / "bin"
-        flags = arch + (" -DK3_KDA_FORCE_SCALAR" if name == "original_c" else "")
+        flags = arch + (" -DK3_KDA_FORCE_SCALAR" if name == "original_c" else " -DK3_KDA_SIMD")
         build = ["make", "-j2", "BUILD=" + str(directory), "BIN=" + str(binary),
                  "ARCH=" + flags, "OMP_CFLAGS=", "OMP_LDFLAGS="]
         targets = ["test_ops", "test_kda_exact", "k3_model", "bench_kda"]
