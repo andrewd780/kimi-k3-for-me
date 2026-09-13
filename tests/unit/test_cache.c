@@ -180,6 +180,66 @@ int main(int argc, char **argv)
       ck(bad3 == 0, "mixed batch and serial", b); }
 
     k3_cache_free(&cache);
+
+    /* Put the requested resident keys at the LRU end. Prefetching a new key must not
+     * evict them and then read them again in the very same batch. */
+    const int64_t stride = (probe.nbytes + 3 * K3_ST_ALIGN - 1)
+                           & ~(int64_t)(K3_ST_ALIGN - 1);
+    if (k3_cache_init(&cache, &st, &c, 8 * stride)) return 2;
+    char profile[4096];
+    snprintf(profile, sizeof profile, "%s/experts.profile", dir);
+    ck(k3_cache_load_profile(&cache, profile, 1) == 0 && cache.profile_pins == 1 &&
+       cache.bytes_read == 0 && cache.slot_of[0] == -1,
+       "profile pins without preloading", NULL);
+    ck(k3_cache_load_profile(&cache, profile, 4) == -1 && cache.profile_pins == 1,
+       "failed profile leaves policy intact", NULL);
+    K3ExpertQ q;
+    for (int e = 0; e < 8; e++)
+        if (cache.src.get(&cache.src, 0, e, &q)) return 2;
+    ck(k3_cache_load_profile(&cache, profile, 1) == -1,
+       "profile cannot change a live cache", NULL);
+    k3_cache_reset_stats(&cache);
+    const int ids[4] = {8, 0, 1, 2};
+    ck(cache.src.getmany(&cache.src, 0, ids, 4) == 1,
+       "batch keeps its resident members", "only expert 8 needs a load");
+    int exact = 1;
+    for (int i = 0; i < 4; i++)
+        if (cache.src.get(&cache.src, 0, ids[i], &q) ||
+            !same_expert(&st, 0, ids[i], &q)) exact = 0;
+    ck(exact && cache.bytes_read == (uint64_t)probe.nbytes,
+       "mixed-residency batch byte-exact", "one payload read");
+    ck(cache.demand_requests == 4 && cache.demand_reuses == 3,
+       "cold prefetch is not reuse", "3 reuses, 4 successful requests");
+
+    const int later = 9;
+    cache.src.getmany(&cache.src, 0, &later, 1);
+    k3_cache_reset_stats(&cache);
+    cache.src.get(&cache.src, 0, later, &q);
+    ck(cache.demand_requests == 1 && cache.demand_reuses == 0,
+       "reset preserves first-use state", "prefetch belongs to an earlier window");
+    cache.src.get(&cache.src, 0, later, &q);
+    ck(cache.demand_requests == 2 && cache.demand_reuses == 1,
+       "second consumption is reuse", NULL);
+    ck(!k3_cache_pin(&cache, -1, NE, 1) &&
+       k3_cache_prefetch(&cache, 0, NE) == -1 &&
+       cache.src.getmany(&cache.src, 1, ids, 4) == -1 &&
+       cache.src.getmany(&cache.src, 0, NULL, 4) == -1,
+       "invalid cache coordinates refused", NULL);
+    ck(k3_cache_pin(&cache, 0, 0, 1) && k3_cache_pin(&cache, 0, 1, 1) &&
+       k3_cache_pin(&cache, 0, 2, 1) && !k3_cache_pin(&cache, 0, 9, 1),
+       "pins leave topk+1 evictable slots", NULL);
+    for (int e = 3; e < NE; e++)
+        if (cache.src.get(&cache.src, 0, e, &q) || !same_expert(&st, 0, e, &q)) exact = 0;
+    ck(exact && cache.src.resident(&cache.src, 0, 0, &q) &&
+       same_expert(&st, 0, 0, &q), "pinned bytes survive pressure", NULL);
+    k3_cache_pin(&cache, 0, 0, 0);
+    k3_cache_pin(&cache, 0, 1, 0);
+    k3_cache_pin(&cache, 0, 2, 0);
+    for (int e = 1; e < NE; e++)
+        if (cache.src.get(&cache.src, 0, e, &q)) exact = 0;
+    ck(exact && cache.src.resident(&cache.src, 0, 0, &q) &&
+       same_expert(&st, 0, 0, &q), "lazy profile pin survives pressure", NULL);
+    k3_cache_free(&cache);
     k3_st_close(&st);
     printf("\n%s\n", g_fail ? "CACHE TESTS FAILED" : "CACHE TESTS PASSED");
     return g_fail ? 1 : 0;

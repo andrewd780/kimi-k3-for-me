@@ -5,6 +5,9 @@
 > **This does not get the full model below 1 TB:** real samples saved 5.7% on packed
 > expert weights and 29.1% on dense BF16 weights. Full-model speed is unmeasured.
 > The earlier [bounded remote cache](docs/REMOTE_STORAGE.md) needs internet on misses.
+> **[Calibrated expert pinning](docs/EXPERT_PROFILES.md)** is now available as an
+> opt-in exact cache policy, with held-out replay, corrected I/O accounting, and native
+> parity tests. The bundled trace contains 12 distinct positions, not 68 new tokens.
 > The upstream measurements below describe the original full local checkpoint.
 
 <div align="center">

@@ -38,6 +38,8 @@ jobs:
           echo "TEST_OMP_FLAGS=-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib -lomp" >> "$GITHUB_ENV"
       - name: Compile and check native ranges, corruption, concurrency and byte parity
         run: python3 -m unittest discover -s tests -p test_offline_storage.py -v
+      - name: Check held-out expert profile replay and trace validation
+        run: python3 -m unittest discover -s tests -p test_expert_profile.py -v
       - name: Build compressed engine and run existing C tests
         run: make ZSTD=1 BUILD=build/zstd BIN=bin/zstd -j4 all test
       - name: Check CMake compressed build

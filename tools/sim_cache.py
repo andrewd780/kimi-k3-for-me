@@ -130,7 +130,10 @@ def main():
     uniq = len(set(trace))
     per_tok = 1472                      # top-16 x 92 MoE layers
     ntok = max(n // per_tok, 1)
-    print("trace: %d requests, %d distinct experts, about %d token(s)" % (n, uniq, ntok))
+    print("trace: %d requests, %d distinct experts, %d position-equivalents" % (n, uniq, ntok))
+    print("Position-equivalents count requests / 1472, NOT new generated tokens.\n"
+          "The bundled fixture repeats prefixes of 5..12 positions. For validated\n"
+          "conversion and held-out calibration, use tools/expert_profile.py.\n")
     print("distinct experts touched: %d of %d (%.2f%% of the pool)"
           % (uniq, TOTAL_EXPERTS, 100.0 * uniq / TOTAL_EXPERTS))
     print("if nothing were cached: %.2f GB per token\n"

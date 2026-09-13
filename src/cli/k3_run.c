@@ -46,6 +46,7 @@
 
 #include <math.h>
 #include <errno.h>
+#include <limits.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -392,6 +393,8 @@ static void usage(FILE *f)
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
+"  --expert-profile PATH ranked calibration profile from tools/expert_profile.py\n"
+"  --pin-experts N        retain N profiled experts on first use; both flags required\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
 "  --layers N            bind only the first N layers (partial shard sets)\n"
 "  --dump-logits PATH    write float32 logits for the first step\n"
@@ -685,6 +688,8 @@ int main(int argc, char **argv)
      * and writing them unconditionally drops two undeclared files into whatever
      * directory the user happened to run from. */
     const char *trace_dir = NULL;
+    const char *expert_profile = NULL;
+    int pin_experts = 0;
     const char *logits_path = NULL;
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
@@ -735,6 +740,18 @@ int main(int argc, char **argv)
             }
         }
         else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--expert-profile") && i + 1 < argc)
+            expert_profile = argv[++i];
+        else if (!strcmp(argv[i], "--pin-experts") && i + 1 < argc) {
+            char *end;
+            errno = 0;
+            const long v = strtol(argv[++i], &end, 10);
+            if (*argv[i] < '0' || *argv[i] > '9' || *end || errno || v < 1 || v > INT_MAX) {
+                fprintf(stderr, "--pin-experts requires a positive integer\n");
+                return 2;
+            }
+            pin_experts = (int)v;
+        }
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
@@ -784,6 +801,10 @@ int main(int argc, char **argv)
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
 
+    if ((expert_profile != NULL) != (pin_experts > 0)) {
+        fprintf(stderr, "--expert-profile and --pin-experts must be supplied together\n");
+        return 2;
+    }
     if (ultra && !trunk_dir) {
         fprintf(stderr, "--ultra-low-memory needs --trunk; resident trunk cannot fit its "
                         "memory contract\n");
@@ -1093,14 +1114,19 @@ int main(int argc, char **argv)
             ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN + 3.0 * E64 * 4
             : 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
         const double w_cache = cache_gb * 1e9;
-        const int Tm = np + gen + 1;
+        const int Tm = prior + np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
         const int Pp = c.kda_heads * c.kda_head_dim;
         const int state_layers = (ultra && !incremental) ? 1 : NL;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
                               + (size_t)3 * Pp * (c.conv_k - 1)) * state_layers * 4;
+        size_t scratch = k3_layer_scratch(&c, Tm);
+        if (incremental) {
+            const size_t cached = k3_mla_scratch_cached(&c, Tm, Tm, 1);
+            if (cached > scratch) scratch = cached;
+        }
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
-                              + (double)k3_layer_scratch(&c, Tm) + (double)c.vocab) * 4;
+                              + (double)scratch + (double)c.vocab) * 4;
         /* The KV cache MUST be in this total: it is the only term that grows with
          * context, so a guard that omits it is blind to the one thing it exists to
          * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
@@ -1191,6 +1217,14 @@ int main(int argc, char **argv)
 
     K3Cache cache;
     if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
+    if (expert_profile) {
+        if (k3_cache_load_profile(&cache, expert_profile, pin_experts)) {
+            k3_cache_free(&cache);
+            return 1;
+        }
+        printf("expert profile: %d lazy pins, %d slots remain evictable\n",
+               cache.profile_pins, cache.nslot - cache.profile_pins);
+    }
     {   /* The plan is a forecast. This is the outcome. */
         char rb[32];
         human(peak_rss_bytes(), rb, sizeof rb);
@@ -1405,7 +1439,7 @@ int main(int argc, char **argv)
     }
 
     printf("%-6s %-10s %-12s %-10s %-10s %s\n",
-           "STEP", "TOKEN", "SECONDS", "CACHE HIT", "READ GB", "TOK/S");
+           "STEP", "TOKEN", "SECONDS", "REUSE %", "EXPERT GB", "TOK/S");
     printf("--------------------------------------------------------------------\n");
     k3_expert_drops = 0;
     double t_total = 0.0;
@@ -1415,6 +1449,7 @@ int main(int argc, char **argv)
      * figure against a single step would misstate the I/O share. */
     double expert_s_total = 0.0, expert_gb_total = 0.0;
     uint64_t expert_reqs_total = 0, expert_evict_total = 0, expert_bytes_total = 0;
+    uint64_t expert_reuses_total = 0;
     /* `nout < gen` drives generation; the `g == 0` disjunct additionally runs the
      * incremental prefill once even when --gen 0, so the prompt's KV and recurrent
      * state are computed and can be saved with ZERO generated tokens. That is what
@@ -1561,16 +1596,17 @@ int main(int argc, char **argv)
         }
         const double dt = now_s() - ts;
         t_total += dt;
-        const uint64_t req = cache.hits + cache.misses;
+        const uint64_t req = cache.demand_requests;
         printf("%-6d %-10d %-12.2f %-10.1f %-10.2f %.3f\n", g, nxt, dt,
-               req ? 100.0 * cache.hits / req : 0.0,
+               req ? 100.0 * cache.demand_reuses / req : 0.0,
                (double)cache.bytes_read / 1e9, 1.0 / dt);
         fflush(stdout);
         /* Roll the per-step figures up before the next reset wipes them. */
         expert_s_total     += cache.load_seconds;
         expert_gb_total    += (double)cache.bytes_read / 1e9;
         expert_bytes_total += cache.bytes_read;
-        expert_reqs_total  += cache.hits + cache.misses;
+        expert_reqs_total  += cache.demand_requests;
+        expert_reuses_total += cache.demand_reuses;
         expert_evict_total += cache.evictions;
         for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
             seq[T++] = emit[i];
@@ -1661,12 +1697,16 @@ int main(int argc, char **argv)
                 "],\"layers\":%d,\"layers_requested\":%d,\"layers_completed\":%d,"
                 "\"expert_drops\":%ld,\"peak_rss_bytes\":%.0f,\"wall_seconds\":%.4f,"
                 "\"seconds_per_token\":%.4f,\"expert_bytes_read\":%llu,"
+                "\"expert_requests\":%llu,\"expert_resident_reuses\":%llu,"
+                "\"expert_cache_slots\":%d,\"expert_profile_pins\":%d,"
                 "\"trunk_bytes_read\":%llu,\"embedding_bytes_read\":%llu,"
                 "\"lm_head_bytes_read\":%llu,\"ultra_low_memory\":%s,"
                 "\"stopped_at\":%d,"
                 "\"generated_text\":",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
                 nout ? t_total / nout : 0.0, (unsigned long long)expert_bytes_total,
+                (unsigned long long)expert_reqs_total,
+                (unsigned long long)expert_reuses_total, cache.nslot, cache.profile_pins,
                 (unsigned long long)(w.trunk ? w.trunk->bytes_read : 0),
                 (unsigned long long)w.ms.embed_bytes_read,
                 (unsigned long long)w.ms.lm_head_bytes_read,
@@ -1711,21 +1751,13 @@ int main(int argc, char **argv)
         if (share > 100.0)
             printf("  over 100%% because trunk reads overlap compute on the reader thread;\n"
                    "  %.1f s of device time was hidden behind arithmetic\n", io_s - t_total);
-        /* Report the DERIVED retention, not the raw hit count. `hits` counts an expert
-         * the batch prefetch pulled off disk microseconds earlier, so it equals the
-         * request count at every cache size and means nothing on its own. An expert that
-         * had to be evicted is one that was not retained, so retained = requests -
-         * evictions. The raw hit count is deliberately not printed beside this
-         * percentage: "35328 of 35328 requests hit ... 2.09%% retained" reads as a
-         * contradiction even though both numbers are correct. */
-        const unsigned long long retained =
-            (expert_reqs_total > expert_evict_total)
-                ? (unsigned long long)(expert_reqs_total - expert_evict_total) : 0ULL;
-        printf("  experts, whole run: %.2f GB read | %llu of %llu requests retained in RAM"
+        /* Count actual reuse. requests-evictions incorrectly credits cold fills,
+         * and raw hits incorrectly credits the first use of prefetched weights. */
+        const unsigned long long retained = (unsigned long long)expert_reuses_total;
+        printf("  experts, whole run: %.2f GB payload read | %llu of %llu requests reused"
                " (%.2f%%) | %llu evictions\n"
-               "    (retention = requests - evictions; the raw `hits` counter includes\n"
-               "     experts the prefetcher had just read from disk, so it is not a\n"
-               "     measure of avoided I/O)\n\n",
+               "    (reuse excludes the first consumption of each load, including\n"
+               "     prefetched loads; expert bytes exclude trunk and model reads)\n\n",
                expert_gb_total, retained,
                (unsigned long long)expert_reqs_total,
                expert_reqs_total ? 100.0 * (double)retained / (double)expert_reqs_total : 0.0,

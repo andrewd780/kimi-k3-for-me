@@ -1,0 +1,198 @@
+{
+  "fixture": "make_tiny_checkpoint.py, 13 layers, 8 experts, top-2",
+  "calibration_ids": [
+    1,
+    2,
+    3
+  ],
+  "evaluation_ids": [
+    4,
+    5,
+    6
+  ],
+  "generated_tokens": 4,
+  "pins": 2,
+  "limitations": "synthetic checkpoint; no real K3 speed or quality claim",
+  "runs": [
+    {
+      "mode": "full",
+      "arm": "plain",
+      "run": 1,
+      "wall_seconds": 0.0319,
+      "expert_bytes_read": 1031424,
+      "expert_requests": 158,
+      "expert_resident_reuses": 0,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "pinned",
+      "run": 1,
+      "wall_seconds": 0.0335,
+      "expert_bytes_read": 992256,
+      "expert_requests": 158,
+      "expert_resident_reuses": 6,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "compressed_pinned",
+      "run": 1,
+      "wall_seconds": 0.0406,
+      "expert_bytes_read": 992256,
+      "expert_requests": 158,
+      "expert_resident_reuses": 6,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "plain",
+      "run": 2,
+      "wall_seconds": 0.0403,
+      "expert_bytes_read": 1031424,
+      "expert_requests": 158,
+      "expert_resident_reuses": 0,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "pinned",
+      "run": 2,
+      "wall_seconds": 0.0327,
+      "expert_bytes_read": 992256,
+      "expert_requests": 158,
+      "expert_resident_reuses": 6,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "compressed_pinned",
+      "run": 2,
+      "wall_seconds": 0.0415,
+      "expert_bytes_read": 992256,
+      "expert_requests": 158,
+      "expert_resident_reuses": 6,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "plain",
+      "run": 3,
+      "wall_seconds": 0.0441,
+      "expert_bytes_read": 1031424,
+      "expert_requests": 158,
+      "expert_resident_reuses": 0,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "pinned",
+      "run": 3,
+      "wall_seconds": 0.0387,
+      "expert_bytes_read": 992256,
+      "expert_requests": 158,
+      "expert_resident_reuses": 6,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "full",
+      "arm": "compressed_pinned",
+      "run": 3,
+      "wall_seconds": 0.0341,
+      "expert_bytes_read": 992256,
+      "expert_requests": 158,
+      "expert_resident_reuses": 6,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "plain",
+      "run": 1,
+      "wall_seconds": 0.0213,
+      "expert_bytes_read": 698496,
+      "expert_requests": 107,
+      "expert_resident_reuses": 0,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "pinned",
+      "run": 1,
+      "wall_seconds": 0.0166,
+      "expert_bytes_read": 678912,
+      "expert_requests": 107,
+      "expert_resident_reuses": 3,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "compressed_pinned",
+      "run": 1,
+      "wall_seconds": 0.026,
+      "expert_bytes_read": 678912,
+      "expert_requests": 107,
+      "expert_resident_reuses": 3,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "plain",
+      "run": 2,
+      "wall_seconds": 0.0179,
+      "expert_bytes_read": 698496,
+      "expert_requests": 107,
+      "expert_resident_reuses": 0,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "pinned",
+      "run": 2,
+      "wall_seconds": 0.016,
+      "expert_bytes_read": 678912,
+      "expert_requests": 107,
+      "expert_resident_reuses": 3,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "compressed_pinned",
+      "run": 2,
+      "wall_seconds": 0.0248,
+      "expert_bytes_read": 678912,
+      "expert_requests": 107,
+      "expert_resident_reuses": 3,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "plain",
+      "run": 3,
+      "wall_seconds": 0.0185,
+      "expert_bytes_read": 698496,
+      "expert_requests": 107,
+      "expert_resident_reuses": 0,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "pinned",
+      "run": 3,
+      "wall_seconds": 0.0162,
+      "expert_bytes_read": 678912,
+      "expert_requests": 107,
+      "expert_resident_reuses": 3,
+      "expert_cache_slots": 6
+    },
+    {
+      "mode": "incremental",
+      "arm": "compressed_pinned",
+      "run": 3,
+      "wall_seconds": 0.022,
+      "expert_bytes_read": 678912,
+      "expert_requests": 107,
+      "expert_resident_reuses": 3,
+      "expert_cache_slots": 6
+    }
+  ]
+}

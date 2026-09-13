@@ -18,6 +18,10 @@ right and this page has a bug.
 Twelve budgets, each enforced by a hard cgroup cap, same prompt, same binary.
 Raw: [data/memory-ladder.tsv](data/memory-ladder.tsv).
 
+The `GB read/tok` column is **expert payload only**, excluding the streamed trunk.
+The tables below are historical measurements, not results for the fork's new cache
+policy. See [the trace audit and calibrated pinning](EXPERT_PROFILES.md) for its scope.
+
 | RAM | pinned layers | expert cache | s/token | vs 8 GB | expert hit | trunk hit | GB read/tok | peak RSS |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 8 | 0 | 0.49 | 32.69 | 1.00× | 0.0% | 0.0% | 25.83 | 8.24 |
@@ -46,8 +50,9 @@ Seven consecutive budgets, a 48× increase in cache size, zero change in bytes m
 
 This is a property of the model, not a defect in the cache. K3's router is trained with
 Quantile Balancing, which deliberately flattens expert usage across the pool. With 16 of
-896 experts selected per layer and no hot subset to exploit, there is nothing for an LRU
-to retain.
+896 experts selected per layer, small LRU caches lose reuse across layer sweeps.
+This does not rule out profiled hot keys; the opt-in policy is evaluated separately in
+[EXPERT_PROFILES.md](EXPERT_PROFILES.md).
 
 **The trunk ring is the one that responds.** Its hit rate tracks pinned layers almost
 exactly:
@@ -97,11 +102,13 @@ there is exploitable locality, and LRU cannot reach it.
 Two things to hold onto:
 
 - **This x-axis is cache size; the ladder's is total budget.** The ladder's 8 GB row has
-  only 0.49 GB of cache (28 slots), which is why it shows 0.0% retention and this table
-  shows 36.2% at 455 slots. They do not disagree.
-- **These are upper bounds, not forecasts.** The trace was recorded during full-recompute
-  decode, which re-touches the same experts ~68 times. Steady-state incremental decode
-  has far less reuse and will do worse. The file says so itself.
+  only 0.49 GB of cache (28 slots). That difference alone does not explain the hit rates:
+  replaying the legacy trace at 28 slots still gives 31.14%.
+- **The workloads also differ.** The trace repeats full prefixes of 5 through 12
+  positions, totaling 68 position evaluations. It contains only 12 distinct positions.
+  Transposing the final pass to position-major order gives 0% LRU reuse at 455 slots.
+  These historical curves do not forecast steady incremental decode or current
+  chunk-union prefill, and they do not establish a budget-allocation bug.
 
 The practical reading: below ~192 GB of *cache alone*, capacity is not the lever. That is
 the same conclusion the fixed-budget sweep below reaches from the opposite direction.

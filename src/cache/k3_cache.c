@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
+#include <limits.h>
 #ifndef _WIN32
 #include <sys/mman.h>   /* MADV_HUGEPAGE; k3_portable_io.h no-ops it on Windows */
 #endif
@@ -46,14 +48,23 @@ static void fill_q(const K3Cache *c, int slot, K3ExpertQ *q)
  * handed the SAME slot, several parallel reads wrote into one buffer, and the MoE
  * multiplied garbage. It cost one wrong token (65 instead of 2494) on the real model and
  * nothing at all in the fixtures, because no fixture exercises the streaming cache. */
-static int pick_victim(K3Cache *c)
+static int pick_victim(K3Cache *c, int layer, const int *ids, int n)
 {
     int best = -1;
     uint64_t oldest = (uint64_t)-1;
     for (int i = 0; i < c->nslot; i++) {
         if (c->key_of[i] == K3_SLOT_INFLIGHT) continue;   /* being read into RIGHT NOW */
         if (c->key_of[i] == K3_SLOT_EMPTY) return i;      /* free, take it */
-        if (c->pinned[i]) continue;
+        if (c->pinned[i] || c->hot_key[c->key_of[i]]) continue;
+        /* A batch must not evict a resident member of its own requested set. For a
+         * prefill union larger than capacity, stop prefetching and let get() stream. */
+        int requested = 0;
+        if (n && c->key_of[i] / c->n_experts == layer) {
+            const int expert = c->key_of[i] % c->n_experts;
+            for (int j = 0; j < n; j++)
+                if (ids[j] == expert) { requested = 1; break; }
+        }
+        if (requested) continue;
         if (c->used_at[i] < oldest) { oldest = c->used_at[i]; best = i; }
     }
     return best;
@@ -79,7 +90,7 @@ static int admit(K3Cache *c, int layer, int expert)
         return -1;
     }
 
-    slot = pick_victim(c);
+    slot = pick_victim(c, 0, NULL, 0);
     if (slot < 0) {
         fprintf(stderr, "k3_cache: every slot is pinned, cannot admit L%d expert %d\n",
                 layer, expert);
@@ -106,6 +117,7 @@ static int admit(K3Cache *c, int layer, int expert)
     c->key_of[slot] = key;
     c->slot_of[key] = slot;
     c->used_at[slot] = ++c->clock;
+    c->fresh[slot] = 1;
     return slot;
 }
 
@@ -131,7 +143,8 @@ static int admit(K3Cache *c, int layer, int expert)
 static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
 {
     K3Cache *c = (K3Cache *)self;
-    if (n <= 0) return 0;
+    if (layer < 0 || layer >= c->n_layers || n < 0 || (n && !ids)) return -1;
+    if (n == 0) return 0;
 
     typedef struct { int slot; int expert; K3ExpertRef r; int64_t got, pad; } Work;
     /* One entry per expert in a batch prefetch, so it is bounded by top-k. */
@@ -154,7 +167,7 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
         if (k3_expert_ref(c->st, layer, e, &r) != 0) continue;
         if (r.nbytes > c->slot_bytes) continue;
 
-        const int slot = pick_victim(c);
+        const int slot = pick_victim(c, layer, ids, n);
         if (slot < 0) break;
         if (c->key_of[slot] >= 0) { c->slot_of[c->key_of[slot]] = -1; c->evictions++; }
         /* INFLIGHT, not EMPTY. Marking it empty made pick_victim's fast path hand the
@@ -210,6 +223,7 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
         c->key_of[w[i].slot] = key;
         c->slot_of[key] = w[i].slot;
         c->used_at[w[i].slot] = ++c->clock;
+        c->fresh[w[i].slot] = 1;
         c->bytes_read += (uint64_t)w[i].got;
         c->prefetch_reads++;
         ok++;
@@ -256,6 +270,9 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
 
     const int slot = admit(c, layer, expert);
     if (slot < 0) return -1;
+    c->demand_requests++;
+    if (!c->fresh[slot]) c->demand_reuses++;
+    c->fresh[slot] = 0;
     fill_q(c, slot, out);
     return 0;
 }
@@ -276,6 +293,7 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->st = st;
     c->n_layers = cfg->n_layers;
     c->n_experts = cfg->n_experts;
+    c->topk = cfg->topk;
 
     /* Size a slot from the checkpoint rather than from arithmetic: find any expert and
      * ask how many bytes it actually occupies. */
@@ -341,10 +359,13 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->key_of  = (int32_t *)malloc((size_t)c->nslot * sizeof(int32_t));
     c->used_at = (uint64_t *)calloc((size_t)c->nslot, sizeof(uint64_t));
     c->pinned  = (unsigned char *)calloc((size_t)c->nslot, 1);
+    c->hot_key = (unsigned char *)calloc(nkey, 1);
+    c->fresh   = (unsigned char *)calloc((size_t)c->nslot, 1);
     c->ref     = (K3ExpertRef *)calloc((size_t)c->nslot, sizeof(K3ExpertRef));
     c->pad     = (int32_t *)calloc((size_t)c->nslot, sizeof(int32_t));
     c->hist    = (uint32_t *)calloc(nkey, sizeof(uint32_t));
-    if (!c->slot_of || !c->key_of || !c->used_at || !c->pinned || !c->ref || !c->pad || !c->hist) {
+    if (!c->slot_of || !c->key_of || !c->used_at || !c->pinned || !c->ref ||
+        !c->pad || !c->hist || !c->hot_key || !c->fresh) {
         k3_cache_free(c); return -1;
     }
     for (size_t i = 0; i < nkey; i++) c->slot_of[i] = -1;
@@ -357,6 +378,7 @@ void k3_cache_free(K3Cache *c)
     k3_aligned_free(c->arena); free(c->slot_of); free(c->key_of);
     free(c->used_at); free(c->pinned); free(c->ref); free(c->pad); free(c->hist);
     free(c->trace);
+    free(c->hot_key); free(c->fresh);
     memset(c, 0, sizeof *c);
 }
 
@@ -374,56 +396,123 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 {
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
+        return 0;
     const int32_t key = layer * c->n_experts + expert;
-    if (key < 0 || key >= c->n_layers * c->n_experts) return 0;
     const int slot = c->slot_of[key];
     if (slot < 0) return 0;
+    if (pin && !c->pinned[slot] && !c->hot_key[key]) {
+        int npin = c->profile_pins;
+        for (int i = 0; i < c->nslot; i++)
+            if (c->pinned[i] && c->key_of[i] >= 0 && !c->hot_key[c->key_of[i]]) npin++;
+        if (npin >= c->nslot - c->topk - 1) return 0;
+    }
     c->pinned[slot] = pin ? 1 : 0;
     return 1;
 }
 
 int k3_cache_prefetch(K3Cache *c, int layer, int expert)
 {
+    if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
+        return -1;
     return admit(c, layer, expert) >= 0 ? 0 : -1;
+}
+
+/* Parse unsigned decimal fields with explicit overflow/sign/trailing-data checks.
+ * scanf's unsigned conversions accept negative inputs; profiles must not. */
+static int profile_fields(const char *s, uint64_t *v, int n)
+{
+    for (int i = 0; i < n; i++) {
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s < '0' || *s > '9') return -1;
+        char *end;
+        errno = 0;
+        unsigned long long x = strtoull(s, &end, 10);
+        if (errno == ERANGE || x > UINT64_MAX) return -1;
+        v[i] = (uint64_t)x;
+        s = end;
+        if (i + 1 < n && *s != ' ' && *s != '\t') return -1;
+    }
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    return *s ? -1 : 0;
+}
+
+int k3_cache_load_profile(K3Cache *c, const char *path, int count)
+{
+    if (c->clock || count <= 0 || count > c->nslot - c->topk - 1) {
+        fprintf(stderr, "k3_cache: profile needs an unused cache and 1..%d pins "
+                        "(keep top-%d plus one slots evictable)\n",
+                c->nslot - c->topk - 1, c->topk);
+        return -1;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "k3_cache: cannot open profile %s\n", path); return -1; }
+    const size_t nkey = (size_t)c->n_layers * c->n_experts;
+    unsigned char *selected = (unsigned char *)calloc(nkey, 1);
+    unsigned char *seen = (unsigned char *)calloc(nkey, 1);
+    int ok = 0, rows = 0;
+    char line[192];
+    uint64_t v[4], prev_count = UINT64_MAX;
+    int prev_key = -1;
+    if (!selected || !seen) goto done;
+    if (!fgets(line, sizeof line, f) || strncmp(line, "K3EXPERTS ", 10) ||
+        !strchr(line, '\n') || profile_fields(line + 10, v, 4) ||
+        v[0] != 1 || v[1] != (uint64_t)c->n_layers ||
+        v[2] != (uint64_t)c->n_experts || v[3] != (uint64_t)c->topk) goto done;
+    while (fgets(line, sizeof line, f)) {
+        if (!strchr(line, '\n') || profile_fields(line, v, 3) ||
+            v[0] >= (uint64_t)c->n_layers || v[1] >= (uint64_t)c->n_experts ||
+            !v[2] || v[2] > prev_count) goto done;
+        const int key = (int)v[0] * c->n_experts + (int)v[1];
+        if (seen[key] || (v[2] == prev_count && key <= prev_key)) goto done;
+        seen[key] = 1;
+        prev_key = key; prev_count = v[2];
+        if (rows < count) {
+            K3ExpertRef ref;
+            if (k3_expert_ref(c->st, (int)v[0], (int)v[1], &ref)) goto done;
+            selected[key] = 1;
+        }
+        rows++;
+    }
+    if (ferror(f) || rows < count) goto done;
+    memcpy(c->hot_key, selected, nkey);
+    c->profile_pins = count;
+    ok = 1;
+done:
+    free(selected); free(seen); fclose(f);
+    if (!ok) fprintf(stderr, "k3_cache: invalid/incompatible profile %s "
+                            "or fewer than %d ranked experts\n", path, count);
+    return ok ? 0 : -1;
 }
 
 void k3_cache_reset_stats(K3Cache *c)
 {
     c->hits = c->misses = c->evictions = c->bytes_read = 0;
+    c->demand_requests = c->demand_reuses = 0;
     c->load_seconds = 0.0;
-    /* prefetch_reads belongs to the same window as hits and misses.
-     *
-     * k3_cache_report derives the effective hit rate as (hits - prefetch_reads), so both
-     * counters must cover the same interval. Resetting one without the other compares a
-     * per-window numerator against a since-startup subtrahend, which drives the result
-     * negative and clamps it to zero at every cache size. */
+    /* Keep per-slot fresh flags: a prefetch before reset is still a first consumption
+     * afterward. Subtracting window-level prefetch totals cannot express this. */
     c->prefetch_reads = 0;
 }
 
 void k3_cache_report(const K3Cache *c, const char *label)
 {
-    const uint64_t n = c->hits + c->misses;
+    const uint64_t n = c->demand_requests;
     int resident = 0, pinned = 0;
-    for (int i = 0; i < c->nslot; i++) { if (c->key_of[i] >= 0) resident++; if (c->pinned[i]) pinned++; }
+    for (int i = 0; i < c->nslot; i++) {
+        if (c->key_of[i] >= 0) {
+            resident++;
+            if (c->pinned[i] || c->hot_key[c->key_of[i]]) pinned++;
+        }
+    }
     printf("cache [%s]\n", label ? label : "");
     printf("  slots        : %d of %.2f MB = %.2f GB arena (%d resident, %d pinned)\n",
            c->nslot, (double)c->slot_bytes / 1e6,
            (double)c->nslot * c->slot_bytes / 1e9, resident, pinned);
-    printf("  requests     : %llu  hits %llu (%.2f%%)  misses %llu  evictions %llu\n",
-           (unsigned long long)n, (unsigned long long)c->hits,
-           n ? 100.0 * c->hits / n : 0.0,
-           (unsigned long long)c->misses, (unsigned long long)c->evictions);
-    /* The prefetch makes the raw hit rate above flattering: an expert the batch read
-     * from disk moments earlier is resident by the time get() asks, so it counts as a
-     * hit. Report what was actually served from RAM without touching the disk. */
-    if (c->prefetch_reads) {
-        const unsigned long long served = (c->hits > c->prefetch_reads)
-                                        ? c->hits - c->prefetch_reads : 0;
-        printf("  of those hits : %llu came from the batch prefetch, i.e. read from disk\n"
-               "                  this token; TRUE resident hit rate %.2f%%\n",
-               (unsigned long long)c->prefetch_reads, n ? 100.0 * served / n : 0.0);
-    }
-    printf("  read from disk: %.2f GB in %.2f s (%.0f MB/s while loading)\n",
+    printf("  requests     : %llu  resident reuses %llu (%.2f%%)  evictions %llu\n",
+           (unsigned long long)n, (unsigned long long)c->demand_reuses,
+           n ? 100.0 * c->demand_reuses / n : 0.0, (unsigned long long)c->evictions);
+    printf("  weight payload: %.2f GB in %.2f s (%.0f MB/s while loading)\n",
            (double)c->bytes_read / 1e9, c->load_seconds,
            c->load_seconds > 0 ? (double)c->bytes_read / 1e6 / c->load_seconds : 0.0);
 }

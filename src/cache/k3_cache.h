@@ -48,7 +48,7 @@ typedef struct {
     K3ExpertSrc  src;             /* MUST be first: pass &cache->src to K3MoeW */
 
     const K3St  *st;
-    int          n_layers, n_experts;
+    int          n_layers, n_experts, topk;
 
     unsigned char *arena;         /* nslot * slot_bytes, page aligned          */
     int64_t      slot_bytes;
@@ -58,6 +58,9 @@ typedef struct {
     int32_t     *key_of;          /* [nslot] -> layer*n_experts+expert, or -1  */
     uint64_t    *used_at;         /* [nslot] LRU stamp                         */
     unsigned char *pinned;        /* [nslot] never evict while set             */
+    unsigned char *hot_key;       /* [n_layers*n_experts] lazy profile pins    */
+    unsigned char *fresh;         /* [nslot] load not yet consumed by get()    */
+    int          profile_pins;
     K3ExpertRef *ref;             /* [nslot] geometry of the resident expert   */
     int32_t     *pad;             /* [nslot] where the payload starts in the slot;
                                    * non-zero only on the O_DIRECT path, where the
@@ -72,8 +75,11 @@ typedef struct {
      * expert is resident by the time get() asks for it, so get() records a hit -- but
      * the bytes still came off the disk during this token. Without this counter the
      * report would show the hit rate climbing while the I/O did not fall at all.
-     * Effective hit rate is (hits - prefetch_reads) / requests. */
+     * Raw hits include these reads; use demand_reuses for retention instead. */
     uint64_t     prefetch_reads;
+    /* Successful get() calls and those reusing an already-consumed resident load.
+     * A prefetch's first consumption is not reuse, even across a stats reset. */
+    uint64_t     demand_requests, demand_reuses;
     double       load_seconds;
     uint32_t    *hist;            /* [n_layers*n_experts] request counts       */
 
@@ -97,9 +103,16 @@ typedef struct {
 int  k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_bytes);
 void k3_cache_free(K3Cache *c);
 
-/* Pin or unpin whatever slot currently holds this expert. Pinning a resident hot set
- * is the payoff from the histogram. Returns 0 if the expert was not resident. */
+/* Pin or unpin a resident expert manually. Returns 0 for invalid/nonresident keys or
+ * if pinning would leave fewer than topk+1 evictable slots. Removing a manual pin
+ * does not remove a profile pin for the same key. */
 int  k3_cache_pin(K3Cache *c, int layer, int expert, int pin);
+
+/* Install a ranked K3EXPERTS v1 text profile before any cache access. Pins are lazy:
+ * weights are loaded only when requested, then retained. Reserve topk+1 evictable
+ * slots. Reject incompatible/malformed profiles without changing the active policy.
+ * Format and calibration workflow: docs/EXPERT_PROFILES.md. */
+int  k3_cache_load_profile(K3Cache *c, const char *path, int count);
 
 /* Load an expert without returning it, so a prefetcher can warm the cache. */
 int  k3_cache_prefetch(K3Cache *c, int layer, int expert);

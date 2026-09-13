@@ -79,6 +79,8 @@ def main():
         f.write(struct.pack("<Q", len(hdr)))
         f.write(hdr)
         f.write(bytes(blob))
+    with open(os.path.join(out, "experts.profile"), "w") as f:
+        f.write("K3EXPERTS 1 1 %d 4\n0 0 9\n0 1 8\n0 2 7\n" % n)
 
     per = ROWS * (PCOLS + SCOLS) * 3
     print("wrote %s" % path)
