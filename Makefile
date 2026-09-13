@@ -170,7 +170,7 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
+UNIT_TESTS := test_ops test_kda_exact test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -202,6 +202,9 @@ $(BIN):
 
 # Each test links only what it needs, so a failure points at one subsystem.
 $(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_kda_exact: tests/unit/test_kda_exact.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
@@ -238,6 +241,9 @@ $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
                    $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/bench_kda: benchmarks/bench_kda.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
@@ -262,6 +268,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	      esac; \
 	  done; echo "  3 malformed stop lists refused, each for the right reason"
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
+	@echo "== KDA bitwise recurrence =="; ./$(BIN)/test_kda_exact
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32

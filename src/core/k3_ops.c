@@ -24,7 +24,7 @@
  * them to the obvious form and the paths diverge in the last bits, which shows up as
  * a fixture failure on one machine and a pass on another.
  *
- * Accumulators are double throughout. Hidden size is 7168 and expert rows are 2048
+ * Matmul accumulators are double; the KDA recurrence retains float sums. Hidden size is 7168 and expert rows are 2048
  * wide; a float32 accumulator loses precision the reference comparisons can see.
  */
 #include "k3.h"
@@ -33,6 +33,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 /* --------------------------------------------------------- fatal errors ---- */
 /* Several kernels here need a small temporary that cannot be hoisted into caller-owned
@@ -183,6 +190,88 @@ void k3_kda_decay(float *g, float *alpha, const float *z, const float *A_log,
 }
 
 /* -------------------------------------------------------- KDA recurrence ---- */
+#if !defined(K3_KDA_FORCE_SCALAR) && defined(__AVX2__)
+typedef __m256 KdaVec;
+#define KDA_WIDTH 8
+#define kda_load _mm256_loadu_ps
+#define kda_store _mm256_storeu_ps
+#define kda_splat _mm256_set1_ps
+#define kda_add _mm256_add_ps
+#define kda_sub _mm256_sub_ps
+#define kda_mul _mm256_mul_ps
+#elif !defined(K3_KDA_FORCE_SCALAR) && defined(__ARM_NEON) && defined(__aarch64__)
+typedef float32x4_t KdaVec;
+#define KDA_WIDTH 4
+#define kda_load vld1q_f32
+#define kda_store vst1q_f32
+#define kda_splat vdupq_n_f32
+#define kda_add vaddq_f32
+#define kda_sub vsubq_f32
+#define kda_mul vmulq_f32
+#endif
+
+#ifdef KDA_WIDTH
+void k3_kda_step(float *S, float *o, const float *q, const float *k,
+                 const float *v, const float *alpha, float beta, int dk, int dv)
+{
+    /* Each lane owns one value column. Both reductions visit key rows in ascending
+     * order, with a rounded float multiply followed by a rounded float add: no FMA
+     * and no horizontal reduction. Columns are independent, so decay + read and
+     * delta write + output can share a state load. Holding u/o in registers also
+     * removes their per-row memory traffic and the temporary allocation.
+     *
+     * Preserve the zero-key/query skips, including signed zero; multiplying by zero
+     * instead can change the bits. K3_KDA_FORCE_SCALAR retains the original C below
+     * as a benchmark/control build, without disabling compiler auto-vectorisation. */
+    int j = 0;
+    for (; j <= dv - KDA_WIDTH; j += KDA_WIDTH) {
+        KdaVec u = kda_splat(0.0f);
+        for (int i = 0; i < dk; i++) {
+            float *row = S + (size_t)i * dv + j;
+            const KdaVec s = kda_mul(kda_load(row), kda_splat(alpha[i]));
+            kda_store(row, s);
+            if (k[i] != 0.0f)
+                u = kda_add(u, kda_mul(kda_splat(k[i]), s));
+        }
+        const KdaVec delta = kda_sub(kda_load(v + j), u);
+        KdaVec out = kda_splat(0.0f);
+        for (int i = 0; i < dk; i++) {
+            float *row = S + (size_t)i * dv + j;
+            KdaVec s = kda_load(row);
+            if (k[i] != 0.0f) {
+                s = kda_add(s, kda_mul(kda_splat(k[i] * beta), delta));
+                kda_store(row, s);
+            }
+            if (q[i] != 0.0f)
+                out = kda_add(out, kda_mul(kda_splat(q[i]), s));
+        }
+        kda_store(o + j, out);
+    }
+    /* Unaligned pointers and arbitrary widths are supported, including dv > 256. */
+    for (; j < dv; j++) {
+        float u = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            float *s = S + (size_t)i * dv + j;
+            *s *= alpha[i];
+            if (k[i] != 0.0f) u += k[i] * *s;
+        }
+        float out = 0.0f;
+        for (int i = 0; i < dk; i++) {
+            float *s = S + (size_t)i * dv + j;
+            if (k[i] != 0.0f) *s += k[i] * beta * (v[j] - u);
+            if (q[i] != 0.0f) out += q[i] * *s;
+        }
+        o[j] = out;
+    }
+}
+#undef KDA_WIDTH
+#undef kda_load
+#undef kda_store
+#undef kda_splat
+#undef kda_add
+#undef kda_sub
+#undef kda_mul
+#else
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
@@ -241,6 +330,7 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
     }
     free(uheap);                                  /* free(NULL) is a no-op */
 }
+#endif
 
 /* ---------------------------------------------------------------- matmul ---- */
 /* The dominant cost in the engine: essentially all compute time is spent here or in
@@ -1050,13 +1140,6 @@ static const float K3_E2M1[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
-
-#if defined(__AVX2__)
-#include <immintrin.h>
-#endif
-#if defined(__ARM_NEON) && defined(__aarch64__)
-#include <arm_neon.h>
-#endif
 
 /* y[out] = W[out][in] . x[in], with W stored as bf16 and widened on read.
  *

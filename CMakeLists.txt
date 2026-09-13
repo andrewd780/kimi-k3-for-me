@@ -104,6 +104,7 @@ function(k3_add_test name src)
   target_link_libraries(${name} PRIVATE k3)
 endfunction()
 
+k3_add_test(test_kda_exact tests/unit/test_kda_exact.c)
 k3_add_test(test_ops    tests/unit/test_ops.c)
 k3_add_test(test_cache  tests/unit/test_cache.c)
 k3_add_test(test_st     tests/unit/test_st.c)
@@ -119,6 +120,7 @@ set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 # Every test the Makefile's `test` target runs is registered here too. The two build
 # systems are documented as interchangeable, so a test present in one and absent from
 # the other silently gives ctest less coverage than `make test`.
+add_test(NAME kda_exact COMMAND test_kda_exact)
 add_test(NAME ops        COMMAND test_ops   ${FIX}/ops)
 add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
@@ -155,6 +157,9 @@ add_test(NAME tokenizer
                  -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/README.md
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_tok_test.cmake)
 set_tests_properties(tokenizer PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
+
+add_executable(bench_kda benchmarks/bench_kda.c)
+target_link_libraries(bench_kda PRIVATE k3)
 
 add_executable(bench_kernels benchmarks/bench_kernels.c)
 target_link_libraries(bench_kernels PRIVATE k3)
