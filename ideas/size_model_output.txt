@@ -1,0 +1,97 @@
+
+BASELINE (what ships today)
+---------------------------
+  experts          82,432 x 33.03M params @ 4.25 bits =   1446.5 GB
+  per expert       17.55 MB   (cache slot in k3_cache.c: 17.55 MB)
+  active (bf16)    56.74B params      =    113.5 GB
+  TOTAL                                          1559.9 GB
+  target                                          200.0 GB
+
+THE WALL: quantization only, all 2.72T expert params kept
+---------------------------------------------------------
+  trunk bf16:  113.5 GB -> experts get   86.5 GB => 0.254 bits/param
+  trunk int8:   56.7 GB -> experts get  143.3 GB => 0.421 bits/param
+  trunk int4:   28.4 GB -> experts get  171.6 GB => 0.504 bits/param
+  For scale: credible post-hoc methods bottom out near 2 bits.
+  => No compression-only route reaches the target. Params must go.
+
+OPTION A: shared base per layer + per-expert low-rank delta
+-----------------------------------------------------------
+  W_e = Base_layer + U_e V_e^T, computed as Base@x + U@(V^T@x).
+  Base: 3 matrices/layer x 92 layers. Delta: r*(3072+3584) params/matrix.
+
+  deltas @ bf16   (bases 6.1 GB, int8 trunk 56.7 GB)
+    rank    8  deltas    26.3 GB   TOTAL    89.2 GB  <-- FITS
+    rank   16  deltas    52.7 GB   TOTAL   115.5 GB  <-- FITS
+    rank   32  deltas   105.3 GB   TOTAL   168.2 GB  <-- FITS
+    rank   64  deltas   210.7 GB   TOTAL   273.5 GB
+    rank  128  deltas   421.4 GB   TOTAL   484.2 GB
+
+  deltas @ int8   (bases 3.0 GB, int8 trunk 56.7 GB)
+    rank    8  deltas    13.2 GB   TOTAL    73.0 GB  <-- FITS
+    rank   16  deltas    26.3 GB   TOTAL    86.1 GB  <-- FITS
+    rank   32  deltas    52.7 GB   TOTAL   112.5 GB  <-- FITS
+    rank   64  deltas   105.3 GB   TOTAL   165.1 GB  <-- FITS
+    rank  128  deltas   210.7 GB   TOTAL   270.5 GB
+
+OPTION A-grid: rank x delta precision (the real design space)
+-------------------------------------------------------------
+  Higher rank at lower delta precision keeps more capacity for the same GB.
+   rank  kept params   %cap         bf16        int8        int4
+     32       55.7 B  2.05%       168 GB*       112 GB*        85 GB*
+     64      108.4 B  3.98%       274 GB        165 GB*       111 GB*
+    128      213.7 B  7.85%       484 GB        270 GB        164 GB*
+    256      424.4 B 15.59%       906 GB        481 GB        269 GB 
+  * fits the target. Delta precision is a second lever independent of rank:
+    rank 128 @ int4 keeps 4x the capacity of rank 32 @ int8 for similar GB.
+
+OPTION B: expert pruning (keep the top-N most-routed)
+-----------------------------------------------------
+  experts @ MXFP4:  17.55 MB each -> keep 8,164 of 82,432  (9.9% of the pool)
+  experts @  int8:  33.03 MB each -> keep 4,337 of 82,432  (5.3% of the pool)
+  Trace precedent: a 68-token trace touched 12.14% of the pool (175.65 GB).
+  That is ONE trace. Coverage growth across diverse prompts is unmeasured.
+
+OPTION C: shared codebook / vector quantization
+-----------------------------------------------
+   1.0 bits/param  experts   340.3 GB   TOTAL   397.1 GB
+   1.5 bits/param  experts   510.5 GB   TOTAL   567.3 GB
+   2.0 bits/param  experts   680.7 GB   TOTAL   737.4 GB
+   2.5 bits/param  experts   850.9 GB   TOTAL   907.6 GB
+   3.0 bits/param  experts  1021.0 GB   TOTAL  1077.8 GB
+  Budget available for experts: 143.3 GB => 0.421 bits/param needed.
+
+OPTION D: hybrid -- prune to a kept set, then low-rank the rest
+---------------------------------------------------------------
+  keep 2% exact (1,648) =   28.9 GB + rest rank-16 int8 =  25.8 GB  TOTAL  111.5 GB  <-- FITS
+  keep 2% exact (1,648) =   28.9 GB + rest rank-32 int8 =  51.6 GB  TOTAL  137.3 GB  <-- FITS
+  keep 5% exact (4,121) =   72.3 GB + rest rank-16 int8 =  25.0 GB  TOTAL  154.1 GB  <-- FITS
+  keep 5% exact (4,121) =   72.3 GB + rest rank-32 int8 =  50.0 GB  TOTAL  179.1 GB  <-- FITS
+  keep 10% exact (8,243) =  144.6 GB + rest rank-16 int8 =  23.7 GB  TOTAL  225.1 GB
+  keep 10% exact (8,243) =  144.6 GB + rest rank-32 int8 =  47.4 GB  TOTAL  248.8 GB
+
+PER-TOKEN I/O AND COMPUTE -- the reason Option A is not just a size win
+-----------------------------------------------------------------------
+  today: 1,472 expert reads x 17.55 MB = 25.83 GB read per token
+         (matches the measured 25.83 GB/token in docs/data/memory-ladder.tsv)
+
+  With a shared base, Base@x is IDENTICAL for all 16 routed experts in a
+  layer, so it is computed ONCE per layer, not 16 times:
+    sum_e g_e (Base + U_e V_e^T) x  =  Base@x + sum_e g_e U_e (V_e^T x)
+
+  bases at int8 = 3.04 GB -- small enough to stay RESIDENT
+    rank  16: delta  319.5 KB/expert ->  0.47 GB/token read ( 54.9x less I/O), expert MACs 12.2x less
+    rank  32: delta  639.0 KB/expert ->  0.94 GB/token read ( 27.5x less I/O), expert MACs  9.9x less
+    rank  64: delta 1278.0 KB/expert ->  1.88 GB/token read ( 13.7x less I/O), expert MACs  7.1x less
+
+  So Option A attacks the 200 GB target AND the 25.83 GB/token bottleneck
+  with the same change. That is the only idea here that does both.
+
+SAMPLING COST: what it takes to TEST any of this on real weights
+----------------------------------------------------------------
+  8 experts          0.14 GB via HTTP range reads
+  32 experts         0.56 GB via HTTP range reads
+  128 experts        2.25 GB via HTTP range reads
+  one full layer    15.72 GB via HTTP range reads
+  tools/remote_model.py read_range() already does pinned-revision range
+  reads against the real checkpoint. No full download needed.
