@@ -62,6 +62,8 @@ jobs:
         env:
           K3_TEST_BIN: bin/zstd/k3
           K3_PROFILE_REPORT: expert-profile-tiny-ci.json
+          K3_CGROUP_TEST: '1'
+          K3_HEAD_REPORT: lm-head-mechanism.json
         run: python3 -m unittest discover -s tests -p test_offline_cli.py -v
       - name: Preserve CI fixture measurements
         if: always() && runner.os == 'Linux'
@@ -71,6 +73,7 @@ jobs:
           path: |
             expert-profile-replay.json
             expert-profile-tiny-ci.json
+            lm-head-mechanism.json
 
   measure:
     runs-on: ubuntu-latest

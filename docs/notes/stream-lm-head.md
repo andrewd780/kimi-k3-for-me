@@ -1,0 +1,45 @@
+# Independent lm_head streaming
+
+`--stream-lm-head` uses the existing exact BF16/F32 chunk reader for the output
+projection while retaining the normal embedding and recurrent-state policies.
+`--ultra-low-memory` still selects streaming for both model tables and its separate
+state-reuse policy. No tensor format or model weights change.
+
+The released BF16 lm_head is 2,348,810,240 bytes. Streaming replaces that resident
+table with a 4,202,496-byte I/O buffer, releasing 2,344,607,744 bytes. It also reads
+the lm_head again for every projected position. Those are geometry and mechanism
+calculations, not measured full-model memory or throughput results.
+
+Fixed presets and explicit `--trunk-gb` values stay explicit. The flag alone frees
+memory; to fund the second trunk slot, give that memory to the trunk budget. For
+example, `--preset laptop --stream-lm-head --trunk-gb 4.84` illustrates the budget
+trade. It is not a verified full-checkpoint 8 GB configuration. `--preset auto`
+does include the smaller model-table reserve in its existing K3 budget estimate.
+Streaming with `--draft-trunk` is refused; ordinary incremental and n-gram
+speculative decoding continue to use the same exact model.
+
+## Mechanism gate
+
+The Linux offline CI job builds the existing tiny synthetic checkpoint, enlarges
+only the two vocabulary tables by repeating existing BF16 rows, and compares:
+
+- Resident lm_head with a trunk budget that selects one ring slot.
+- Streamed lm_head with precisely its net released bytes added to that budget.
+
+Both native runs execute inside separate systemd cgroup v2 units with the same
+64 MiB `MemoryMax` and `MemorySwapMax=0`. The child checks the actual cgroup files
+before starting the engine and records peak charged memory and OOM events. The
+test refuses an uncapped substitute. It requires the same planned memory total,
+ring sizes 1 and 2 respectively, all layers completed, no expert drops, identical
+generated IDs, and byte-identical full-vocabulary logits.
+
+This is a scaled mechanism check. It does not allocate the real 2.35 GB lm_head,
+establish the real model's 8 GB RSS, measure overlap benefit or measure s/token.
+The exported mechanism artifact deliberately omits all fixture timings. Full-model
+timing remains blocked until a permitted host has the entire checkpoint locally.
+
+The ordinary tiny CLI tests also check resident-versus-streamed logits for full
+recompute and incremental decode, including a compressed trunk and compressed
+checkpoint. Machine-readable run JSON now includes `lm_head_streamed`,
+`trunk_ring_slots`, slot and budget bytes, resident model bytes, stream-buffer
+bytes and the planned memory total.

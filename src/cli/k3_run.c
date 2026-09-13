@@ -366,6 +366,8 @@ static void usage(FILE *f)
 "                        recurrent-state slot during full recompute; needs --trunk\n"
 "\n"
 "generation:\n"
+"  --stream-lm-head      stream exact lm_head chunks while keeping embedding/state\n"
+"                        policy unchanged; increase --trunk-gb to use freed memory\n"
 "  --gen N               tokens to generate (default 8)\n"
 "  --stop-id N           halt after emitting token id N (repeatable, up to 8). The\n"
 "                        stop id is kept in the sequence, so --save-state and a later\n"
@@ -531,6 +533,7 @@ typedef struct {
     int          n_bound;
     int          layers_completed;
     int          ultra;
+    int          stream_lm_head;
     K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
     /* Incremental decode state. Only MLA layers need a KV cache, so the 24 of them are
      * numbered densely rather than indexing all 93 and wasting 74% of the allocation. */
@@ -656,7 +659,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         for (int t = 0; t < T; t++) {
             if (w->score_targets && t < w->score_start) continue;
             k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
-            if (w->ultra) {
+            if (w->stream_lm_head) {
                 if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
             } else {
                 k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
@@ -672,7 +675,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         return 0;
     }
     k3_rmsnorm(nrm, h + (size_t)(T - 1) * E, w->mb.norm, E, c->rms_eps);
-    if (w->ultra) {
+    if (w->stream_lm_head) {
         if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
     } else {
         k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
@@ -719,6 +722,7 @@ int main(int argc, char **argv)
      * past the end-of-message marker that a caller will only throw away. */
     int stop_id[8]; int n_stop = 0, hit_stop = 0, stopped_at = -1;
     double cache_gb = 64.0, trunk_gb = 16.0;
+    double memory_plan_bytes = 0.0;
     int budget_auto = 0;
     int spec_n = 0;
     int tf_check = 0;
@@ -726,7 +730,7 @@ int main(int argc, char **argv)
     double draft_gb = 6.0;
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
-    int incremental = 0, ultra = 0;
+    int incremental = 0, ultra = 0, stream_lm_head = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -796,6 +800,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--ultra-low-memory")) ultra = 1;
+        else if (!strcmp(argv[i], "--stream-lm-head")) stream_lm_head = 1;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
@@ -829,6 +834,11 @@ int main(int argc, char **argv)
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
 
+    const int head_streamed = ultra || stream_lm_head;
+    if (stream_lm_head && draft_dir) {
+        fprintf(stderr, "--stream-lm-head does not yet support --draft-trunk\n");
+        return 2;
+    }
     if (score_prompt) {
         if (incremental || load_state || save_state || spec_n || draft_dir || tf_check ||
             reread_prompt || n_stop || want_layers != -1 || trace_dir || logits_path) {
@@ -893,7 +903,9 @@ int main(int argc, char **argv)
         /* Fixed costs outside both budgets: embeddings + lm_head 4.70 GB, safetensors
          * index, recurrent state 0.63 GB, KV cache and scratch. Reserve them plus a
          * 2 GB + 2% margin so auto never invites the OOM killer. */
-        const double reserve = 2.0 + 0.02 * (avail / 1e9) + 4.70 + 1.70;
+        const double tables = head_streamed
+            ? 2.35 + ((double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN) / 1e9 : 4.70;
+        const double reserve = 2.0 + 0.02 * (avail / 1e9) + tables + 1.70;
         double usable = avail / 1e9 - reserve;
         const double slot_min = 2.5;   /* one ring slot + headroom; refuse below */
         const double cache_min = 0.5;  /* topk+1 expert slots is ~0.3 GB */
@@ -1155,9 +1167,10 @@ int main(int argc, char **argv)
     {
         const int64_t E64 = c.hidden;
         const double w_trunk = trunk_dir ? trunk_gb * 1e9 : (double)total;
-        const double w_model = ultra
-            ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN + 3.0 * E64 * 4
-            : 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
+        const double w_model = (ultra ? 0.0 : (double)c.vocab * E64 * 2)
+            + (head_streamed ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN
+                             : (double)c.vocab * E64 * 2)
+            + 3.0 * E64 * 4;
         const double w_cache = cache_gb * 1e9;
         const int Tm = prior + np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
@@ -1184,6 +1197,7 @@ int main(int argc, char **argv)
               * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4
             : 0.0;
         const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
+        memory_plan_bytes = need_b;
         const double have = mem_available_bytes();
 
         char b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
@@ -1196,7 +1210,8 @@ int main(int argc, char **argv)
                "  recurrent state  %s\n  buffers          %s\n  KV cache         %s\n"
                "  TOTAL            %s\n",
                trunk_dir ? "(STREAMED)" : "(resident)", b1, b2,
-               ultra ? "(STREAMED)" : "(resident)", b3, b4, b5, b7, b6);
+               ultra ? "(STREAMED)" : (head_streamed ? "(lm_head streamed)" : "(resident)"),
+               b3, b4, b5, b7, b6);
         if (have > 0.0) {
             human(have, b1, sizeof b1);
             printf("  available        %s\n", b1);
@@ -1264,11 +1279,15 @@ int main(int argc, char **argv)
 
     t0 = now_s();
     w.ultra = ultra;
-    if (k3_bind_model_parts(&st, &c, !ultra, !ultra, &w.mb) != 0) return 1;
-    if (ultra && k3_model_stream_init(&w.ms, &st, &c) != 0) return 1;
+    w.stream_lm_head = head_streamed;
+    if (k3_bind_model_parts(&st, &c, !ultra, !head_streamed, &w.mb) != 0) return 1;
+    if (head_streamed && k3_model_stream_init(&w.ms, &st, &c) != 0) return 1;
     human((double)w.mb.nbytes, b1, sizeof b1);
     if (ultra)
         printf("final norms: %s resident; embedding and lm_head streamed in %.1f s\n\n",
+               b1, now_s() - t0);
+    else if (head_streamed)
+        printf("embedding and final norms: %s resident; lm_head streamed in %.1f s\n\n",
                b1, now_s() - t0);
     else
         printf("embedding, final norm and lm_head: %s in %.1f s\n\n", b1, now_s() - t0);
@@ -1789,6 +1808,10 @@ int main(int argc, char **argv)
                 "\"expert_cache_slots\":%d,\"expert_profile_pins\":%d,"
                 "\"trunk_bytes_read\":%llu,\"embedding_bytes_read\":%llu,"
                 "\"lm_head_bytes_read\":%llu,\"ultra_low_memory\":%s,"
+                "\"lm_head_streamed\":%s,\"trunk_ring_slots\":%d,"
+                "\"trunk_slot_bytes\":%lld,\"trunk_budget_bytes\":%.0f,"
+                "\"model_resident_bytes\":%zu,\"model_stream_buffer_bytes\":%zu,"
+                "\"memory_plan_bytes\":%.0f,"
                 "\"stopped_at\":%d,"
                 "\"generated_text\":",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
@@ -1798,7 +1821,11 @@ int main(int argc, char **argv)
                 (unsigned long long)(w.trunk ? w.trunk->bytes_read : 0),
                 (unsigned long long)w.ms.embed_bytes_read,
                 (unsigned long long)w.ms.lm_head_bytes_read,
-                w.ultra ? "true" : "false", stopped_at);
+                w.ultra ? "true" : "false", w.stream_lm_head ? "true" : "false",
+                w.trunk ? w.trunk->nslot : 0,
+                (long long)(w.trunk ? w.trunk->slot_bytes : 0),
+                w.trunk ? trunk_gb * 1e9 : 0.0, w.mb.nbytes, w.ms.bufcap,
+                memory_plan_bytes, stopped_at);
         json_string(f, generated_text);
         fputs("}\n", f);
         fclose(f);
@@ -1821,7 +1848,7 @@ int main(int argc, char **argv)
      * separates them. */
     {
         const double trunk_s = w.trunk ? w.trunk->load_seconds : 0.0;
-        const double model_s = w.ultra ? w.ms.read_seconds : 0.0;
+        const double model_s = w.stream_lm_head ? w.ms.read_seconds : 0.0;
         /* Both terms MUST be whole-run totals over the same window. Mixing a cumulative
          * trunk time with a last-step expert time and dividing by the whole run
          * understates the expert share by roughly the token count. */
