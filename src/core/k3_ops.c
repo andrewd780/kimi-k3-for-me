@@ -214,65 +214,52 @@ typedef float32x4_t KdaVec;
 void k3_kda_step(float *S, float *o, const float *q, const float *k,
                  const float *v, const float *alpha, float beta, int dk, int dv)
 {
-    /* Each lane owns one value column. Both reductions visit key rows in ascending
-     * order, with a rounded float multiply followed by a rounded float add: no FMA
-     * and no horizontal reduction. Columns are independent, so decay + read and
-     * delta write + output can share a state load. Holding u/o in registers also
-     * removes their per-row memory traffic and the temporary allocation.
-     *
-     * Preserve the zero-key/query skips, including signed zero; multiplying by zero
-     * instead can change the bits. K3_KDA_FORCE_SCALAR retains the original C below
-     * as a benchmark/control build, without disabling compiler auto-vectorisation. */
-    /* A 32-column tile amortises row broadcasts and branches. One-vector tiles
-     * were bit-exact but slower than compiler-vectorised C on both CI ISAs. */
-    enum { vectors = 32 / KDA_WIDTH };
-    int j = 0;
-    for (; j <= dv - 32; j += 32) {
-        KdaVec u[vectors], delta[vectors], out[vectors];
-        for (int t = 0; t < vectors; t++) u[t] = kda_splat(0.0f);
-        for (int i = 0; i < dk; i++) {
-            float *row = S + (size_t)i * dv + j;
-            const KdaVec av = kda_splat(alpha[i]), kv = kda_splat(k[i]);
-            for (int t = 0; t < vectors; t++) {
-                const KdaVec state = kda_mul(kda_load(row + t * KDA_WIDTH), av);
-                kda_store(row + t * KDA_WIDTH, state);
-                if (k[i] != 0.0f) u[t] = kda_add(u[t], kda_mul(kv, state));
-            }
+    /* Lanes own independent value columns; key rows are still reduced in their
+     * original ascending order. Separate multiply/add instructions retain the float
+     * rounding points. Fuse decay + read and delta write + output, but keep state
+     * access row-major: column tiles regressed on the ARM CI runner.
+     * K3_KDA_FORCE_SCALAR selects the original optimised C control below. */
+    float ubuf[K3_KDA_STEP_DV];
+    float *u = dv <= K3_KDA_STEP_DV ? ubuf : (float *)malloc((size_t)dv * sizeof(float));
+    if (!u) k3_fatal_oom("KDA recurrence temporary", (size_t)dv * sizeof(float));
+    for (int j = 0; j < dv; j++) u[j] = 0.0f;
+    for (int i = 0; i < dk; i++) {
+        float *row = S + (size_t)i * dv;
+        const KdaVec av = kda_splat(alpha[i]), kv = kda_splat(k[i]);
+        int j = 0;
+        for (; j <= dv - KDA_WIDTH; j += KDA_WIDTH) {
+            const KdaVec state = kda_mul(kda_load(row + j), av);
+            kda_store(row + j, state);
+            if (k[i] != 0.0f)
+                kda_store(u + j, kda_add(kda_load(u + j), kda_mul(kv, state)));
         }
-        for (int t = 0; t < vectors; t++) {
-            delta[t] = kda_sub(kda_load(v + j + t * KDA_WIDTH), u[t]);
-            out[t] = kda_splat(0.0f);
+        for (; j < dv; j++) {
+            row[j] *= alpha[i];
+            if (k[i] != 0.0f) u[j] += k[i] * row[j];
         }
-        for (int i = 0; i < dk; i++) {
-            float *row = S + (size_t)i * dv + j;
-            const KdaVec kb = kda_splat(k[i] * beta), qv = kda_splat(q[i]);
-            for (int t = 0; t < vectors; t++) {
-                KdaVec state = kda_load(row + t * KDA_WIDTH);
-                if (k[i] != 0.0f) {
-                    state = kda_add(state, kda_mul(kb, delta[t]));
-                    kda_store(row + t * KDA_WIDTH, state);
-                }
-                if (q[i] != 0.0f) out[t] = kda_add(out[t], kda_mul(qv, state));
-            }
-        }
-        for (int t = 0; t < vectors; t++) kda_store(o + j + t * KDA_WIDTH, out[t]);
     }
-    /* Unaligned pointers and arbitrary widths are supported, including dv > 256. */
-    for (; j < dv; j++) {
-        float u = 0.0f;
-        for (int i = 0; i < dk; i++) {
-            float *s = S + (size_t)i * dv + j;
-            *s *= alpha[i];
-            if (k[i] != 0.0f) u += k[i] * *s;
+    /* Prediction error is column-local and invariant over the rank-one write. */
+    for (int j = 0; j < dv; j++) { u[j] = v[j] - u[j]; o[j] = 0.0f; }
+    for (int i = 0; i < dk; i++) {
+        if (k[i] == 0.0f && q[i] == 0.0f) continue;
+        float *row = S + (size_t)i * dv;
+        const KdaVec kb = kda_splat(k[i] * beta), qv = kda_splat(q[i]);
+        int j = 0;
+        for (; j <= dv - KDA_WIDTH; j += KDA_WIDTH) {
+            KdaVec state = kda_load(row + j);
+            if (k[i] != 0.0f) {
+                state = kda_add(state, kda_mul(kb, kda_load(u + j)));
+                kda_store(row + j, state);
+            }
+            if (q[i] != 0.0f)
+                kda_store(o + j, kda_add(kda_load(o + j), kda_mul(qv, state)));
         }
-        float out = 0.0f;
-        for (int i = 0; i < dk; i++) {
-            float *s = S + (size_t)i * dv + j;
-            if (k[i] != 0.0f) *s += k[i] * beta * (v[j] - u);
-            if (q[i] != 0.0f) out += q[i] * *s;
+        for (; j < dv; j++) {
+            if (k[i] != 0.0f) row[j] += k[i] * beta * u[j];
+            if (q[i] != 0.0f) o[j] += q[i] * row[j];
         }
-        o[j] = out;
     }
+    if (u != ubuf) free(u);
 }
 #undef KDA_WIDTH
 #undef kda_load
