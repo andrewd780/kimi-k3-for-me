@@ -38,6 +38,8 @@ jobs:
           echo "TEST_OMP_FLAGS=-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib -lomp" >> "$GITHUB_ENV"
       - name: Compile and check native ranges, corruption, concurrency and byte parity
         run: python3 -m unittest discover -s tests -p test_offline_storage.py -v
+      - name: Check quality window coverage and aggregation (no model evaluation)
+        run: python3 -m unittest discover -s tests -p test_quality.py -v
       - name: Check held-out expert profile replay and trace validation
         run: python3 -m unittest discover -s tests -p test_expert_profile.py -v
       - name: Reproduce the single deterministic replay result per arm

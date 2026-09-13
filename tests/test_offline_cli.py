@@ -9,10 +9,12 @@ import base64
 import contextlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -95,6 +97,34 @@ class OfflineCliTests(unittest.TestCase):
                 self.assert_same(a, b)
                 self.assertFalse(b[0]["reread_prompt"])
                 self.assertEqual(b[0]["original_prompt_tokens"], 3)
+
+    def test_native_score_primitive_on_synthetic_logits(self):
+        # Does not invoke the corpus harness or produce a K3 quality measurement.
+        # Compare the new native score path to ordinary prefix logits of this toy.
+        ids = [3, 7, 11, 5]
+        losses = []
+        for position in range(1, len(ids)):
+            _, raw = self.run_cli(self.plain, ["--ids", ",".join(map(str, ids[:position]))])
+            logits = struct.unpack("=256f", raw)
+            maximum = max(logits)
+            losses.append(math.log(sum(math.exp(x - maximum) for x in logits))
+                          + (maximum - logits[ids[position]]))
+        for first in (1, 2):
+            output = self.path / f"score-{first}.json"
+            process = subprocess.run([str(self.binary), str(self.packed), "--score-prompt",
+                                      "--ids", ",".join(map(str, ids)), "--score-start", str(first),
+                                      "--trunk", str(self.ztrunk), "--trunk-gb", "0.001",
+                                      "--cache-gb", "0.0001", "--out", str(output)],
+                                     capture_output=True, text=True, env=self.env, timeout=60)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            report = json.loads(output.read_text())
+            self.assertEqual(report["scored_tokens"], len(ids) - first)
+            self.assertEqual(report["input_ids"], ids)
+            self.assertEqual(report["layers_completed"], 13)
+            self.assertEqual(report["expert_drops"], 0)
+            for got, want in zip(report["token_nll"], losses[first - 1:]):
+                self.assertAlmostEqual(got, want, places=9)
+            self.assertAlmostEqual(report["nll_sum"], sum(losses[first - 1:]), places=9)
 
     def test_reread_is_exact_token_repetition(self):
         for mode in ([], ["--incremental"]):

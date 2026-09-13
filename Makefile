@@ -175,7 +175,7 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_kda_exact test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
+UNIT_TESTS := test_ops test_kda_exact test_quality test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -211,6 +211,9 @@ $(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 
 $(BIN)/test_kda_exact: tests/unit/test_kda_exact.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/test_quality: tests/unit/test_quality.c $(ENGINE_HEADERS) | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $< -o $@ $(LDFLAGS)
 
 $(BIN)/test_cache: tests/unit/test_cache.c $(BUILD)/src/cache/k3_cache.o \
                    $(BUILD)/src/io/k3_load.o $(BUILD)/src/io/k3_st.o \
@@ -273,6 +276,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	      esac; \
 	  done; echo "  3 malformed stop lists refused, each for the right reason"
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
+	@echo "== quality arithmetic =="; ./$(BIN)/test_quality
 	@echo "== KDA bitwise recurrence =="; ./$(BIN)/test_kda_exact
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \

@@ -45,6 +45,7 @@
 #endif
 
 #include <math.h>
+#include <float.h>
 #include <errno.h>
 #include <limits.h>
 #include <ctype.h>
@@ -66,6 +67,7 @@
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_quality.h"
 
 static double now_s(void)
 {
@@ -393,6 +395,10 @@ static void usage(FILE *f)
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
+"  --score-prompt       teacher-force the prompt; write per-token NLL to --out.\n"
+"                        No generation, implicit BOS/EOS, or state continuation\n"
+"  --score-start N      first target position to score (default 1); earlier tokens\n"
+"                        remain context. Used for overlapping quality windows\n"
 "  --expert-profile PATH ranked calibration profile from tools/expert_profile.py\n"
 "  --pin-experts N        retain N profiled experts on first use; both flags required\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
@@ -532,6 +538,9 @@ typedef struct {
     int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
     int          n_mla, kv_cap, cached;
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
+    const int   *score_targets; /* optional next-token targets for each input position */
+    double      *score_nll;
+    int          score_start;   /* first scored input position, zero-based */
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -643,15 +652,21 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
 
     float *nrm = scratch;
-    if (arg_all) {
+    if (arg_all || w->score_targets) {
         for (int t = 0; t < T; t++) {
+            if (w->score_targets && t < w->score_start) continue;
             k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
             if (w->ultra) {
                 if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
             } else {
                 k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
             }
-            arg_all[t] = argmax_(logits_last, c->vocab);
+            if (arg_all) arg_all[t] = argmax_(logits_last, c->vocab);
+            if (w->score_targets && k3_token_nll(logits_last, c->vocab,
+                                                 w->score_targets[t], w->score_nll + t)) {
+                fprintf(stderr, "invalid logits/target at score position %d\n", t + 1);
+                return -1;
+            }
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
         return 0;
@@ -694,6 +709,8 @@ int main(int argc, char **argv)
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
+    int score_prompt = 0, score_start = 1;
+    int exit_status = 0;
     int reread_prompt = 0;
     /* --stop-id, repeatable. Generation halts AFTER emitting a listed id, so the state
      * written by --save-state still contains it and a later --load-state continues the
@@ -715,6 +732,17 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--reread-prompt")) reread_prompt = 1;
+        else if (!strcmp(argv[i], "--score-prompt")) score_prompt = 1;
+        else if (!strcmp(argv[i], "--score-start") && i + 1 < argc) {
+            char *end;
+            errno = 0;
+            const long value = strtol(argv[++i], &end, 10);
+            if (!*argv[i] || *end || errno || value < 1 || value >= K3_MAX_PROMPT) {
+                fprintf(stderr, "--score-start must be a valid positive target position\n");
+                return 2;
+            }
+            score_start = (int)value;
+        }
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
@@ -801,6 +829,18 @@ int main(int argc, char **argv)
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
 
+    if (score_prompt) {
+        if (incremental || load_state || save_state || spec_n || draft_dir || tf_check ||
+            reread_prompt || n_stop || want_layers != -1 || trace_dir || logits_path) {
+            fprintf(stderr, "--score-prompt requires a complete teacher-forced model; "
+                            "generation/state/partial-layer diagnostics cannot be combined\n");
+            return 2;
+        }
+        gen = 0;
+    } else if (score_start != 1) {
+        fprintf(stderr, "--score-start needs --score-prompt\n");
+        return 2;
+    }
     if ((expert_profile != NULL) != (pin_experts > 0)) {
         fprintf(stderr, "--expert-profile and --pin-experts must be supplied together\n");
         return 2;
@@ -975,6 +1015,10 @@ int main(int argc, char **argv)
         }
     }
     if (np <= 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
+    if (score_prompt && score_start >= np) {
+        fprintf(stderr, "--score-prompt needs at least one target after --score-start\n");
+        return 2;
+    }
     for (int i = 0; i < np; i++)
         if (prompt[i] < 0 || prompt[i] >= c.vocab) {
             fprintf(stderr, "token id %d is outside the vocabulary of %d\n", prompt[i], c.vocab);
@@ -1300,6 +1344,7 @@ int main(int argc, char **argv)
     memcpy(seq + prior, prompt, (size_t)np * sizeof(int));
     int T = prior + np;
     int nout = 0;
+    char *generated_text = NULL;
 
     /* ---- optional incremental decode ----
      * Full recompute re-runs the whole prefix every step, so expert traffic grows with
@@ -1406,6 +1451,46 @@ int main(int argc, char **argv)
                    "tokens per sweep;\n               the exact model verifies every one "
                    "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
         }
+    }
+
+    if (score_prompt) {
+        double *losses = (double *)calloc((size_t)np - 1, sizeof(double));
+        if (!losses) { exit_status = 1; goto cleanup; }
+        w.score_targets = seq + 1;
+        w.score_nll = losses;
+        w.score_start = score_start - 1;
+        k3_expert_drops = 0;
+        if (forward(&w, &c, &cache, seq, np - 1, lg, sc, h, br, ks, NULL) != 0 ||
+            w.layers_completed != c.n_layers || k3_expert_drops) {
+            fprintf(stderr, "quality run invalid; no scores published\n");
+            free(losses);
+            exit_status = 1;
+            goto cleanup;
+        }
+        double sum = 0.0;
+        for (int i = score_start - 1; i < np - 1; i++) sum += losses[i];
+        const int count = np - score_start;
+        const double mean = sum / count;
+        FILE *sf = fopen(outp, "w");
+        if (!sf) { perror(outp); exit_status = 1; }
+        else {
+            fprintf(sf, "{\"schema\":1,\"task\":\"perplexity\",\"input_ids\":[");
+            for (int i = 0; i < np; i++) fprintf(sf, "%s%d", i ? "," : "", seq[i]);
+            fprintf(sf, "],\"score_start\":%d,\"scored_tokens\":%d,"
+                        "\"layers\":%d,\"layers_completed\":%d,\"expert_drops\":0,"
+                        "\"nll_sum\":%.17g,\"mean_nll\":%.17g,\"perplexity\":",
+                    score_start, count, c.n_layers, w.layers_completed, sum, mean);
+            if (mean <= log(DBL_MAX)) fprintf(sf, "%.17g", exp(mean));
+            else fputs("null", sf); /* mean_nll remains defined when exp overflows */
+            fputs(",\"token_nll\":[", sf);
+            for (int i = score_start - 1; i < np - 1; i++)
+                fprintf(sf, "%s%.17g", i == score_start - 1 ? "" : ",", losses[i]);
+            fputs("]}\n", sf);
+            const int failed = ferror(sf);
+            if (fclose(sf) || failed) { perror(outp); exit_status = 1; }
+        }
+        free(losses);
+        goto cleanup;
     }
 
     /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
@@ -1667,7 +1752,6 @@ int main(int argc, char **argv)
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
      * streaming would emit mojibake at every token boundary that splits a codepoint. */
-    char *generated_text = NULL;
     if (have_tok && nout > 0) {
         generated_text = (char *)malloc((size_t)nout * 8 + 1);
         if (generated_text) {
@@ -1728,7 +1812,6 @@ int main(int argc, char **argv)
         k3_cache_dump_trace(&cache, p);
     }
 
-    free(w.kvc); free(w.ropec); free(w.mla_slot);
     /* Report the compute-versus-I/O split rather than leaving it to be inferred.
      *
      * It cannot be inferred safely: a flat curve across a RAM sweep looks like evidence
@@ -1767,6 +1850,8 @@ int main(int argc, char **argv)
                expert_reqs_total ? 100.0 * (double)retained / (double)expert_reqs_total : 0.0,
                (unsigned long long)expert_evict_total);
     }
+cleanup:
+    free(w.kvc); free(w.ropec); free(w.mla_slot);
     if (w.trunk) { k3_trunk_report(w.trunk, "final"); k3_trunk_close(w.trunk); }
     k3_cache_free(&cache);
     for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
@@ -1775,6 +1860,7 @@ int main(int argc, char **argv)
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
     free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
+    free(prompt); free(seq); free(outtok);
 
     /* A dropped expert means some token was computed with part of its routed sum
      * missing. The run still produced token ids and they still look plausible, which is
@@ -1787,5 +1873,5 @@ int main(int argc, char **argv)
                 "the shard set or the storage is at fault.\n", k3_expert_drops);
         return 4;
     }
-    return 0;
+    return exit_status;
 }

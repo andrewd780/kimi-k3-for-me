@@ -108,6 +108,7 @@ function(k3_add_test name src)
   target_link_libraries(${name} PRIVATE k3)
 endfunction()
 
+k3_add_test(test_quality tests/unit/test_quality.c)
 k3_add_test(test_kda_exact tests/unit/test_kda_exact.c)
 k3_add_test(test_ops    tests/unit/test_ops.c)
 k3_add_test(test_cache  tests/unit/test_cache.c)
@@ -124,6 +125,7 @@ set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 # Every test the Makefile's `test` target runs is registered here too. The two build
 # systems are documented as interchangeable, so a test present in one and absent from
 # the other silently gives ctest less coverage than `make test`.
+add_test(NAME quality COMMAND test_quality)
 add_test(NAME kda_exact COMMAND test_kda_exact)
 add_test(NAME ops        COMMAND test_ops   ${FIX}/ops)
 add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
