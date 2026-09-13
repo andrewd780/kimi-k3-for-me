@@ -188,6 +188,9 @@ int main(int argc, char **argv)
     if (k3_cache_init(&cache, &st, &c, 8 * stride)) return 2;
     char profile[4096];
     snprintf(profile, sizeof profile, "%s/experts.profile", dir);
+    ck(k3_cache_check_profile(profile, 1) == 0 &&
+       k3_cache_check_profile(profile, 4) == -1,
+       "profile preflight without checkpoint", NULL);
     ck(k3_cache_load_profile(&cache, profile, 1) == 0 && cache.profile_pins == 1 &&
        cache.bytes_read == 0 && cache.slot_of[0] == -1,
        "profile pins without preloading", NULL);
@@ -210,6 +213,11 @@ int main(int argc, char **argv)
        "mixed-residency batch byte-exact", "one payload read");
     ck(cache.demand_requests == 4 && cache.demand_reuses == 3,
        "cold prefetch is not reuse", "3 reuses, 4 successful requests");
+    ck(cache.src.getmany(&cache.src, 0, ids, 4) == 0,
+       "resident batch needs no reads", NULL);
+    int clear = 1;
+    for (int e = 0; e < NE; e++) if (cache.requested[e]) clear = 0;
+    ck(clear, "batch marks clear on no-work return", NULL);
 
     const int later = 9;
     cache.src.getmany(&cache.src, 0, &later, 1);
@@ -239,6 +247,15 @@ int main(int argc, char **argv)
         if (cache.src.get(&cache.src, 0, e, &q)) exact = 0;
     ck(exact && cache.src.resident(&cache.src, 0, 0, &q) &&
        same_expert(&st, 0, 0, &q), "lazy profile pin survives pressure", NULL);
+    const int union_ids[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 12, -1, NE};
+    cache.src.getmany(&cache.src, 0, union_ids,
+                      (int)(sizeof union_ids / sizeof union_ids[0]));
+    clear = 1;
+    for (int e = 0; e < NE; e++) if (cache.requested[e]) clear = 0;
+    ck(clear, "oversized batch releases every mark", "including duplicate/invalid IDs");
+    for (int e = 1; e <= 12; e++)
+        if (cache.src.get(&cache.src, 0, e, &q) || !same_expert(&st, 0, e, &q)) exact = 0;
+    ck(exact, "oversized batch demand fallback exact", NULL);
     k3_cache_free(&cache);
     k3_st_close(&st);
     printf("\n%s\n", g_fail ? "CACHE TESTS FAILED" : "CACHE TESTS PASSED");

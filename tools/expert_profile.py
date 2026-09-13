@@ -68,6 +68,7 @@ def legacy_prefixes(pairs, topk):
 
 
 def rank(keys):
+    """Accept requests or their Counter; both build and evaluation share tie order."""
     return sorted(Counter(keys).items(), key=lambda item: (-item[1], item[0]))
 
 
@@ -137,7 +138,6 @@ def main(argv=None):
             cmd.add_argument("--train-requests", type=int, required=True)
             cmd.add_argument("--slots", default="28,455,615,1344,2073,3647,6208")
             cmd.add_argument("--pin-fractions", default="0,0.5,1")
-            cmd.add_argument("--runs", type=int, default=3)
     args = ap.parse_args(argv)
     try:
         if not (0 < args.n_layers <= 4096 and 0 < args.n_experts <= 65536 and
@@ -152,7 +152,7 @@ def main(argv=None):
                         raise ValueError("take-requests exceeds a trace or is nonpositive")
                     keys = keys[:args.take_requests]
                 counts.update(keys)
-            ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            ranked = rank(counts)
             write_profile(args.out, ranked, args.n_layers, args.n_experts, args.topk)
             print("wrote %s: %d ranked experts from %d calibration requests" %
                   (args.out, len(ranked), sum(counts.values())))
@@ -160,8 +160,6 @@ def main(argv=None):
         keys, info = load(args.traces, args)
         if not 0 < args.train_requests < len(keys):
             raise ValueError("split must leave nonempty training and test requests")
-        if not 3 <= args.runs <= 100:
-            raise ValueError("report 3..100 independent cold replays per arm")
         slots = [int(value) for value in args.slots.split(",")]
         fractions = [float(value) for value in args.pin_fractions.split(",")]
         if any(cap < args.topk + 1 for cap in slots):
@@ -170,7 +168,8 @@ def main(argv=None):
             raise ValueError("pin fractions must be in [0,1]")
         train, test = keys[:args.train_requests], keys[args.train_requests:]
         ranked = rank(train)
-        report = {"source": info, "training_requests": len(train),
+        report = {"kind": "deterministic replay; one result per arm",
+                  "source": info, "training_requests": len(train),
                   "heldout_requests": len(test), "training_distinct": len(set(train)),
                   "heldout_distinct": len(set(test)),
                   "limitations": ["one context; held-out suffix is not prompt diversity",
@@ -183,8 +182,7 @@ def main(argv=None):
                 hot = [key for key, _ in ranked[:count]]
                 report["arms"].append({"slots": cap, "arena_bytes": cap * SLOT_BYTES,
                                        "requested_pin_fraction": fraction, "pins": count,
-                                       "runs": [replay(test, cap, hot)
-                                                for _ in range(args.runs)]})
+                                       "result": replay(test, cap, hot)})
         args.out.write_text(json.dumps(report, indent=2) + "\n")
         return 0
     except (OSError, ValueError) as exc:

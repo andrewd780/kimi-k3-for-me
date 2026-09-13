@@ -38,6 +38,10 @@ evictable slots, incompatible geometry, missing selected experts, duplicate keys
 unsorted counts, overflow, or malformed lines. First-touch loads still cost I/O. An
 unrequested hot expert occupies no slot. Installing a profile reads metadata only;
 it does not preload weights. Profiles can be installed only before cache accesses.
+Path, format and row count are checked during argument processing, before opening
+the checkpoint. Model geometry, selected tensor availability and pin capacity are
+rechecked after metadata indexing and before any weight binding. Profile geometry is
+bounded to 4,096 layers, 65,536 experts and top-64, matching the producer.
 
 Profile format is ASCII with a final newline on every line:
 
@@ -88,7 +92,7 @@ This supplies no evidence that coverage plateaus across diverse prompts. It cann
 justify deleting the other 88% of experts. Prompt-diverse full-model traces are still
 needed before evaluating any approximate subset model.
 
-## Held-out replay, three cold runs per arm
+## Held-out deterministic replay
 
 Train on the first 5 derived positions (7,360 requests, 5,682 distinct experts), test on
 the last 7 (10,304 requests, 5,908 distinct experts). Hot keys are ranked from training
@@ -97,7 +101,7 @@ capacity. This serial policy model excludes batch prefetch scheduling.
 
 ```bash
 python3 tools/expert_profile.py evaluate tests/fixtures/expert_trace.bin \
-  --layout legacy-prefixes --train-requests 7360 --runs 3 \
+  --layout legacy-prefixes --train-requests 7360 \
   --out docs/measurements/expert-profile-replay.json
 ```
 
@@ -106,22 +110,29 @@ bytes are in [the replay report](measurements/expert-profile-replay.json). Capac
 are expert slots, not total process RAM. A real slot is 17,555,456 bytes including
 alignment room; its expert payload is 17,547,264 bytes.
 
-| Slots | Pins | Loads run 1 | Loads run 2 | Loads run 3 | Mean loads |
-|---:|---:|---:|---:|---:|---:|
-| 28 | 0 | 10,304 | 10,304 | 10,304 | 10,304 |
-| 28 | 11 | 10,259 | 10,259 | 10,259 | 10,259 |
-| 615 | 0 | 10,304 | 10,304 | 10,304 | 10,304 |
-| 615 | 598 | 9,793 | 9,793 | 9,793 | 9,793 |
-| 1,344 | 0 | 10,304 | 10,304 | 10,304 | 10,304 |
-| 1,344 | 1,327 | 9,289 | 9,289 | 9,289 | 9,289 |
-| 3,647 | 0 | 6,102 | 6,102 | 6,102 | 6,102 |
-| 3,647 | 1,823 | 6,125 | 6,125 | 6,125 | 6,125 |
+| Slots | Pins | Deterministic loads |
+|---:|---:|---:|
+| 28 | 0 | 10,304 |
+| 28 | 11 | 10,259 |
+| 615 | 0 | 10,304 |
+| 615 | 598 | 9,793 |
+| 1,344 | 0 | 10,304 |
+| 1,344 | 1,327 | 9,289 |
+| 3,647 | 0 | 6,102 |
+| 3,647 | 1,823 | 6,125 |
 
 The first comparison saves **0.44% of expert payload reads**; the 615-slot comparison
 saves 4.96%, and the 1,344-slot comparison saves 9.85%. At 3,647 slots, half pinning
-slightly increases reads. Repeated deterministic replays verify the counts, not
-statistical generalization. These are projections on seven held-out positions in the
+slightly increases reads. Re-executing this deterministic calculation adds no evidence;
+the former `--runs` option and three identical results per arm have been removed.
+Actual timed native/CLI comparisons still require three runs per arm. These replay
+results are projections on seven held-out positions in the
 same context, not SSD measurements or expected speedups on a laptop.
+
+**Small-machine outcome: negative.** The historical 8 GB configuration has 28 slots;
+45 avoided loads out of 10,304 is only **0.44% of expert reads**, an even smaller share
+of total weight I/O. Static hot-set pinning is not being pursued further for small
+machines. Larger-slot rows are not forecasts for an 8 GB laptop.
 
 ## Memory and I/O accounting
 
@@ -162,6 +173,9 @@ prefill, instead of parsing the final step's human-readable report.
 Batch prefetch also protects requested experts already resident while selecting its
 victims. A mixed batch must not evict and reload its own members. If a prefill union
 exceeds available slots, prefetch stops reserving and normal demand reads finish it.
+Membership is marked once per batch in a byte array (83,328 bytes for K3) and checked
+in O(1) per victim candidate. Marks are cleared after reservation, including no-work
+and capacity-limited batches; the LRU victim scan itself is still linear in slots.
 
 ## Native checks and remaining limits
 

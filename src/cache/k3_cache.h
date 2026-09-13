@@ -59,6 +59,7 @@ typedef struct {
     uint64_t    *used_at;         /* [nslot] LRU stamp                         */
     unsigned char *pinned;        /* [nslot] never evict while set             */
     unsigned char *hot_key;       /* [n_layers*n_experts] lazy profile pins    */
+    unsigned char *requested;     /* [n_layers*n_experts] current batch set    */
     unsigned char *fresh;         /* [nslot] load not yet consumed by get()    */
     int          profile_pins;
     K3ExpertRef *ref;             /* [nslot] geometry of the resident expert   */
@@ -113,6 +114,11 @@ int  k3_cache_pin(K3Cache *c, int layer, int expert, int pin);
  * slots. Reject incompatible/malformed profiles without changing the active policy.
  * Format and calibration workflow: docs/EXPERT_PROFILES.md. */
 int  k3_cache_load_profile(K3Cache *c, const char *path, int count);
+
+/* Check path, format and requested row count before any checkpoint is opened.
+ * Geometry, selected tensor availability and slot budget are rechecked by load_profile
+ * after indexing metadata, still before the CLI binds any model weights. */
+int  k3_cache_check_profile(const char *path, int count);
 
 /* Load an expert without returning it, so a prefetcher can warm the cache. */
 int  k3_cache_prefetch(K3Cache *c, int layer, int expert);

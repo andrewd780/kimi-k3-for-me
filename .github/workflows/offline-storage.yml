@@ -40,6 +40,10 @@ jobs:
         run: python3 -m unittest discover -s tests -p test_offline_storage.py -v
       - name: Check held-out expert profile replay and trace validation
         run: python3 -m unittest discover -s tests -p test_expert_profile.py -v
+      - name: Reproduce the single deterministic replay result per arm
+        run: |
+          python3 tools/expert_profile.py evaluate tests/fixtures/expert_trace.bin --layout legacy-prefixes --train-requests 7360 --out expert-profile-replay.json
+          cmp docs/measurements/expert-profile-replay.json expert-profile-replay.json
       - name: Build compressed engine and run existing C tests
         run: make ZSTD=1 BUILD=build/zstd BIN=bin/zstd -j4 all test
       - name: Check CMake compressed build
@@ -55,7 +59,16 @@ jobs:
         if: runner.os == 'Linux'
         env:
           K3_TEST_BIN: bin/zstd/k3
+          K3_PROFILE_REPORT: expert-profile-tiny-ci.json
         run: python3 -m unittest discover -s tests -p test_offline_cli.py -v
+      - name: Preserve CI fixture measurements
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: expert-profile-ci
+          path: |
+            expert-profile-replay.json
+            expert-profile-tiny-ci.json
 
   measure:
     runs-on: ubuntu-latest
