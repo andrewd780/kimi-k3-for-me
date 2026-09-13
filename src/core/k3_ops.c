@@ -223,29 +223,39 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
      * Preserve the zero-key/query skips, including signed zero; multiplying by zero
      * instead can change the bits. K3_KDA_FORCE_SCALAR retains the original C below
      * as a benchmark/control build, without disabling compiler auto-vectorisation. */
+    /* A 32-column tile amortises row broadcasts and branches. One-vector tiles
+     * were bit-exact but slower than compiler-vectorised C on both CI ISAs. */
+    enum { vectors = 32 / KDA_WIDTH };
     int j = 0;
-    for (; j <= dv - KDA_WIDTH; j += KDA_WIDTH) {
-        KdaVec u = kda_splat(0.0f);
+    for (; j <= dv - 32; j += 32) {
+        KdaVec u[vectors], delta[vectors], out[vectors];
+        for (int t = 0; t < vectors; t++) u[t] = kda_splat(0.0f);
         for (int i = 0; i < dk; i++) {
             float *row = S + (size_t)i * dv + j;
-            const KdaVec s = kda_mul(kda_load(row), kda_splat(alpha[i]));
-            kda_store(row, s);
-            if (k[i] != 0.0f)
-                u = kda_add(u, kda_mul(kda_splat(k[i]), s));
-        }
-        const KdaVec delta = kda_sub(kda_load(v + j), u);
-        KdaVec out = kda_splat(0.0f);
-        for (int i = 0; i < dk; i++) {
-            float *row = S + (size_t)i * dv + j;
-            KdaVec s = kda_load(row);
-            if (k[i] != 0.0f) {
-                s = kda_add(s, kda_mul(kda_splat(k[i] * beta), delta));
-                kda_store(row, s);
+            const KdaVec av = kda_splat(alpha[i]), kv = kda_splat(k[i]);
+            for (int t = 0; t < vectors; t++) {
+                const KdaVec state = kda_mul(kda_load(row + t * KDA_WIDTH), av);
+                kda_store(row + t * KDA_WIDTH, state);
+                if (k[i] != 0.0f) u[t] = kda_add(u[t], kda_mul(kv, state));
             }
-            if (q[i] != 0.0f)
-                out = kda_add(out, kda_mul(kda_splat(q[i]), s));
         }
-        kda_store(o + j, out);
+        for (int t = 0; t < vectors; t++) {
+            delta[t] = kda_sub(kda_load(v + j + t * KDA_WIDTH), u[t]);
+            out[t] = kda_splat(0.0f);
+        }
+        for (int i = 0; i < dk; i++) {
+            float *row = S + (size_t)i * dv + j;
+            const KdaVec kb = kda_splat(k[i] * beta), qv = kda_splat(q[i]);
+            for (int t = 0; t < vectors; t++) {
+                KdaVec state = kda_load(row + t * KDA_WIDTH);
+                if (k[i] != 0.0f) {
+                    state = kda_add(state, kda_mul(kb, delta[t]));
+                    kda_store(row + t * KDA_WIDTH, state);
+                }
+                if (q[i] != 0.0f) out[t] = kda_add(out[t], kda_mul(qv, state));
+            }
+        }
+        for (int t = 0; t < vectors; t++) kda_store(o + j + t * KDA_WIDTH, out[t]);
     }
     /* Unaligned pointers and arbitrary widths are supported, including dv > 256. */
     for (; j < dv; j++) {

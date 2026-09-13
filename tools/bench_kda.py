@@ -21,7 +21,7 @@ def run(command):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--batches", type=int, default=512)
+    parser.add_argument("--batches", type=int, default=4096)
     args = parser.parse_args()
     if not 1 <= args.batches <= 100000:
         parser.error("--batches must be in [1, 100000]")
