@@ -100,14 +100,16 @@ for rung in $rungs; do
 
         SPT=$(grep -oE '[0-9.]+ s/token average' "$OUT/$tag.log" | tail -1 | awk '{print $1}')
         RSS=$(grep -oE 'PEAK RSS for the whole run: [0-9.]+' "$OUT/$tag.log" | tail -1 | awk '{print $7}')
-        GBR=$(grep -oE 'read from disk: [0-9.]+ GB' "$OUT/$tag.log" | tail -1 | awk '{print $4}')
+        # Average expert payload per emitted token, including prefill. The human cache
+        # report describes only the final step and is not a whole-run measurement.
+        GBR=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("%.6f" % (d["expert_bytes_read"]/len(d["generated_ids"])/1e9))' "$OUT/$tag.json")
         IDSO=$(python3 -c "import json,sys;print(','.join(map(str,json.load(open(sys.argv[1]))['generated_ids'])))" "$OUT/$tag.json" 2>/dev/null)
 
         # The determinism assertion is the entire point of this harness, so it must not
         # pass vacuously. An unreadable result file leaves IDSO empty, and comparing
         # empty against empty would "confirm" identical output at every rung.
-        if [ -z "$IDSO" ]; then
-            echo "   *** could not read generated_ids from $OUT/$tag.json ***"
+        if [ -z "$IDSO" ] || [ -z "$GBR" ]; then
+            echo "   *** could not read generation/byte metrics from $OUT/$tag.json ***"
             exit 1
         fi
         if [ -z "$REF" ]; then

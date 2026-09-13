@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 import offline_model as om  # noqa: E402
 import pack_trunk  # noqa: E402
+import expert_profile  # noqa: E402
 
 
 class OfflineCliTests(unittest.TestCase):
@@ -66,6 +67,8 @@ class OfflineCliTests(unittest.TestCase):
                                 env=self.env, timeout=60)
         if not ok:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("AddressSanitizer", result.stderr)
+            self.assertNotIn("runtime error:", result.stderr)
             self.assertFalse(out.exists())
             return result
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -159,6 +162,78 @@ class OfflineCliTests(unittest.TestCase):
                                           "--incremental", "--load-state", state], ok=False)
         self.assertIn("history", result.stderr)
         self.assertIn("ceiling", result.stderr)
+
+    def test_profiled_pins_preserve_complete_logits_three_runs_per_arm(self):
+        trace = self.path / "calibration"
+        trace.mkdir()
+        self.run_cli(self.plain, ["--ids", "1,2,3", "--incremental",
+                                  "--gen", "4", "--dump-cache-trace", trace])
+        profile = self.path / "experts.profile"
+        with contextlib.redirect_stdout(io.StringIO()):
+            expert_profile.main(["build", str(trace / "expert_trace.bin"),
+                                 "--n-layers", "13", "--n-experts", "8", "--topk", "2",
+                                 "--out", str(profile)])
+        measurements = []
+        for mode in ([], ["--incremental"]):
+            for run in range(3):
+                with self.subTest(mode=mode, run=run):
+                    args = ["--ids", "4,5,6", "--gen", "4", *mode]
+                    base = self.run_cli(self.plain, args)
+                    pins = self.run_cli(self.plain, [*args, "--expert-profile", profile,
+                                                    "--pin-experts", "2"])
+                    compressed = self.run_cli(self.packed, [*args, "--expert-profile",
+                                                           profile, "--pin-experts", "2"])
+                    self.assert_same(base, pins)
+                    self.assert_same(base, compressed)
+                    self.assertEqual(pins[0]["expert_profile_pins"], 2)
+                    self.assertEqual(base[0]["expert_profile_pins"], 0)
+                    for arm, result in (("plain", base), ("pinned", pins),
+                                        ("compressed_pinned", compressed)):
+                        report = result[0]
+                        self.assertLessEqual(report["expert_resident_reuses"],
+                                             report["expert_requests"])
+                        measurements.append({"mode": "incremental" if mode else "full",
+                                             "arm": arm, "run": run + 1,
+                                             **{key: report[key] for key in
+                                                ("wall_seconds", "expert_bytes_read",
+                                                 "expert_requests", "expert_resident_reuses",
+                                                 "expert_cache_slots")}})
+        if os.environ.get("K3_PROFILE_REPORT"):
+            Path(os.environ["K3_PROFILE_REPORT"]).write_text(json.dumps(
+                {"fixture": "make_tiny_checkpoint.py, 13 layers, 8 experts, top-2",
+                 "calibration_ids": [1, 2, 3], "evaluation_ids": [4, 5, 6],
+                 "generated_tokens": 4, "pins": 2,
+                 "limitations": "synthetic checkpoint; no real K3 speed or quality claim",
+                 "runs": measurements}, indent=2) + "\n")
+
+    def test_invalid_profiles_and_pin_budgets_fail(self):
+        profile = self.path / "invalid.profile"
+        header = "K3EXPERTS 1 13 8 2\n"
+        invalid = ("K3EXPERTS 2 13 8 2\n1 0 3\n",
+                   "K3EXPERTS 1 12 8 2\n1 0 3\n",
+                   header + "1 0 3\n1 0 2\n",
+                   header + "1 0 3\n1 1 4\n",
+                   header + "1 1 3\n1 0 3\n",
+                   header + "-1 0 3\n", header + "13 0 3\n",
+                   header + "1 8 3\n", header + "0 0 3\n",
+                   header + "1 0 0\n", header + "1 0 18446744073709551616\n",
+                   header + "1 0 3 garbage\n", header + "1 0 3", header,
+                   header + "1 0 3\x00hidden\n", header + "1 0 " + "9" * 300 + "\n")
+        for text in invalid:
+            with self.subTest(text=text[:65]):
+                profile.write_bytes(text.encode())
+                result = self.run_cli(self.plain, ["--ids", "1", "--expert-profile",
+                                                  profile, "--pin-experts", "1"], ok=False)
+                self.assertIn("profile", result.stderr)
+        profile.write_text(header + "1 0 3\n")
+        for value in ("0", "-1", "2.5", "99999999999999999999", "100000"):
+            with self.subTest(value=value):
+                self.run_cli(self.plain, ["--ids", "1", "--expert-profile", profile,
+                                          "--pin-experts", value], ok=False)
+        self.run_cli(self.plain, ["--ids", "1", "--expert-profile", profile], ok=False)
+        self.run_cli(self.plain, ["--ids", "1", "--pin-experts", "1"], ok=False)
+        self.run_cli(self.plain, ["--ids", "1", "--expert-profile", profile,
+                                  "--pin-experts", "2"], ok=False)
 
 
 if __name__ == "__main__":
