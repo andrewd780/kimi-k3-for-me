@@ -1,8 +1,9 @@
 # Offline quality evaluation
 
 **Built, not evaluated on K3.** No full checkpoint is available on a permitted
-host. The unit tests validate scoring arithmetic and window accounting, not K3
-quality. A new lossy model still needs a real evaluation against the exact
+host. The unit tests validate scoring arithmetic and window accounting; a tiny
+native primitive check compares scores to prefix logits without invoking the
+corpus harness. None measures K3 quality. A new lossy model needs a real evaluation against the exact
 checkpoint. Draft acceptance with a BF16 verifier is not that evaluation.
 
 `tools/quality.py` measures teacher-forced corpus perplexity through `bin/k3`.

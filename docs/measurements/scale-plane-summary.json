@@ -826,7 +826,7 @@
   "scale_plane_projection": {
     "assumed_raw_bytes": 85000000000,
     "projected_zstd3_bytes": 13201793167.326185,
-    "limits": "Extrapolation from stratified samples, not a census or a implemented scale codec."
+    "limits": "Extrapolation from stratified samples, not a census or an implemented scale codec."
   },
   "limits": "256 experts, three matrices each, eight selected layers; central 1 MiB packed samples, full matched scale tensors. Total sample payload is 1.078 GB, of which 264 MB is scales. Not model quality or decode throughput."
 }

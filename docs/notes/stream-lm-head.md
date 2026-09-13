@@ -38,6 +38,26 @@ establish the real model's 8 GB RSS, measure overlap benefit or measure s/token.
 The exported mechanism artifact deliberately omits all fixture timings. Full-model
 timing remains blocked until a permitted host has the entire checkpoint locally.
 
+The gate passed in [CI run 34783226202](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/34783226202).
+The toy checkpoint was 12,680,201 bytes, with a 4,501,504-byte lm_head. Replacing
+that table with the stream buffer made 299,008 bytes available for the trunk.
+
+| Observed quantity | Resident head | Streamed head |
+| --- | ---: | ---: |
+| Total planned bytes | 9,602,560 | 9,602,560 |
+| Trunk budget bytes | 299,008 | 598,016 |
+| Trunk slot bytes | 245,760 | 245,760 |
+| Ring slots | 1 | 2 |
+| Cgroup peak charged bytes | 17,686,528 | 17,948,672 |
+| Cgroup limit bytes | 67,108,864 | 67,108,864 |
+| OOM events | 0 | 0 |
+
+The cap includes runtime overhead beyond the allocation plan; this does not claim
+that the plan equals RSS or that streaming lowers total RSS after reinvesting the
+freed memory. Full-vocabulary logits matched byte for byte and both runs generated
+`[83, 31]`. The [raw mechanism record](../measurements/lm-head-mechanism.json)
+includes the logit hash, actual cgroup paths and memory events.
+
 The ordinary tiny CLI tests also check resident-versus-streamed logits for full
 recompute and incremental decode, including a compressed trunk and compressed
 checkpoint. Machine-readable run JSON now includes `lm_head_streamed`,

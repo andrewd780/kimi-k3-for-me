@@ -1,0 +1,80 @@
+{
+  "arms": {
+    "resident": {
+      "cgroup": {
+        "cgroup": "/system.slice/k3-head-3440-resident.service",
+        "events": {
+          "high": 0,
+          "low": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_group_kill": 0,
+          "oom_kill": 0
+        },
+        "memory_max_bytes": 67108864,
+        "memory_peak_bytes": 17686528,
+        "memory_swap_max_bytes": 0,
+        "returncode": 0,
+        "schema": 1
+      },
+      "engine": {
+        "generated_ids": [
+          83,
+          31
+        ],
+        "lm_head_bytes_read": 0,
+        "lm_head_streamed": false,
+        "memory_plan_bytes": 9602560,
+        "model_resident_bytes": 9004544,
+        "model_stream_buffer_bytes": 0,
+        "peak_rss_bytes": 14225408,
+        "trunk_budget_bytes": 299008,
+        "trunk_ring_slots": 1,
+        "trunk_slot_bytes": 245760
+      },
+      "logits_sha256": "e21dbdcfbc6a94fb8005fca41a47dfa7cdb240fdb424061d8a7a81c8b2c48aea"
+    },
+    "streamed": {
+      "cgroup": {
+        "cgroup": "/system.slice/k3-head-3440-streamed.service",
+        "events": {
+          "high": 0,
+          "low": 0,
+          "max": 0,
+          "oom": 0,
+          "oom_group_kill": 0,
+          "oom_kill": 0
+        },
+        "memory_max_bytes": 67108864,
+        "memory_peak_bytes": 17948672,
+        "memory_swap_max_bytes": 0,
+        "returncode": 0,
+        "schema": 1
+      },
+      "engine": {
+        "generated_ids": [
+          83,
+          31
+        ],
+        "lm_head_bytes_read": 9003008,
+        "lm_head_streamed": true,
+        "memory_plan_bytes": 9602560,
+        "model_resident_bytes": 4503040,
+        "model_stream_buffer_bytes": 4202496,
+        "peak_rss_bytes": 14397440,
+        "trunk_budget_bytes": 598016,
+        "trunk_ring_slots": 2,
+        "trunk_slot_bytes": 245760
+      },
+      "logits_sha256": "e21dbdcfbc6a94fb8005fca41a47dfa7cdb240fdb424061d8a7a81c8b2c48aea"
+    }
+  },
+  "checkpoint_bytes": 12680201,
+  "ci_run": "34783226202",
+  "head_bytes": 4501504,
+  "kind": "scaled synthetic mechanism, not a real K3 memory/speed measurement",
+  "net_bytes_available_for_trunk": 299008,
+  "vocab": 17584,
+  "head_commit": "201e9cc2216b12115277f334db0414508d863489",
+  "job_id": 103793912876
+}
