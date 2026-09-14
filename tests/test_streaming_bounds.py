@@ -9,7 +9,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-import streaming_bounds as sb  # noqa: E402
+import streaming_bounds as sb
 
 
 class BoundsTests(unittest.TestCase):

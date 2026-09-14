@@ -150,7 +150,7 @@ class OfflineStorageTests(unittest.TestCase):
                 self.assertEqual(reader.read(37), want[off:off + 37])
             # A failing decoder must not matter when only a raw extent is requested.
             with mock.patch.object(reader.codec, "decompress", side_effect=AssertionError):
-                for index, (offset, stored, kind) in enumerate(reader.entries):
+                for index, (_offset, stored, kind) in enumerate(reader.entries):
                     if kind == om.RAW_EXTENT:
                         start = reader.ends[index - 1] if index else 0
                         reader.seek(start)
@@ -231,7 +231,7 @@ class OfflineStorageTests(unittest.TestCase):
                 self.reject(source, dest)
 
     def test_selective_raw_damage_needs_full_hash_verification(self):
-        source, dest, report = self.selective()
+        _source, dest, report = self.selective()
         data = bytearray(dest.read_bytes())
         _, off, _, kind, _ = om.MAP_ENTRY.unpack_from(data, om.HEADER.size)
         self.assertEqual(kind, om.RAW_EXTENT)
@@ -242,7 +242,7 @@ class OfflineStorageTests(unittest.TestCase):
             self.assertNotEqual(hashlib.sha256(reader.read()).hexdigest(), report["sha256"])
 
     def test_selective_plan_preflight_and_output_cap(self):
-        source, dest, _ = self.selective()
+        source, _dest, _ = self.selective()
         raw = source.read_bytes()
         bad = self.path / "bad.safetensors"
         bad.write_bytes(raw[:100])
