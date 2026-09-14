@@ -46,7 +46,8 @@ class OfflineStorageTests(unittest.TestCase):
         cls.no_codec = cls.root / "no_codec"
         cls.parity = cls.root / "parity"
         cls.stream = cls.root / "stream"
-        subprocess.run([*base, *cflags, "-DK3_WITH_ZSTD", *omp,
+        native_flags = shlex.split(os.environ.get("K3_TEST_NATIVE_CFLAGS", ""))
+        subprocess.run([*base, *cflags, *native_flags, "-DK3_WITH_ZSTD", *omp,
                         str(ROOT / "tests/unit/test_zfile.c"), *libs,
                         "-o", str(cls.native)], check=True)
         subprocess.run([*base, str(ROOT / "tests/unit/test_zfile.c"),
@@ -70,10 +71,13 @@ class OfflineStorageTests(unittest.TestCase):
         result = subprocess.run([str(program), *map(str, args)], text=True,
                                 capture_output=True, timeout=60,
                                 env={**os.environ, "OMP_NUM_THREADS": "4"})
+        self.assertNotIn("ERROR: AddressSanitizer", result.stderr)
+        self.assertNotIn("ERROR: LeakSanitizer", result.stderr)
+        self.assertNotIn("runtime error:", result.stderr)
         if ok:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         return result
 
     def archive(self, raw=None, shuffle="off"):

@@ -20,14 +20,22 @@ int main(int argc, char **argv)
 {
     if (argc != 3) return 2;
     int plain = open(argv[1], O_RDONLY), packed = open(argv[2], O_RDONLY);
-    if (plain < 0 || packed < 0) return 1;
+    if (plain < 0 || packed < 0) {
+        if (plain >= 0) close(plain);
+        if (packed >= 0) close(packed);
+        return 1;
+    }
     K3ZFile *z = NULL;
     if (k3_zopen(packed, &z)) { close(plain); close(packed); return 1; }
     int64_t size = (int64_t)lseek(plain, 0, SEEK_END);
-    if (size < 0 || (uint64_t)size != z->raw_size || size > (64 << 20)) return 1;
+    if (size < 0 || (uint64_t)size != z->raw_size || size > (64 << 20)) {
+        k3_zfree(z); close(plain); close(packed); return 1;
+    }
     unsigned char *want = (unsigned char *)malloc((size_t)size + 1);
     unsigned char *got = (unsigned char *)malloc((size_t)size + 1);
-    if (!want || !got) return 1;
+    if (!want || !got) {
+        free(want); free(got); k3_zfree(z); close(plain); close(packed); return 1;
+    }
     int bad = pread(plain, want, (size_t)size, 0) != size;
     if (k3_zread(z, got, size, 0) != size || memcmp(want, got, (size_t)size)) bad++;
     free(got);

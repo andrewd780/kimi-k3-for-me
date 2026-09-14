@@ -1,0 +1,203 @@
+{
+  "schema": 1,
+  "kind": "conditional mathematical model; not measured latency or throughput",
+  "evidence": {
+    "path": "docs/measurements/scale-plane-summary.json",
+    "sha256": "56a7c553f9891e22cff95760b78d54b8c5dc807a061bf3f96579083bb033f0c9",
+    "checkpoint_revision": "f831ab66814297da540d832a5235f8e904f29d06",
+    "scale_retained_fraction_sample": 0.15531521373324925
+  },
+  "assumptions": {
+    "SSD_GBps": 3.0,
+    "aggregate_scale_decode_GBps": 0.68,
+    "compute_seconds_if_executed_alone": 216.0,
+    "compute_is_hypothetical": true,
+    "trunk_GB_approx": 108.81,
+    "expert_bytes": 17547264,
+    "MoE_layers": 92,
+    "topk": 16,
+    "experts_per_layer": 896,
+    "persistent_cache_hits": 0,
+    "limits": "No contention, metadata, alignment, page cache or startup cost calibration. Bandwidth and compute are scenario inputs."
+  },
+  "bytes": {
+    "expert_per_token": 25829572608,
+    "scale_per_token": 1519386624,
+    "raw_total_per_token": 134639572608,
+    "selective_total_per_token": 133356169842.25,
+    "expert_fraction_saved": 0.0496873403686324,
+    "total_fraction_saved": 0.009532136361473736,
+    "ideal_IO_speed_ratio": 1.0096238724257616,
+    "ideal_IO_ratio_if_all_expert_reads_vanished": 1.2373823417700578,
+    "ideal_IO_ratio_if_all_trunk_reads_vanished": 5.212613257344378,
+    "scale_plane_GB_assumed": 85.0,
+    "scale_plane_GB_saved_projection": 71.79820683267381,
+    "checkpoint_GB_after_scales_projection": 1488.2017931673263
+  },
+  "codec_bounds": {
+    "serial_break_even_decode_GBps": 3.551620733290445,
+    "ideal_dedicated_decode_GBps_to_feed_expert_stream": 0.18569739805818034,
+    "raw_serial_scenario_seconds": 260.879857536,
+    "selective_serial_scenario_seconds": 262.686448708201,
+    "raw_perfect_overlap_lower_bound_seconds": 216.0,
+    "selective_perfect_overlap_dedicated_decoder_lower_bound_seconds": 216.0,
+    "selective_perfect_overlap_shared_CPU_work_lower_bound_seconds": 218.23439209411765,
+    "shared_CPU_assumption": "C and scale/D are normalized service times on the same exclusive CPU resource; actual scaling is unknown."
+  },
+  "known_route_pipeline": {
+    "assumptions": "One fixed-bandwidth reader, compute overlaps without slowing; known experts consumed in original order; bytes unchanged.",
+    "two_expert_buffer_bytes": 35094528,
+    "current_topk_plus_one_arena_payload_bytes": 298303488,
+    "memory_is_scheduling_floor_not_supported_engine_setting": true,
+    "scenarios": [
+      {
+        "read_cost_units": 1.0,
+        "compute_cost_units": 1.0,
+        "barrier_cost_units": 32.0,
+        "two_buffer_cost_units": 17.0,
+        "ideal_expert_stage_speed_ratio": 1.8823529411764706
+      },
+      {
+        "read_cost_units": 1.0,
+        "compute_cost_units": 4.0,
+        "barrier_cost_units": 80.0,
+        "two_buffer_cost_units": 65.0,
+        "ideal_expert_stage_speed_ratio": 1.2307692307692308
+      },
+      {
+        "read_cost_units": 4.0,
+        "compute_cost_units": 1.0,
+        "barrier_cost_units": 80.0,
+        "two_buffer_cost_units": 65.0,
+        "ideal_expert_stage_speed_ratio": 1.2307692307692308
+      }
+    ]
+  },
+  "prediction": [
+    {
+      "assumed_recall_at_16": 0.0,
+      "expert_traffic_multiplier": 2.0,
+      "total_traffic_multiplier": 1.191842354425784
+    },
+    {
+      "assumed_recall_at_16": 0.35,
+      "expert_traffic_multiplier": 1.65,
+      "total_traffic_multiplier": 1.1246975303767595
+    },
+    {
+      "assumed_recall_at_16": 0.7,
+      "expert_traffic_multiplier": 1.3,
+      "total_traffic_multiplier": 1.0575527063277352
+    },
+    {
+      "assumed_recall_at_16": 1.0,
+      "expert_traffic_multiplier": 1.0,
+      "total_traffic_multiplier": 1.0
+    }
+  ],
+  "batching_uniform_independent_model": [
+    {
+      "independent_requests": 1,
+      "expected_experts_per_layer": 16.0,
+      "expert_GB_per_output": 25.829572608,
+      "total_GB_per_output": 134.639572608,
+      "ideal_IO_throughput_ratio": 1.0
+    },
+    {
+      "independent_requests": 2,
+      "expected_experts_per_layer": 31.714285714285715,
+      "expert_GB_per_output": 25.598951424,
+      "total_GB_per_output": 80.003951424,
+      "ideal_IO_throughput_ratio": 1.682911533887189
+    },
+    {
+      "independent_requests": 4,
+      "expected_experts_per_layer": 62.306031341107875,
+      "expert_GB_per_output": 25.14590875689796,
+      "total_GB_per_output": 52.34840875689796,
+      "ideal_IO_throughput_ratio": 2.571989785463317
+    },
+    {
+      "independent_requests": 8,
+      "expected_experts_per_layer": 120.27942703324352,
+      "expert_GB_per_output": 24.271610889092198,
+      "total_GB_per_output": 37.8728608890922,
+      "ideal_IO_throughput_ratio": 3.5550409831008483
+    },
+    {
+      "independent_requests": 16,
+      "expected_experts_per_layer": 224.41249182603462,
+      "expert_GB_per_output": 22.642495124073314,
+      "total_GB_per_output": 29.443120124073314,
+      "ideal_IO_throughput_ratio": 4.572870403701402
+    },
+    {
+      "independent_requests": 32,
+      "expected_experts_per_layer": 392.61854784004913,
+      "expert_GB_per_output": 19.806971266957166,
+      "total_GB_per_output": 23.20728376695717,
+      "ideal_IO_throughput_ratio": 5.801608407085605
+    }
+  ],
+  "lossy_topk_IO_only": [
+    {
+      "topk": 1,
+      "total_GB_per_token": 110.424348288,
+      "ideal_IO_speed_ratio": 1.2192924359113606
+    },
+    {
+      "topk": 4,
+      "total_GB_per_token": 115.267393152,
+      "ideal_IO_speed_ratio": 1.1680629614869005
+    },
+    {
+      "topk": 8,
+      "total_GB_per_token": 121.724786304,
+      "ideal_IO_speed_ratio": 1.1060982458555821
+    },
+    {
+      "topk": 16,
+      "total_GB_per_token": 134.639572608,
+      "ideal_IO_speed_ratio": 1.0
+    }
+  ],
+  "speculation": [
+    {
+      "assumed_conditional_agreement": 0.0,
+      "draft_length": 4,
+      "expected_verified_outputs": 1.0
+    },
+    {
+      "assumed_conditional_agreement": 0.125,
+      "draft_length": 4,
+      "expected_verified_outputs": 1.142822265625
+    },
+    {
+      "assumed_conditional_agreement": 0.5,
+      "draft_length": 4,
+      "expected_verified_outputs": 1.9375
+    },
+    {
+      "assumed_conditional_agreement": 0.9,
+      "draft_length": 4,
+      "expected_verified_outputs": 4.0951
+    },
+    {
+      "assumed_conditional_agreement": 1.0,
+      "draft_length": 4,
+      "expected_verified_outputs": 5.0
+    }
+  ],
+  "unimplemented_scale_palette": {
+    "common_bytes": [
+      121,
+      120,
+      122
+    ],
+    "sample_values": 264241152,
+    "escape_values": 1748370,
+    "selector_plus_escape_bits_per_value": 2.052932557605562,
+    "retained_fraction_excluding_index_header": 0.25661656970069524,
+    "limits": "An exact representation size on the observed histogram, not a codec implementation, decoded speed, or unseen-data size guarantee."
+  }
+}

@@ -12,6 +12,10 @@ If the Zstd sample ratio generalizes to an 85 GB full scale plane, it projects t
 compression result. It does not make a 1.56 TB checkpoint fit under 200 GB, and no
 new deployment codec or format is added by this measurement.
 
+A later [selective reader](../SELECTIVE_SCALES.md) implements scale-only archives
+with raw packed-weight extents. Its synthetic correctness gates do not change
+the measurement's scope or turn the size projection into a full-checkpoint result.
+
 ## What was actually read
 
 The [CI campaign](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/34781927101)
