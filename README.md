@@ -9,6 +9,15 @@
 > opt-in exact cache policy, with held-out replay, corrected I/O accounting, and native
 > parity tests. The bundled trace contains 12 distinct positions, not 68 new tokens.
 > The upstream measurements below describe the original full local checkpoint.
+>
+> **September 13 follow-up:** [matched E8M0 scale samples](docs/notes/scale-plane.md)
+> retain 15.53% of their bytes under Zstd. Applied to an 85 GB scale plane, that
+> projects to about 72 GB saved; it is not a complete-checkpoint result.
+> [Exact AVX2/NEON KDA](docs/notes/kda-simd.md) stays opt-in after mixed/negative
+> timings. [Quality scoring](docs/QUALITY.md) is implemented but has no full-K3
+> evaluation yet. [Independent lm_head streaming](docs/notes/stream-lm-head.md)
+> has a capped synthetic mechanism gate. No work here establishes speed on a
+> small laptop; the earlier “laptop” campaign used a many-core cloud x86 host.
 
 <div align="center">
 
@@ -417,6 +426,7 @@ printf 'La capitale de la France est' > /tmp/p.txt
 | `--trunk-gb` | `X` | 16 | budget for pinned layers plus the streaming ring |
 | `--cache-gb` | `X` | 64 | budget for the routed-expert LRU cache |
 | `--ultra-low-memory` | none | off | stream exact embedding rows and lm_head chunks; full recompute also reuses one recurrent-state slot. Requires `--trunk` |
+| `--stream-lm-head` | none | off | stream only the output table; give the net freed memory to `--trunk-gb` to fund another ring slot. [Mechanism and limits](docs/notes/stream-lm-head.md) |
 
 The `ultra` preset selects `--ultra-low-memory` with a 2.5 GB trunk ring and a
 0.31 GB expert cache. It is a proof-of-life path for 8 GB-class machines, not an

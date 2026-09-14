@@ -1,0 +1,45 @@
+name: Exact KDA SIMD
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  kernels:
+    name: KDA exactness and timing (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Original C versus SIMD, three interleaved runs each
+        run: python3 tools/bench_kda.py --out kda-${{ runner.arch }}.json
+      - name: SIMD tail and state checks under sanitizers
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          arch=""
+          if [ "$(uname -m)" = x86_64 ]; then arch="-mavx2 -mfma"; fi
+          make BUILD=build/kda-asan BIN=bin/kda-asan \
+            CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -ffp-contract=off -DK3_KDA_SIMD $arch -fsanitize=address,undefined -fno-omit-frame-pointer" \
+            LDFLAGS="-lm -fsanitize=address,undefined" bin/kda-asan/test_kda_exact
+          ./bin/kda-asan/test_kda_exact
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kda-${{ runner.arch }}
+          path: |
+            kda-*.json
+            build/kda-*/*.log

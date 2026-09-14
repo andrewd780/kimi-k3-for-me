@@ -10,6 +10,22 @@ make test-all SHARD_DIR=~/k3model   # adds the checkpoint-dependent tests
 
 ## What each gate proves
 
+**`test_kda_exact`** compares complete recurrent-state and output bytes against the
+original scalar-order C through 9,504 repeated steps, including zero skips,
+misalignment, tails and heap-sized widths. The dedicated KDA workflow compiles
+both the original C and opt-in SIMD, compares full oracle-logit traces within each
+ISA, runs sanitizer coverage, and records three synthetic timing runs per arm.
+
+**`test_quality`** checks stable NLL arithmetic on synthetic logits. Python quality
+tests cover overlapping target windows and token-weighted aggregation. A tiny CLI
+primitive check compares native scores with ordinary prefix logits. These tests
+do not invoke the corpus harness or measure full-checkpoint model quality.
+
+**The Linux lm_head mechanism check** uses a scaled synthetic checkpoint in two
+64 MiB cgroup v2 units with swap disabled. It verifies the actual cap, equal memory
+plans, one versus two trunk ring slots, no drops and identical full-vocabulary
+logits. It refuses an uncapped fallback. See [the mechanism note](notes/stream-lm-head.md).
+
 **`test_ops`**, every kernel against reference values, at a tolerance declared in the
 fixture manifest rather than hardcoded. Several fixtures are adversarial by construction:
 the router fixture reorders its top-2 on 5 of 6 rows, so an implementation that ignores

@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -95,6 +98,149 @@ class OfflineCliTests(unittest.TestCase):
                 self.assert_same(a, b)
                 self.assertFalse(b[0]["reread_prompt"])
                 self.assertEqual(b[0]["original_prompt_tokens"], 3)
+
+    def test_native_score_primitive_on_synthetic_logits(self):
+        # Does not invoke the corpus harness or produce a K3 quality measurement.
+        # Compare the new native score path to ordinary prefix logits of this toy.
+        ids = [3, 7, 11, 5]
+        losses = []
+        for position in range(1, len(ids)):
+            _, raw = self.run_cli(self.plain, ["--ids", ",".join(map(str, ids[:position]))])
+            logits = struct.unpack("=256f", raw)
+            maximum = max(logits)
+            losses.append(math.log(sum(math.exp(x - maximum) for x in logits))
+                          + (maximum - logits[ids[position]]))
+        for first in (1, 2):
+            output = self.path / f"score-{first}.json"
+            process = subprocess.run([str(self.binary), str(self.packed), "--score-prompt",
+                                      "--ids", ",".join(map(str, ids)), "--score-start", str(first),
+                                      "--trunk", str(self.ztrunk), "--trunk-gb", "0.001",
+                                      "--cache-gb", "0.0001", "--out", str(output)],
+                                     capture_output=True, text=True, env=self.env, timeout=60)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            report = json.loads(output.read_text())
+            self.assertEqual(report["scored_tokens"], len(ids) - first)
+            self.assertEqual(report["input_ids"], ids)
+            self.assertEqual(report["layers_completed"], 13)
+            self.assertEqual(report["expert_drops"], 0)
+            for got, want in zip(report["token_nll"], losses[first - 1:]):
+                self.assertAlmostEqual(got, want, places=9)
+            self.assertAlmostEqual(report["nll_sum"], sum(losses[first - 1:]), places=9)
+
+    def test_stream_lm_head_independent_of_ultra(self):
+        for mode in ([], ["--incremental"]):
+            args = ["--ids", "3,7,11", "--trunk", self.ztrunk, "--trunk-gb", "0.001", *mode]
+            resident = self.run_cli(self.packed, args)
+            streamed = self.run_cli(self.packed, [*args, "--stream-lm-head"])
+            self.assert_same(resident, streamed)
+            self.assertFalse(streamed[0]["ultra_low_memory"])
+            self.assertTrue(streamed[0]["lm_head_streamed"])
+            self.assertEqual(streamed[0]["embedding_bytes_read"], 0)
+            self.assertGreater(streamed[0]["lm_head_bytes_read"], 0)
+        refused = self.run_cli(self.plain, ["--ids", "3,7", "--stream-lm-head",
+                                           "--draft-trunk", "absent"], ok=False)
+        self.assertIn("--stream-lm-head does not yet support --draft-trunk", refused.stderr)
+
+    def test_lm_head_ring_under_cgroup_cap(self):
+        if os.environ.get("K3_CGROUP_TEST") != "1":
+            self.skipTest("set K3_CGROUP_TEST=1 on a Linux CI runner with sudo/systemd")
+        cap = 64 << 20
+        stream_buffer = (4 << 20) + 2 * 4096
+        config = json.loads((self.plain / "config.json").read_text())
+        trunk_meta = json.loads((self.trunk / "trunk.json").read_text())
+        largest = max(layer["nbytes"] for layer in trunk_meta["layers"])
+        # Leave generous room for this tiny config's vector widening. This is a
+        # budget choice, not an alternate implementation of the ring allocator.
+        one_budget = largest + (64 << 10)
+        row_bytes = config["hidden_size"] * 2
+        vocab = (stream_buffer + one_budget + row_bytes - 1) // row_bytes
+        old_vocab = config["vocab_size"]
+        config["vocab_size"] = vocab
+        model = self.path / "wide-tables"
+        model.mkdir()
+        source = (self.plain / "model.safetensors").read_bytes()
+        header_size = struct.unpack("<Q", source[:8])[0]
+        header = json.loads(source[8:8 + header_size])
+        source_payload = memoryview(source)[8 + header_size:]
+        new_header, blobs, offset = {}, [], 0
+        for name, entry in header.items():
+            if name == "__metadata__":
+                continue
+            first, last = entry["data_offsets"]
+            raw = bytes(source_payload[first:last])
+            entry = dict(entry)
+            if name in ("language_model.model.embed_tokens.weight", "language_model.lm_head.weight"):
+                self.assertEqual(entry["dtype"], "BF16")
+                self.assertEqual(len(raw), old_vocab * row_bytes)
+                raw += raw[:row_bytes] * (vocab - old_vocab)
+                entry["shape"] = [vocab, config["hidden_size"]]
+            entry["data_offsets"] = [offset, offset + len(raw)]
+            new_header[name] = entry
+            blobs.append(raw)
+            offset += len(raw)
+        encoded = json.dumps(new_header).encode()
+        with (model / "model.safetensors").open("wb") as f:
+            f.write(struct.pack("<Q", len(encoded)))
+            f.write(encoded)
+            for blob in blobs:
+                f.write(blob)
+        (model / "config.json").write_text(json.dumps(config))
+        head_bytes = vocab * row_bytes
+        freed = head_bytes - stream_buffer
+        results, logits = {}, {}
+        for arm, budget in (("resident", one_budget), ("streamed", one_budget + freed)):
+            output = self.path / (arm + ".json")
+            raw_logits = self.path / (arm + ".f32")
+            limits = self.path / (arm + "-cgroup.json")
+            command = [str(self.binary), str(model), "--ids", "3,7,11", "--gen", "2",
+                       "--cache-gb", "0.0001", "--trunk", str(self.trunk),
+                       "--trunk-gb", f"{budget / 1e9:.9f}", "--out", str(output),
+                       "--dump-logits", str(raw_logits)]
+            if arm == "streamed":
+                command.append("--stream-lm-head")
+            run = ["sudo", "-n", "systemd-run", "--quiet", "--wait", "--pipe", "--collect",
+                   f"--unit=k3-head-{os.getpid()}-{arm}", f"--property=MemoryMax={cap}",
+                   "--property=MemorySwapMax=0", "--property=MemoryAccounting=yes",
+                   "--setenv=OMP_NUM_THREADS=2", "--setenv=K3_NOHUGE=1",
+                   sys.executable, str(ROOT / "tools/cgroup_probe.py"), "--limit", str(cap),
+                   "--report", str(limits), "--", *command]
+            process = subprocess.run(run, capture_output=True, text=True, timeout=120)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            engine = json.loads(output.read_text())
+            group = json.loads(limits.read_text())
+            self.assertEqual(engine["layers_completed"], 13)
+            self.assertEqual(engine["expert_drops"], 0)
+            self.assertEqual(group["memory_max_bytes"], cap)
+            self.assertEqual(group["memory_swap_max_bytes"], 0)
+            self.assertLessEqual(group["memory_peak_bytes"], cap)
+            self.assertEqual(group["events"]["oom"], 0)
+            self.assertFalse(engine["ultra_low_memory"])
+            self.assertEqual(engine["embedding_bytes_read"], 0)
+            self.assertLess(engine["memory_plan_bytes"], cap)
+            logits[arm] = raw_logits.read_bytes()
+            self.assertEqual(len(logits[arm]), vocab * 4)
+            # Mechanism report deliberately excludes all fixture timings.
+            fields = ("trunk_ring_slots", "trunk_slot_bytes", "trunk_budget_bytes",
+                      "model_resident_bytes", "model_stream_buffer_bytes", "memory_plan_bytes",
+                      "peak_rss_bytes", "lm_head_streamed", "lm_head_bytes_read", "generated_ids")
+            results[arm] = {"engine": {key: engine[key] for key in fields}, "cgroup": group,
+                            "logits_sha256": hashlib.sha256(logits[arm]).hexdigest()}
+        a, b = results["resident"]["engine"], results["streamed"]["engine"]
+        self.assertEqual(a["trunk_ring_slots"], 1)
+        self.assertEqual(b["trunk_ring_slots"], 2)
+        self.assertEqual(a["generated_ids"], b["generated_ids"])
+        self.assertEqual(logits["resident"], logits["streamed"])
+        self.assertEqual(a["model_resident_bytes"] - b["model_resident_bytes"], head_bytes)
+        self.assertEqual(b["model_stream_buffer_bytes"], stream_buffer)
+        self.assertEqual(a["memory_plan_bytes"], b["memory_plan_bytes"])
+        report = {"kind": "scaled synthetic mechanism, not a real K3 memory/speed measurement",
+                  "ci_run": os.environ.get("GITHUB_RUN_ID"), "head_bytes": head_bytes,
+                  "net_bytes_available_for_trunk": freed, "vocab": vocab,
+                  "checkpoint_bytes": (model / "model.safetensors").stat().st_size,
+                  "arms": results}
+        if os.environ.get("K3_HEAD_REPORT"):
+            Path(os.environ["K3_HEAD_REPORT"]).write_text(json.dumps(report, indent=2) + "\n")
+        print("HEAD MECHANISM " + json.dumps(report), flush=True)
 
     def test_reread_is_exact_token_repetition(self):
         for mode in ([], ["--incremental"]):

@@ -30,6 +30,16 @@
 #include "k3.h"
 #include "k3_cfg.h"   /* one config reader for both shapes; never defaults a field */
 
+/* Optional raw logits from every oracle forward, for bytewise cross-build gates. */
+static FILE *logit_trace;
+static void trace_logits(const float *values, size_t n)
+{
+    if (logit_trace && fwrite(values, sizeof(float), n, logit_trace) != n) {
+        fprintf(stderr, "cannot write oracle logit trace\n");
+        exit(2);
+    }
+}
+
 /* ------------------------------------------------------------ weight store ---- */
 typedef struct {
     float *blob;
@@ -313,6 +323,11 @@ int main(int argc, char **argv)
     float *lg   = (float *)malloc((size_t)T * (size_t)c.vocab * sizeof(float));
 
     forward(m, &c, full, T, lg, scratch, h, br, ks, 0);
+    if (argc > 2) {
+        logit_trace = fopen(argv[2], "wb");
+        if (!logit_trace) { perror(argv[2]); return 2; }
+    }
+    trace_logits(lg, (size_t)T * c.vocab);
     int tf_all = 0, tf_gen = 0, tf_gen_ok = 0;
     for (int i = 0; i < T; i++) {
         const int got = argmax_(lg + (size_t)i * (size_t)c.vocab, c.vocab);
@@ -333,6 +348,7 @@ int main(int argc, char **argv)
     int reuse_ok = 0;
     if (ks_reuse && lg_reuse) {
         forward(m, &c, full, T, lg_reuse, scratch, h, br, ks_reuse, 1);
+        trace_logits(lg_reuse, (size_t)T * c.vocab);
         reuse_ok = memcmp(lg, lg_reuse,
                           (size_t)T * (size_t)c.vocab * sizeof(float)) == 0;
     }
@@ -344,6 +360,7 @@ int main(int argc, char **argv)
     int cur = np, gok = 0;
     while (cur < T) {
         forward(m, &c, gen, cur, lg, scratch, h, br, ks, 0);
+        trace_logits(lg, (size_t)cur * c.vocab);
         gen[cur] = argmax_(lg + (size_t)(cur - 1) * (size_t)c.vocab, c.vocab);
         if (gen[cur] == full[cur]) gok++;
         cur++;
@@ -420,6 +437,7 @@ int main(int argc, char **argv)
                 k3_rmsnorm(nrm, h_i + (size_t)lastt * c.hidden, m->final_norm,
                            c.hidden, c.rms_eps);
                 k3_matmul(lg_i, nrm, m->lm_head, c.hidden, c.vocab);
+                trace_logits(lg_i, (size_t)c.vocab);
 
                 cached = base + nT;
                 if (cached >= T) break;
@@ -459,5 +477,6 @@ int main(int argc, char **argv)
      * `gok = (iok == T - np) ? gok : -1;`, existed only to poison a value that was then
      * discarded. Both sibling harnesses already propagated (test_ops.c and
      * scale_test.c); this one was left out. */
+    if (logit_trace && fclose(logit_trace)) return 2;
     return pass ? 0 : 1;
 }

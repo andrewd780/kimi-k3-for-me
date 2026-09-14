@@ -18,18 +18,30 @@ already default to 3 repeats and report mean, sd and spread. What remains is re-
 the 12 ladder rungs and the 12 splits under it and replacing the single-sample tables in
 docs/data/ with replicated ones.
 
+Blocked in this fork until a permitted host holds the entire checkpoint locally.
+The upstream campaign used a rented instance; no standing campaign host exists.
+
 ## 3. Thread scaling
 
-`OMP_NUM_THREADS` has never been swept on this engine. The workload is I/O bound at low
-memory budgets, so the useful thread count is probably well below the core count, and
-on memory-bound workloads throughput often *declines* past a point. Unknown here.
+`OMP_NUM_THREADS` has not been swept on the full workload. The published I/O split
+comes from a many-core cloud x86 host and does not establish the split on a small
+machine. A core-limited ladder and thread-count sweep remain blocked on a local
+full-checkpoint host. Synthetic kernel timing is not a substitute.
 
 ## 4. SIMD in the KDA recurrence
 
-The bf16 trunk matmul and the MXFP4 expert matmul already have hand-written AVX2 paths
-(`src/core/k3_ops.c`), each written to reproduce the scalar reduction order exactly. The
-KDA recurrence does not: it is still plain scalar C, and it is the largest remaining
-un-vectorised kernel on the non-I/O path.
+Exact AVX2 and NEON recurrences are implemented behind `KDA_SIMD=1`. Three layouts
+passed bytewise gates, but none established a useful gain on both CI ISAs: the
+retained row-major experiment is only modestly faster on x86 and slower on ARM.
+The original optimized C remains the default; it already allows compiler
+auto-vectorization. See [raw three-run results and limits](notes/kda-simd.md).
+
+The [scale-plane entropy campaign](notes/scale-plane.md) found a useful storage
+opportunity, but a dedicated scale reader still needs implementation and timing.
+The [quality harness](QUALITY.md) is ready for a future full-checkpoint host; no
+real K3 perplexity or lossy quality result is claimed. The independent
+[`--stream-lm-head`](notes/stream-lm-head.md) flag has a synthetic mechanism gate,
+with full-model overlap timing still blocked.
 
 ## 5. Sampling
 

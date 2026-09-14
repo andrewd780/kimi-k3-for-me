@@ -45,6 +45,7 @@
 #endif
 
 #include <math.h>
+#include <float.h>
 #include <errno.h>
 #include <limits.h>
 #include <ctype.h>
@@ -66,6 +67,7 @@
 #include "k3_trunk.h"
 #include "k3_tok.h"   /* text in/out; the --ids path never touches it */
 #include "k3_cfg.h"   /* read the checkpoint's own config rather than assuming it */
+#include "k3_quality.h"
 
 static double now_s(void)
 {
@@ -364,6 +366,8 @@ static void usage(FILE *f)
 "                        recurrent-state slot during full recompute; needs --trunk\n"
 "\n"
 "generation:\n"
+"  --stream-lm-head      stream exact lm_head chunks while keeping embedding/state\n"
+"                        policy unchanged; increase --trunk-gb to use freed memory\n"
 "  --gen N               tokens to generate (default 8)\n"
 "  --stop-id N           halt after emitting token id N (repeatable, up to 8). The\n"
 "                        stop id is kept in the sequence, so --save-state and a later\n"
@@ -393,6 +397,10 @@ static void usage(FILE *f)
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
+"  --score-prompt       teacher-force the prompt; write per-token NLL to --out.\n"
+"                        No generation, implicit BOS/EOS, or state continuation\n"
+"  --score-start N      first target position to score (default 1); earlier tokens\n"
+"                        remain context. Used for overlapping quality windows\n"
 "  --expert-profile PATH ranked calibration profile from tools/expert_profile.py\n"
 "  --pin-experts N        retain N profiled experts on first use; both flags required\n"
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
@@ -525,6 +533,7 @@ typedef struct {
     int          n_bound;
     int          layers_completed;
     int          ultra;
+    int          stream_lm_head;
     K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
     /* Incremental decode state. Only MLA layers need a KV cache, so the 24 of them are
      * numbered densely rather than indexing all 93 and wasting 74% of the allocation. */
@@ -532,6 +541,9 @@ typedef struct {
     int         *mla_slot;   /* [n_layers] -> dense MLA index, or -1 */
     int          n_mla, kv_cap, cached;
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
+    const int   *score_targets; /* optional next-token targets for each input position */
+    double      *score_nll;
+    int          score_start;   /* first scored input position, zero-based */
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -643,21 +655,27 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
 
     float *nrm = scratch;
-    if (arg_all) {
+    if (arg_all || w->score_targets) {
         for (int t = 0; t < T; t++) {
+            if (w->score_targets && t < w->score_start) continue;
             k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
-            if (w->ultra) {
+            if (w->stream_lm_head) {
                 if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
             } else {
                 k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
             }
-            arg_all[t] = argmax_(logits_last, c->vocab);
+            if (arg_all) arg_all[t] = argmax_(logits_last, c->vocab);
+            if (w->score_targets && k3_token_nll(logits_last, c->vocab,
+                                                 w->score_targets[t], w->score_nll + t)) {
+                fprintf(stderr, "invalid logits/target at score position %d\n", t + 1);
+                return -1;
+            }
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
         return 0;
     }
     k3_rmsnorm(nrm, h + (size_t)(T - 1) * E, w->mb.norm, E, c->rms_eps);
-    if (w->ultra) {
+    if (w->stream_lm_head) {
         if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
     } else {
         k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
@@ -694,6 +712,8 @@ int main(int argc, char **argv)
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
+    int score_prompt = 0, score_start = 1;
+    int exit_status = 0;
     int reread_prompt = 0;
     /* --stop-id, repeatable. Generation halts AFTER emitting a listed id, so the state
      * written by --save-state still contains it and a later --load-state continues the
@@ -702,6 +722,7 @@ int main(int argc, char **argv)
      * past the end-of-message marker that a caller will only throw away. */
     int stop_id[8]; int n_stop = 0, hit_stop = 0, stopped_at = -1;
     double cache_gb = 64.0, trunk_gb = 16.0;
+    double memory_plan_bytes = 0.0;
     int budget_auto = 0;
     int spec_n = 0;
     int tf_check = 0;
@@ -709,12 +730,23 @@ int main(int argc, char **argv)
     double draft_gb = 6.0;
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
-    int incremental = 0, ultra = 0;
+    int incremental = 0, ultra = 0, stream_lm_head = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--reread-prompt")) reread_prompt = 1;
+        else if (!strcmp(argv[i], "--score-prompt")) score_prompt = 1;
+        else if (!strcmp(argv[i], "--score-start") && i + 1 < argc) {
+            char *end;
+            errno = 0;
+            const long value = strtol(argv[++i], &end, 10);
+            if (!*argv[i] || *end || errno || value < 1 || value >= K3_MAX_PROMPT) {
+                fprintf(stderr, "--score-start must be a valid positive target position\n");
+                return 2;
+            }
+            score_start = (int)value;
+        }
         else if (!strcmp(argv[i], "--tok") && i + 1 < argc) tok_dir = argv[++i];
         else if (!strcmp(argv[i], "--config") && i + 1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
@@ -768,6 +800,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--ultra-low-memory")) ultra = 1;
+        else if (!strcmp(argv[i], "--stream-lm-head")) stream_lm_head = 1;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
@@ -801,6 +834,23 @@ int main(int argc, char **argv)
         else { fprintf(stderr, "unknown option %s\n\n", argv[i]); usage(stderr); return 2; }
     }
 
+    const int head_streamed = ultra || stream_lm_head;
+    if (stream_lm_head && draft_dir) {
+        fprintf(stderr, "--stream-lm-head does not yet support --draft-trunk\n");
+        return 2;
+    }
+    if (score_prompt) {
+        if (incremental || load_state || save_state || spec_n || draft_dir || tf_check ||
+            reread_prompt || n_stop || want_layers != -1 || trace_dir || logits_path) {
+            fprintf(stderr, "--score-prompt requires a complete teacher-forced model; "
+                            "generation/state/partial-layer diagnostics cannot be combined\n");
+            return 2;
+        }
+        gen = 0;
+    } else if (score_start != 1) {
+        fprintf(stderr, "--score-start needs --score-prompt\n");
+        return 2;
+    }
     if ((expert_profile != NULL) != (pin_experts > 0)) {
         fprintf(stderr, "--expert-profile and --pin-experts must be supplied together\n");
         return 2;
@@ -853,7 +903,9 @@ int main(int argc, char **argv)
         /* Fixed costs outside both budgets: embeddings + lm_head 4.70 GB, safetensors
          * index, recurrent state 0.63 GB, KV cache and scratch. Reserve them plus a
          * 2 GB + 2% margin so auto never invites the OOM killer. */
-        const double reserve = 2.0 + 0.02 * (avail / 1e9) + 4.70 + 1.70;
+        const double tables = head_streamed
+            ? 2.35 + ((double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN) / 1e9 : 4.70;
+        const double reserve = 2.0 + 0.02 * (avail / 1e9) + tables + 1.70;
         double usable = avail / 1e9 - reserve;
         const double slot_min = 2.5;   /* one ring slot + headroom; refuse below */
         const double cache_min = 0.5;  /* topk+1 expert slots is ~0.3 GB */
@@ -975,6 +1027,10 @@ int main(int argc, char **argv)
         }
     }
     if (np <= 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
+    if (score_prompt && score_start >= np) {
+        fprintf(stderr, "--score-prompt needs at least one target after --score-start\n");
+        return 2;
+    }
     for (int i = 0; i < np; i++)
         if (prompt[i] < 0 || prompt[i] >= c.vocab) {
             fprintf(stderr, "token id %d is outside the vocabulary of %d\n", prompt[i], c.vocab);
@@ -1111,9 +1167,10 @@ int main(int argc, char **argv)
     {
         const int64_t E64 = c.hidden;
         const double w_trunk = trunk_dir ? trunk_gb * 1e9 : (double)total;
-        const double w_model = ultra
-            ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN + 3.0 * E64 * 4
-            : 2.0 * (double)c.vocab * E64 * 2 + 3.0 * E64 * 4;
+        const double w_model = (ultra ? 0.0 : (double)c.vocab * E64 * 2)
+            + (head_streamed ? (double)K3_MODEL_STREAM_CHUNK + 2.0 * K3_ST_ALIGN
+                             : (double)c.vocab * E64 * 2)
+            + 3.0 * E64 * 4;
         const double w_cache = cache_gb * 1e9;
         const int Tm = prior + np + gen + 1;
         const int mb = c.n_layers / c.attn_res_block + 2;
@@ -1140,6 +1197,7 @@ int main(int argc, char **argv)
               * ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 4
             : 0.0;
         const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
+        memory_plan_bytes = need_b;
         const double have = mem_available_bytes();
 
         char b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
@@ -1152,7 +1210,8 @@ int main(int argc, char **argv)
                "  recurrent state  %s\n  buffers          %s\n  KV cache         %s\n"
                "  TOTAL            %s\n",
                trunk_dir ? "(STREAMED)" : "(resident)", b1, b2,
-               ultra ? "(STREAMED)" : "(resident)", b3, b4, b5, b7, b6);
+               ultra ? "(STREAMED)" : (head_streamed ? "(lm_head streamed)" : "(resident)"),
+               b3, b4, b5, b7, b6);
         if (have > 0.0) {
             human(have, b1, sizeof b1);
             printf("  available        %s\n", b1);
@@ -1220,11 +1279,15 @@ int main(int argc, char **argv)
 
     t0 = now_s();
     w.ultra = ultra;
-    if (k3_bind_model_parts(&st, &c, !ultra, !ultra, &w.mb) != 0) return 1;
-    if (ultra && k3_model_stream_init(&w.ms, &st, &c) != 0) return 1;
+    w.stream_lm_head = head_streamed;
+    if (k3_bind_model_parts(&st, &c, !ultra, !head_streamed, &w.mb) != 0) return 1;
+    if (head_streamed && k3_model_stream_init(&w.ms, &st, &c) != 0) return 1;
     human((double)w.mb.nbytes, b1, sizeof b1);
     if (ultra)
         printf("final norms: %s resident; embedding and lm_head streamed in %.1f s\n\n",
+               b1, now_s() - t0);
+    else if (head_streamed)
+        printf("embedding and final norms: %s resident; lm_head streamed in %.1f s\n\n",
                b1, now_s() - t0);
     else
         printf("embedding, final norm and lm_head: %s in %.1f s\n\n", b1, now_s() - t0);
@@ -1300,6 +1363,7 @@ int main(int argc, char **argv)
     memcpy(seq + prior, prompt, (size_t)np * sizeof(int));
     int T = prior + np;
     int nout = 0;
+    char *generated_text = NULL;
 
     /* ---- optional incremental decode ----
      * Full recompute re-runs the whole prefix every step, so expert traffic grows with
@@ -1406,6 +1470,46 @@ int main(int argc, char **argv)
                    "tokens per sweep;\n               the exact model verifies every one "
                    "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
         }
+    }
+
+    if (score_prompt) {
+        double *losses = (double *)calloc((size_t)np - 1, sizeof(double));
+        if (!losses) { exit_status = 1; goto cleanup; }
+        w.score_targets = seq + 1;
+        w.score_nll = losses;
+        w.score_start = score_start - 1;
+        k3_expert_drops = 0;
+        if (forward(&w, &c, &cache, seq, np - 1, lg, sc, h, br, ks, NULL) != 0 ||
+            w.layers_completed != c.n_layers || k3_expert_drops) {
+            fprintf(stderr, "quality run invalid; no scores published\n");
+            free(losses);
+            exit_status = 1;
+            goto cleanup;
+        }
+        double sum = 0.0;
+        for (int i = score_start - 1; i < np - 1; i++) sum += losses[i];
+        const int count = np - score_start;
+        const double mean = sum / count;
+        FILE *sf = fopen(outp, "w");
+        if (!sf) { perror(outp); exit_status = 1; }
+        else {
+            fprintf(sf, "{\"schema\":1,\"task\":\"perplexity\",\"input_ids\":[");
+            for (int i = 0; i < np; i++) fprintf(sf, "%s%d", i ? "," : "", seq[i]);
+            fprintf(sf, "],\"score_start\":%d,\"scored_tokens\":%d,"
+                        "\"layers\":%d,\"layers_completed\":%d,\"expert_drops\":0,"
+                        "\"nll_sum\":%.17g,\"mean_nll\":%.17g,\"perplexity\":",
+                    score_start, count, c.n_layers, w.layers_completed, sum, mean);
+            if (mean <= log(DBL_MAX)) fprintf(sf, "%.17g", exp(mean));
+            else fputs("null", sf); /* mean_nll remains defined when exp overflows */
+            fputs(",\"token_nll\":[", sf);
+            for (int i = score_start - 1; i < np - 1; i++)
+                fprintf(sf, "%s%.17g", i == score_start - 1 ? "" : ",", losses[i]);
+            fputs("]}\n", sf);
+            const int failed = ferror(sf);
+            if (fclose(sf) || failed) { perror(outp); exit_status = 1; }
+        }
+        free(losses);
+        goto cleanup;
     }
 
     /* --tf-check: teacher-forced agreement over the whole --ids sequence in ONE sweep.
@@ -1667,7 +1771,6 @@ int main(int argc, char **argv)
     /* Decoded text, when a tokenizer is loaded. Printed as a distinct block rather than
      * streamed per token: a partially-decoded multi-byte sequence is not valid UTF-8, so
      * streaming would emit mojibake at every token boundary that splits a codepoint. */
-    char *generated_text = NULL;
     if (have_tok && nout > 0) {
         generated_text = (char *)malloc((size_t)nout * 8 + 1);
         if (generated_text) {
@@ -1705,6 +1808,10 @@ int main(int argc, char **argv)
                 "\"expert_cache_slots\":%d,\"expert_profile_pins\":%d,"
                 "\"trunk_bytes_read\":%llu,\"embedding_bytes_read\":%llu,"
                 "\"lm_head_bytes_read\":%llu,\"ultra_low_memory\":%s,"
+                "\"lm_head_streamed\":%s,\"trunk_ring_slots\":%d,"
+                "\"trunk_slot_bytes\":%lld,\"trunk_budget_bytes\":%.0f,"
+                "\"model_resident_bytes\":%zu,\"model_stream_buffer_bytes\":%zu,"
+                "\"memory_plan_bytes\":%.0f,"
                 "\"stopped_at\":%d,"
                 "\"generated_text\":",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
@@ -1714,7 +1821,11 @@ int main(int argc, char **argv)
                 (unsigned long long)(w.trunk ? w.trunk->bytes_read : 0),
                 (unsigned long long)w.ms.embed_bytes_read,
                 (unsigned long long)w.ms.lm_head_bytes_read,
-                w.ultra ? "true" : "false", stopped_at);
+                w.ultra ? "true" : "false", w.stream_lm_head ? "true" : "false",
+                w.trunk ? w.trunk->nslot : 0,
+                (long long)(w.trunk ? w.trunk->slot_bytes : 0),
+                w.trunk ? trunk_gb * 1e9 : 0.0, w.mb.nbytes, w.ms.bufcap,
+                memory_plan_bytes, stopped_at);
         json_string(f, generated_text);
         fputs("}\n", f);
         fclose(f);
@@ -1728,7 +1839,6 @@ int main(int argc, char **argv)
         k3_cache_dump_trace(&cache, p);
     }
 
-    free(w.kvc); free(w.ropec); free(w.mla_slot);
     /* Report the compute-versus-I/O split rather than leaving it to be inferred.
      *
      * It cannot be inferred safely: a flat curve across a RAM sweep looks like evidence
@@ -1738,7 +1848,7 @@ int main(int argc, char **argv)
      * separates them. */
     {
         const double trunk_s = w.trunk ? w.trunk->load_seconds : 0.0;
-        const double model_s = w.ultra ? w.ms.read_seconds : 0.0;
+        const double model_s = w.stream_lm_head ? w.ms.read_seconds : 0.0;
         /* Both terms MUST be whole-run totals over the same window. Mixing a cumulative
          * trunk time with a last-step expert time and dividing by the whole run
          * understates the expert share by roughly the token count. */
@@ -1767,6 +1877,8 @@ int main(int argc, char **argv)
                expert_reqs_total ? 100.0 * (double)retained / (double)expert_reqs_total : 0.0,
                (unsigned long long)expert_evict_total);
     }
+cleanup:
+    free(w.kvc); free(w.ropec); free(w.mla_slot);
     if (w.trunk) { k3_trunk_report(w.trunk, "final"); k3_trunk_close(w.trunk); }
     k3_cache_free(&cache);
     for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
@@ -1775,6 +1887,7 @@ int main(int argc, char **argv)
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
     free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
+    free(prompt); free(seq); free(outtok);
 
     /* A dropped expert means some token was computed with part of its routed sum
      * missing. The run still produced token ids and they still look plausible, which is
@@ -1787,5 +1900,5 @@ int main(int argc, char **argv)
                 "the shard set or the storage is at fault.\n", k3_expert_drops);
         return 4;
     }
-    return 0;
+    return exit_status;
 }

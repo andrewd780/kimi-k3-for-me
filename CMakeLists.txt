@@ -26,6 +26,7 @@ endif()
 # the build machine. Off by default so a packaged build is portable.
 option(K3_NATIVE_ARCH "Optimise for the building CPU (-march/-mcpu=native)" OFF)
 option(K3_SANITIZE    "Build with ASan + UBSan"                        OFF)
+option(K3_KDA_SIMD "Enable experimental exact KDA SIMD (not a proven speedup)" OFF)
 option(K3_ZSTD        "Read offline lossless .k3z weights with libzstd" OFF)
 
 find_package(OpenMP)
@@ -75,6 +76,9 @@ target_include_directories(k3 PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/tokenizer)
 
 target_link_libraries(k3 PUBLIC k3_flags m Threads::Threads)
+if(K3_KDA_SIMD)
+  target_compile_definitions(k3 PUBLIC K3_KDA_SIMD)
+endif()
 if(K3_ZSTD)
   find_path(K3_ZSTD_INCLUDE_DIR zstd.h)
   find_library(K3_ZSTD_LIBRARY NAMES zstd)
@@ -104,6 +108,8 @@ function(k3_add_test name src)
   target_link_libraries(${name} PRIVATE k3)
 endfunction()
 
+k3_add_test(test_quality tests/unit/test_quality.c)
+k3_add_test(test_kda_exact tests/unit/test_kda_exact.c)
 k3_add_test(test_ops    tests/unit/test_ops.c)
 k3_add_test(test_cache  tests/unit/test_cache.c)
 k3_add_test(test_st     tests/unit/test_st.c)
@@ -119,6 +125,8 @@ set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 # Every test the Makefile's `test` target runs is registered here too. The two build
 # systems are documented as interchangeable, so a test present in one and absent from
 # the other silently gives ctest less coverage than `make test`.
+add_test(NAME quality COMMAND test_quality)
+add_test(NAME kda_exact COMMAND test_kda_exact)
 add_test(NAME ops        COMMAND test_ops   ${FIX}/ops)
 add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
@@ -155,6 +163,9 @@ add_test(NAME tokenizer
                  -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/README.md
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_tok_test.cmake)
 set_tests_properties(tokenizer PROPERTIES SKIP_REGULAR_EXPRESSION "SKIPPED:")
+
+add_executable(bench_kda benchmarks/bench_kda.c)
+target_link_libraries(bench_kda PRIVATE k3)
 
 add_executable(bench_kernels benchmarks/bench_kernels.c)
 target_link_libraries(bench_kernels PRIVATE k3)
