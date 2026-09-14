@@ -7,6 +7,12 @@ FUSE mount or decompressed copy on disk. All released weight bits are preserved,
 including the existing MXFP4 codes and scales. This does not recover precision that
 was already removed when the released checkpoint was quantized.
 
+An additional opt-in [`--policy scales`](SELECTIVE_SCALES.md) writes variable
+extents: expert scales can be compressed while packed weights and other tensors
+remain raw positioned reads. Its format and raw-payload integrity properties
+differ from the fully checksummed fixed blocks documented below. Full-model
+speed for either format is unmeasured.
+
 **The full K3 checkpoint still does not fit under 1 TB with the tested codecs.**
 The 1.56 TB checkpoint needs about 36% savings to reach 1 TB, before adding a packed
 trunk, sessions or filesystem overhead. Sampled packed expert weights saved only

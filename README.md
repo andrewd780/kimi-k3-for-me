@@ -18,6 +18,13 @@
 > evaluation yet. [Independent lm_head streaming](docs/notes/stream-lm-head.md)
 > has a capped synthetic mechanism gate. No work here establishes speed on a
 > small laptop; the earlier “laptop” campaign used a many-core cloud x86 host.
+>
+> **September 14 follow-up:** [selective scale archives](docs/SELECTIVE_SCALES.md)
+> now let packed weights bypass the decoder. This is opt-in, byte-exact and
+> tested on synthetic checkpoints; full-model speed remains unmeasured.
+> The [streaming option map and reproducible bounds](docs/notes/streaming-options.md)
+> cover experts **and** the trunk. Scale compression projects to only 0.953% fewer
+> total token bytes; overlap, trunk scheduling and compute remain the larger leads.
 
 <div align="center">
 

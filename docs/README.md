@@ -17,6 +17,8 @@
 | [TESTING.md](TESTING.md) | what each gate proves |
 | [BENCHMARKING.md](BENCHMARKING.md) | how to measure without fooling yourself |
 | [ROADMAP.md](ROADMAP.md) | what is missing, in priority order |
+| [SELECTIVE_SCALES.md](SELECTIVE_SCALES.md) | offline scales-only compression with raw packed-weight reads |
+| [notes/streaming-options.md](notes/streaming-options.md) | streaming options, exact math, limitations and gates |
 | [data/](data/) | the raw measurement output every table is transcribed from |
 
 ## Upstream material

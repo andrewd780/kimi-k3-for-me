@@ -38,6 +38,16 @@ jobs:
           echo "TEST_OMP_FLAGS=-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include -L$(brew --prefix libomp)/lib -lomp" >> "$GITHUB_ENV"
       - name: Compile and check native ranges, corruption, concurrency and byte parity
         run: python3 -m unittest discover -s tests -p test_offline_storage.py -v
+      - name: Check selective ranges under address and undefined-behavior sanitizers
+        if: runner.os == 'Linux'
+        env:
+          K3_TEST_NATIVE_CFLAGS: '-fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie -no-pie'
+        run: python3 -m unittest discover -s tests -p test_offline_storage.py -k selective -v
+      - name: Verify streaming equations and reproduce the deterministic scenario
+        run: |
+          python3 -m unittest discover -s tests -p test_streaming_bounds.py -v
+          python3 tools/streaming_bounds.py --out streaming-bounds.json
+          cmp docs/measurements/streaming-bounds.json streaming-bounds.json
       - name: Check quality window coverage and aggregation (no model evaluation)
         run: python3 -m unittest discover -s tests -p test_quality.py -v
       - name: Check held-out expert profile replay and trace validation

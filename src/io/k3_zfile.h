@@ -23,12 +23,15 @@
 #define K3_ZMAX_COUNT (1u << 22)
 
 typedef struct { uint64_t off; uint32_t size, flags; } K3ZEntry;
+typedef struct { uint64_t end, off, size; uint32_t flags; } K3ZExtent;
 typedef struct K3ZFile {
     int fd;
     uint64_t raw_size;
     uint32_t block_size, count;
     unsigned char id[16];
     K3ZEntry *entry;
+    K3ZExtent *extent;   /* K3ZMAP1: raw spans plus independently coded scale spans */
+    int mapped;
 } K3ZFile;
 
 static inline int k3_zsuffix(const char *path)
@@ -39,7 +42,7 @@ static inline int k3_zsuffix(const char *path)
 
 static inline void k3_zfree(K3ZFile *z)
 {
-    if (z) { free(z->entry); free(z); }
+    if (z) { free(z->entry); free(z->extent); free(z); }
 }
 
 #ifdef K3_WITH_ZSTD
@@ -54,7 +57,9 @@ static inline int k3_zpread(int fd, void *buf, size_t n, uint64_t off)
 {
     size_t got = 0;
     while (got < n) {
-        ssize_t r = pread(fd, (unsigned char *)buf + got, n - got,
+        size_t take = n - got;
+        if (take > (1u << 30)) take = 1u << 30;
+        ssize_t r = pread(fd, (unsigned char *)buf + got, take,
                           (off_t)(off + got));
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return -1;
@@ -62,6 +67,7 @@ static inline int k3_zpread(int fd, void *buf, size_t n, uint64_t off)
     }
     return 0;
 }
+#include "k3_zmap.h"
 #endif
 
 static inline int k3_zopen(int fd, K3ZFile **out)
@@ -74,8 +80,9 @@ static inline int k3_zopen(int fd, K3ZFile **out)
 #else
     unsigned char h[K3_ZHEADER];
     int64_t physical = (int64_t)lseek(fd, 0, SEEK_END);
-    if (physical < K3_ZHEADER || k3_zpread(fd, h, sizeof h, 0) ||
-        memcmp(h, "K3ZSTD1\0", 8) || k3_zle(h + 40, 8)) goto bad_header;
+    if (physical < K3_ZHEADER || k3_zpread(fd, h, sizeof h, 0)) goto bad_header;
+    if (!memcmp(h, "K3ZMAP1\0", 8)) return k3_zmap_open(fd, h, (uint64_t)physical, out);
+    if (memcmp(h, "K3ZSTD1\0", 8) || k3_zle(h + 40, 8)) goto bad_header;
     uint64_t raw = k3_zle(h + 8, 8);
     uint32_t block = (uint32_t)k3_zle(h + 16, 4);
     uint32_t count = (uint32_t)k3_zle(h + 20, 4);
@@ -122,6 +129,7 @@ static inline int64_t k3_zread(const K3ZFile *z, void *dst, int64_t n, int64_t o
     if (!z || off < 0 || n < 0 || (uint64_t)off > z->raw_size ||
         (uint64_t)n > z->raw_size - (uint64_t)off || (uint64_t)n > SIZE_MAX) return 0;
     if (!n) return 0;
+    if (z->mapped) return k3_zmap_read(z, dst, n, off);
     size_t bound = ZSTD_compressBound((size_t)z->block_size + K3_ZPREFIX);
     unsigned char *packed = (unsigned char *)malloc(bound);
     unsigned char *raw = (unsigned char *)malloc((size_t)z->block_size + K3_ZPREFIX);

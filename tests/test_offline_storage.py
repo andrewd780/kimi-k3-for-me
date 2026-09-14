@@ -15,6 +15,7 @@ import random
 import shlex
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -45,7 +46,8 @@ class OfflineStorageTests(unittest.TestCase):
         cls.no_codec = cls.root / "no_codec"
         cls.parity = cls.root / "parity"
         cls.stream = cls.root / "stream"
-        subprocess.run([*base, *cflags, "-DK3_WITH_ZSTD", *omp,
+        native_flags = shlex.split(os.environ.get("K3_TEST_NATIVE_CFLAGS", ""))
+        subprocess.run([*base, *cflags, *native_flags, "-DK3_WITH_ZSTD", *omp,
                         str(ROOT / "tests/unit/test_zfile.c"), *libs,
                         "-o", str(cls.native)], check=True)
         subprocess.run([*base, str(ROOT / "tests/unit/test_zfile.c"),
@@ -69,10 +71,13 @@ class OfflineStorageTests(unittest.TestCase):
         result = subprocess.run([str(program), *map(str, args)], text=True,
                                 capture_output=True, timeout=60,
                                 env={**os.environ, "OMP_NUM_THREADS": "4"})
+        self.assertNotIn("ERROR: AddressSanitizer", result.stderr)
+        self.assertNotIn("ERROR: LeakSanitizer", result.stderr)
+        self.assertNotIn("runtime error:", result.stderr)
         if ok:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         else:
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         return result
 
     def archive(self, raw=None, shuffle="off"):
@@ -104,6 +109,170 @@ class OfflineStorageTests(unittest.TestCase):
             self.assertEqual(reader.read(), raw[-37:])
             with self.assertRaises(ValueError):
                 reader.seek(-1)
+
+    def selective(self, random_scales=False):
+        # Odd boundaries, scales longer than a block, three separate matrices,
+        # all 256 byte values, and multi-MiB raw runs. No released weights.
+        generator = random.Random(63011)
+        header, payload = {}, bytearray()
+        for matrix in ("w1", "w2", "w3"):
+            prefix = "language_model.model.layers.1.block_sparse_moe.experts.0." + matrix
+            for suffix, shape, raw in (
+                    ("weight_packed", [257, 4112], generator.randbytes(257 * 4112)),
+                    ("weight_scale", [257, 257], generator.randbytes(257 * 257)
+                     if random_scales else (bytes(range(256)) + b"y" * (257 * 257 - 256)))):
+                name = prefix + "." + suffix
+                lo = len(payload)
+                payload.extend(raw)
+                header[name] = {"dtype": "U8", "shape": shape,
+                                "data_offsets": [lo, len(payload)]}
+        encoded = json.dumps(header).encode()
+        source, dest = self.path / "select.safetensors", self.path / "select.safetensors.k3z"
+        source.write_bytes(struct.pack("<Q", len(encoded)) + encoded + payload)
+        report = om.pack_file(source, dest, block=64 << 10, policy="scales")
+        return source, dest, report
+
+    def test_selective_raw_bypass_and_complete_random_range_parity(self):
+        source, dest, report = self.selective()
+        self.run_c(self.native, source, dest)  # concurrent reads + injected decoder failure
+        want = source.read_bytes()
+        self.assertEqual(report["stored_bytes"], dest.stat().st_size)
+        self.assertEqual(report["source_bytes"], len(want))
+        self.assertEqual(report["sha256"], hashlib.sha256(want).hexdigest())
+        self.assertEqual(report["scale_bytes"], 3 * 257 * 257)
+        self.assertEqual(report["compressed_scale_bytes"], report["scale_bytes"])
+        with om.Reader(dest) as reader:
+            self.assertEqual(reader.read(), want)
+            boundaries = [0, *reader.ends]
+            for boundary in boundaries:
+                off = max(0, boundary - 3)
+                reader.seek(off)
+                self.assertEqual(reader.read(37), want[off:off + 37])
+            # A failing decoder must not matter when only a raw extent is requested.
+            with mock.patch.object(reader.codec, "decompress", side_effect=AssertionError):
+                for index, (offset, stored, kind) in enumerate(reader.entries):
+                    if kind == om.RAW_EXTENT:
+                        start = reader.ends[index - 1] if index else 0
+                        reader.seek(start)
+                        self.assertEqual(reader.read(min(37, stored)), want[start:start + min(37, stored)])
+        self.run_c(self.no_codec, source, dest, ok=False)
+
+    def test_selective_incompressible_scales_fall_back_to_raw(self):
+        source, dest, report = self.selective(random_scales=True)
+        self.assertEqual(report["compressed_scale_bytes"], 0)
+        self.assertEqual(report["raw_payload_bytes"], source.stat().st_size)
+        self.assertEqual(report["stored_bytes"], report["source_bytes"] + report["index_bytes"])
+        self.run_c(self.native, source, dest)
+
+    @staticmethod
+    def repair_map_index(data):
+        count = om.HEADER.unpack_from(data)[3]
+        end = om.HEADER.size + count * om.MAP_ENTRY.size
+        checksum = om.index_hash(data[om.HEADER.size:end], om.index_hash(data[:40]))
+        struct.pack_into("<Q", data, 40, checksum)
+
+    def test_selective_corruption_and_invalid_extent_geometry_fail_closed(self):
+        source, dest, _ = self.selective()
+        original = dest.read_bytes()
+        for offset in (8, 16, 20, 24, 40, 48, 56, 64, 72, 76):
+            with self.subTest(offset=offset):
+                data = bytearray(original)
+                data[offset] ^= 128
+                dest.write_bytes(data)
+                self.reject(source, dest)
+        # Recompute the metadata checksum to exercise bounds independently of it.
+        for entry_index, field, value in ((0, 0, 0), (0, 0, len(source.read_bytes()) + 1),
+                                          (0, 1, 0), (0, 2, (1 << 64) - 1),
+                                          (0, 3, 7), (0, 4, 1), (1, 0, 1)):
+            data = bytearray(original)
+            at = om.HEADER.size + entry_index * om.MAP_ENTRY.size
+            entry = list(om.MAP_ENTRY.unpack_from(data, at))
+            entry[field] = value
+            om.MAP_ENTRY.pack_into(data, at, *entry)
+            self.repair_map_index(data)
+            dest.write_bytes(data)
+            self.reject(source, dest)
+        for data in (original[:10], original[:-1], original + b"x"):
+            dest.write_bytes(data)
+            self.reject(source, dest)
+        dest.write_bytes(original)
+        with om.Reader(dest) as reader:
+            compressed = [(off, n) for off, n, flag in reader.entries if flag == 0]
+        for off, n in compressed:
+            data = bytearray(original)
+            data[off + n - 1] ^= 1
+            dest.write_bytes(data)
+            self.reject(source, dest)
+
+    def test_selective_scale_frame_identity_and_position_are_bound(self):
+        source, dest, _ = self.selective()
+        original = dest.read_bytes()
+        with om.Reader(dest) as reader:
+            index = next(i for i, e in enumerate(reader.entries) if e[2] == 0)
+            off, n, _ = reader.entries[index]
+            start = reader.ends[index - 1] if index else 0
+            length = reader.ends[index] - start
+            raw = reader.codec.decompress(original[off:off + n], length + om.PREFIX.size)
+            for prefix_offset in (0, 16, 24, 28):
+                changed = bytearray(raw)
+                changed[prefix_offset] ^= 1
+                frame = reader.codec.compress(bytes(changed))
+                data = bytearray(original[:off] + frame + original[off + n:])
+                for i in range(len(reader.entries)):
+                    at = om.HEADER.size + i * om.MAP_ENTRY.size
+                    entry = list(om.MAP_ENTRY.unpack_from(data, at))
+                    if i == index:
+                        entry[2] = len(frame)
+                    elif i > index:
+                        entry[1] += len(frame) - n
+                    om.MAP_ENTRY.pack_into(data, at, *entry)
+                self.repair_map_index(data)
+                dest.write_bytes(data)
+                self.reject(source, dest)
+
+    def test_selective_raw_damage_needs_full_hash_verification(self):
+        source, dest, report = self.selective()
+        data = bytearray(dest.read_bytes())
+        _, off, _, kind, _ = om.MAP_ENTRY.unpack_from(data, om.HEADER.size)
+        self.assertEqual(kind, om.RAW_EXTENT)
+        data[off] ^= 1
+        dest.write_bytes(data)
+        # Raw payload deliberately has ordinary-file integrity, not frame checksums.
+        with om.Reader(dest) as reader:
+            self.assertNotEqual(hashlib.sha256(reader.read()).hexdigest(), report["sha256"])
+
+    def test_selective_plan_preflight_and_output_cap(self):
+        source, dest, _ = self.selective()
+        raw = source.read_bytes()
+        bad = self.path / "bad.safetensors"
+        bad.write_bytes(raw[:100])
+        with self.assertRaises(ValueError):
+            om.pack_file(bad, self.path / "bad.k3z", policy="scales")
+        n = struct.unpack_from("<Q", raw)[0]
+        header = json.loads(raw[8:8 + n])
+        name = next(k for k in header if k.endswith("weight_scale"))
+        header[name]["shape"][1] -= 1
+        encoded = json.dumps(header).encode()
+        bad.write_bytes(struct.pack("<Q", len(encoded)) + encoded + raw[8 + n:])
+        with self.assertRaisesRegex(ValueError, "paired E8M0"):
+            om.scale_plan(bad)
+        other = self.path / "capped.k3z"
+        with self.assertRaisesRegex(OSError, "exceeds"):
+            om.pack_file(source, other, policy="scales", limit=80000)
+        self.assertFalse(other.exists())
+        self.assertFalse(Path(str(other) + ".part").exists())
+        self.assertEqual(source.read_bytes(), raw)
+
+    def test_selective_all_raw_shard_and_trunk_packing(self):
+        source = self.model()
+        packed = self.path / "mapped-model"
+        with contextlib.redirect_stdout(io.StringIO()):
+            om.pack_model(source, packed, policy="scales")
+            self.assertEqual(pack_trunk.main([str(source), str(self.path / "ta"), "1"]), 0)
+            self.assertEqual(pack_trunk.main([str(packed), str(self.path / "tb"), "1"]), 0)
+        self.run_c(self.parity, source, packed)
+        self.assertEqual((self.path / "ta/trunk.bin").read_bytes(),
+                         (self.path / "tb/trunk.bin").read_bytes())
 
     def test_shuffle_restores_odd_length_and_cross_block_reads(self):
         source, dest = self.archive(shuffle="on")

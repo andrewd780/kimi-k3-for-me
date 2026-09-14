@@ -37,7 +37,11 @@ The original optimized C remains the default; it already allows compiler
 auto-vectorization. See [raw three-run results and limits](notes/kda-simd.md).
 
 The [scale-plane entropy campaign](notes/scale-plane.md) found a useful storage
-opportunity, but a dedicated scale reader still needs implementation and timing.
+opportunity. An opt-in [selective scale reader](SELECTIVE_SCALES.md) now leaves
+packed weights raw and decodes only scales; native synthetic gates pass, while
+real conversion size and timing remain unmeasured. The
+[streaming option map](notes/streaming-options.md) derives the next exact scheduling
+leads and explains why scale-only coding cannot be a large full-model speedup.
 The [quality harness](QUALITY.md) is ready for a future full-checkpoint host; no
 real K3 perplexity or lossy quality result is claimed. The independent
 [`--stream-lm-head`](notes/stream-lm-head.md) flag has a synthetic mechanism gate,
