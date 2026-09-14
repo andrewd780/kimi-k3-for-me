@@ -36,6 +36,7 @@ class OfflineCliTests(unittest.TestCase):
         cls.binary = (ROOT / os.environ.get("K3_TEST_BIN", "bin/zstd/k3")).resolve()
         cls.env = {**os.environ, "OMP_NUM_THREADS": "2", "K3_NOHUGE": "1"}
         cls.plain, cls.packed = cls.root / "plain", cls.root / "packed"
+        cls.selective = cls.root / "selective"
         subprocess.run([sys.executable, str(ROOT / "tools/make_tiny_checkpoint.py"),
                         str(cls.plain)], check=True, capture_output=True, env=cls.env)
         # Minimal all-byte vocabulary exercises text and UTF-8 file entry points.
@@ -46,6 +47,7 @@ class OfflineCliTests(unittest.TestCase):
         cls.ztrunk = cls.root / "ztrunk"
         with contextlib.redirect_stdout(io.StringIO()):
             om.pack_model(cls.plain, cls.packed, block=64 << 10)
+            om.pack_model(cls.plain, cls.selective, block=64 << 10, policy="scales")
             if pack_trunk.main([str(cls.packed), str(cls.trunk), "13"]):
                 raise AssertionError("tiny trunk packing failed")
             cls.ztrunk.mkdir()
@@ -98,6 +100,15 @@ class OfflineCliTests(unittest.TestCase):
                 self.assert_same(a, b)
                 self.assertFalse(b[0]["reread_prompt"])
                 self.assertEqual(b[0]["original_prompt_tokens"], 3)
+
+    def test_selective_scales_with_evictions_and_trunk_streaming(self):
+        for mode in ([], ["--incremental"]):
+            for head in ([], ["--stream-lm-head"]):
+                with self.subTest(mode=mode, head=head):
+                    args = ["--ids", "1,2,3", "--reread-prompt", "--trunk", self.ztrunk,
+                            "--trunk-gb", "0.001", *mode, *head]
+                    self.assert_same(self.run_cli(self.plain, args),
+                                     self.run_cli(self.selective, args))
 
     def test_native_score_primitive_on_synthetic_logits(self):
         # Does not invoke the corpus harness or produce a K3 quality measurement.
