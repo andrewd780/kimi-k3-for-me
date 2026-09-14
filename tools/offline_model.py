@@ -25,6 +25,9 @@ MAGIC = b"K3ZSTD1\0"
 MAP_MAGIC = b"K3ZMAP1\0"
 MAP_ENTRY = struct.Struct("<QQQII")  # logical end, physical offset/size, kind, reserved
 RAW_EXTENT = 2
+# Raw extents are padded so physical offset == logical offset (mod ALIGN); the C reader
+# can then serve their aligned interior by direct I/O. Must match K3_ST_ALIGN.
+ALIGN = 4096
 BLOCK = 1 << 20
 MAX_BLOCK = 8 << 20
 MAX_COUNT = 1 << 22
@@ -103,13 +106,17 @@ class Reader(io.RawIOBase):
                     self.ends.append(end)
                 else:
                     offset, size, flags = entry
-                if (offset != cursor or size > physical - cursor or
+                # A mapped archive may pad up to ALIGN-1 bytes before an extent so raw
+                # payload keeps its logical alignment on disk; K3ZSTD1 blocks are packed.
+                gap = offset - cursor
+                if (gap < 0 or gap >= (ALIGN if self.mapped else 1) or
+                        size > physical - offset or
                         (not self.mapped and flags not in (0, 1)) or
                         (flags != RAW_EXTENT and
                          (not 9 <= size <= bound or flags not in (0, 1)))):
                     raise ValueError("invalid block index")
                 self.entries.append((offset, size, flags))
-                cursor += size
+                cursor = offset + size
             if self.mapped and end != self.size:
                 raise ValueError("extent index does not cover the logical file")
             if cursor != physical:
@@ -294,6 +301,9 @@ def pack_scales(source, destination, *, block=BLOCK, level=3, limit=None):
     Raw payload has the same integrity properties as an ordinary safetensors
     file. A full logical SHA-256 is recorded for explicit whole-archive verify.
     Compressed extents have mandatory frame checksums and index/identity binding.
+    Every raw extent is preceded by up to ALIGN-1 zero bytes so that its physical
+    offset equals its logical offset modulo ALIGN; the C reader relies on that to
+    read the aligned interior of raw extents with direct I/O.
     """
     source, destination = Path(source), Path(destination)
     if destination.exists() or source.resolve() == destination.resolve():
@@ -306,7 +316,7 @@ def pack_scales(source, destination, *, block=BLOCK, level=3, limit=None):
     codec, archive_id = Zstd(), os.urandom(16)
     part = destination.with_name(destination.name + ".part")
     entries, sha = [], hashlib.sha256()
-    scale_bytes = scale_stored = raw_bytes = compressed_scale_bytes = 0
+    scale_bytes = scale_stored = raw_bytes = compressed_scale_bytes = padding = 0
     header = HEADER.pack(MAP_MAGIC, size, block, len(plan), archive_id, 0)
     with part.open("xb") as dst:
         try:
@@ -314,8 +324,15 @@ def pack_scales(source, destination, *, block=BLOCK, level=3, limit=None):
             dst.seek(cursor)
             with source.open("rb") as src:
                 for index, (lo, hi, kind) in enumerate(plan):
-                    offset = cursor
                     if kind == RAW_EXTENT:
+                        # Keep raw payload at physical == logical (mod ALIGN).
+                        pad = (lo - cursor) % ALIGN
+                        if limit is not None and cursor + pad > limit:
+                            raise OSError("alignment padding exceeds --max-output-gb")
+                        dst.write(bytes(pad))
+                        cursor += pad
+                        padding += pad
+                        offset = cursor
                         left = hi - lo
                         while left:
                             chunk = src.read(min(block, left))
@@ -340,8 +357,15 @@ def pack_scales(source, destination, *, block=BLOCK, level=3, limit=None):
                         if len(packed) >= len(raw):
                             packed, kind = raw, RAW_EXTENT
                             raw_bytes += len(raw)
+                            pad = (lo - cursor) % ALIGN   # fallback raw: align it too
+                            if limit is not None and cursor + pad > limit:
+                                raise OSError("alignment padding exceeds --max-output-gb")
+                            dst.write(bytes(pad))
+                            cursor += pad
+                            padding += pad
                         else:
                             compressed_scale_bytes += len(raw)
+                        offset = cursor
                         if limit is not None and cursor + len(packed) > limit:
                             raise OSError("scale output exceeds --max-output-gb")
                         dst.write(packed)
@@ -379,6 +403,7 @@ def pack_scales(source, destination, *, block=BLOCK, level=3, limit=None):
             "extents": len(entries), "raw_payload_bytes": raw_bytes,
             "scale_bytes": scale_bytes, "scale_stored_bytes": scale_stored,
             "compressed_scale_bytes": compressed_scale_bytes,
+            "alignment": ALIGN, "padding_bytes": padding,
             "index_bytes": HEADER.size + len(entries) * MAP_ENTRY.size}
 
 

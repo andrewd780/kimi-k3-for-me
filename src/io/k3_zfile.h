@@ -1,5 +1,5 @@
 /* Independently checksummed Zstandard blocks. See docs/OFFLINE_STORAGE.md.
- * The descriptor belongs to the caller. Indexes are immutable; each read owns its
+ * Both descriptors belong to the caller. Indexes are immutable; each read owns its
  * scratch buffers so parallel expert and trunk reads never share decoder state. */
 #ifndef K3_ZFILE_H
 #define K3_ZFILE_H
@@ -26,12 +26,15 @@ typedef struct { uint64_t off; uint32_t size, flags; } K3ZEntry;
 typedef struct { uint64_t end, off, size; uint32_t flags; } K3ZExtent;
 typedef struct K3ZFile {
     int fd;
+    int dfd;             /* optional second descriptor for direct I/O, or -1; used only
+                          * for the aligned interior of K3ZMAP1 raw extents */
     uint64_t raw_size;
     uint32_t block_size, count;
     unsigned char id[16];
     K3ZEntry *entry;
     K3ZExtent *extent;   /* K3ZMAP1: raw spans plus independently coded scale spans */
     int mapped;
+    uint64_t direct_bytes;   /* raw bytes served through dfd; a diagnostic total */
 } K3ZFile;
 
 static inline int k3_zsuffix(const char *path)
@@ -93,7 +96,7 @@ static inline int k3_zopen(int fd, K3ZFile **out)
     if (cursor > (uint64_t)physical) goto bad_header;
     K3ZFile *z = (K3ZFile *)calloc(1, sizeof *z);
     if (!z) return -1;
-    z->fd = fd; z->raw_size = raw; z->block_size = block; z->count = count;
+    z->fd = fd; z->dfd = -1; z->raw_size = raw; z->block_size = block; z->count = count;
     memcpy(z->id, h + 24, 16);
     z->entry = (K3ZEntry *)calloc(count ? count : 1, sizeof *z->entry);
     unsigned char *table = (unsigned char *)malloc(count ? (size_t)count * 16 : 1);

@@ -1,12 +1,21 @@
 /* Internal implementation for k3_zfile.h, included only with K3_WITH_ZSTD.
  * K3ZMAP1 preserves logical offsets while coding only selected tensor extents.
- * Raw spans go straight from pread into the caller's buffer; no decoder or
- * whole-span allocation. All metadata is immutable after open. */
+ * Raw spans go straight from pread into the caller's buffer, and their aligned
+ * interior bypasses the page cache when a direct descriptor is present; no decoder
+ * or whole-span allocation. All metadata is immutable after open. */
 #ifndef K3_ZMAP_H
 #define K3_ZMAP_H
 
 #define K3_ZMAP_ENTRY 32
 #define K3_ZMAP_RAW 2
+/* The writer pads up to K3_ZMAP_ALIGN-1 zero bytes before every raw extent so that its
+ * physical offset equals its logical offset modulo K3_ZMAP_ALIGN. The shard reader
+ * widens each read to K3_ST_ALIGN boundaries into an aligned slot, so the two
+ * alignments must agree for the aligned interior to be eligible for direct I/O. */
+#define K3_ZMAP_ALIGN 4096u
+#if defined(K3_ST_ALIGN) && (K3_ST_ALIGN != 4096)
+#error "K3_ZMAP_ALIGN must equal K3_ST_ALIGN"
+#endif
 
 static inline uint64_t k3_zmap_hash(const unsigned char *p, size_t n, uint64_t h)
 {
@@ -27,7 +36,7 @@ static inline int k3_zmap_open(int fd, const unsigned char *h, uint64_t physical
     if (cursor > physical) goto bad_header;
     K3ZFile *z = (K3ZFile *)calloc(1, sizeof *z);
     if (!z) return -1;
-    z->fd = fd; z->raw_size = raw_size; z->block_size = block;
+    z->fd = fd; z->dfd = -1; z->raw_size = raw_size; z->block_size = block;
     z->count = count; z->mapped = 1;
     memcpy(z->id, h + 24, 16);
     z->extent = (K3ZExtent *)calloc(count ? count : 1, sizeof *z->extent);
@@ -44,15 +53,17 @@ static inline int k3_zmap_open(int fd, const unsigned char *h, uint64_t physical
         K3ZExtent *e = &z->extent[i];
         e->end = k3_zle(p, 8); e->off = k3_zle(p + 8, 8);
         e->size = k3_zle(p + 16, 8); e->flags = (uint32_t)k3_zle(p + 24, 4);
+        /* Extents are stored in order; a gap below the alignment is padding. */
         if (k3_zle(p + 28, 4) || e->end <= logical || e->end > raw_size ||
-            e->off != cursor || e->size > physical - cursor ||
+            e->off < cursor || e->off - cursor >= K3_ZMAP_ALIGN || e->off > physical ||
+            e->size > physical - e->off ||
             (e->flags != 0 && e->flags != K3_ZMAP_RAW)) { bad = 1; break; }
         uint64_t length = e->end - logical;
         if ((e->flags == K3_ZMAP_RAW && e->size != length) ||
             (e->flags == 0 && (length > block || e->size < 9 || e->size > bound))) {
             bad = 1; break;
         }
-        logical = e->end; cursor += e->size;
+        logical = e->end; cursor = e->off + e->size;
     }
     free(table);
     if (bad || logical != raw_size || cursor != physical) {
@@ -63,6 +74,38 @@ static inline int k3_zmap_open(int fd, const unsigned char *h, uint64_t physical
 bad_header:
     fprintf(stderr, "k3z: invalid selective archive header or extent index\n");
     return -1;
+}
+
+/* One raw span. Direct I/O wants the file offset, the length and the buffer address
+ * all aligned. The writer keeps raw payload at physical == logical (mod ALIGN) and the
+ * shard reader widens its reads to ALIGN boundaries into an ALIGN-aligned slot, so when
+ * the destination and the file position agree modulo ALIGN the aligned interior can go
+ * through the direct descriptor. The ragged ends, under ALIGN bytes each, stay
+ * buffered.
+ * A direct read the filesystem refuses falls back to a buffered read of the span. */
+static inline int k3_zmap_raw_read(const K3ZFile *z, unsigned char *dst, size_t n,
+                                   uint64_t phys)
+{
+    const uint64_t A = K3_ZMAP_ALIGN;
+    if (z->dfd >= 0 && n >= 2 * A && (uintptr_t)dst % A == phys % A) {
+        const uint64_t lo = (phys + A - 1) & ~(A - 1), hi = (phys + n) & ~(A - 1);
+        if (hi > lo) {
+            const size_t head = (size_t)(lo - phys), body = (size_t)(hi - lo);
+            const size_t tail = n - head - body;
+            if (head && k3_zpread(z->fd, dst, head, phys)) return -1;
+            if (!k3_zpread(z->dfd, dst + head, body, lo)) {
+                /* A diagnostic total, never read for control flow; relaxed is enough. */
+#if defined(__GNUC__)
+                __atomic_fetch_add(&((K3ZFile *)z)->direct_bytes, (uint64_t)body,
+                                   __ATOMIC_RELAXED);
+#else
+                ((K3ZFile *)z)->direct_bytes += body;
+#endif
+                return tail ? k3_zpread(z->fd, dst + head + body, tail, hi) : 0;
+            }
+        }
+    }
+    return k3_zpread(z->fd, dst, n, phys);
 }
 
 static inline int64_t k3_zmap_read(const K3ZFile *z, void *dst, int64_t n, int64_t off)
@@ -85,7 +128,7 @@ static inline int64_t k3_zmap_read(const K3ZFile *z, void *dst, int64_t n, int64
         if (take > (uint64_t)(n - done)) take = (uint64_t)(n - done);
         unsigned char *outp = (unsigned char *)dst + (size_t)done;
         if (e->flags == K3_ZMAP_RAW) {
-            if (k3_zpread(z->fd, outp, (size_t)take, e->off + within)) break;
+            if (k3_zmap_raw_read(z, outp, (size_t)take, e->off + within)) break;
         } else {
             if (!packed) {
                 packed = (unsigned char *)malloc(

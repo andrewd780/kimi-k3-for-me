@@ -1,4 +1,5 @@
 /* Actual C decoder: concurrent disjoint random reads, boundaries and bad ranges. */
+#define _GNU_SOURCE            /* O_DIRECT, as in k3_st.c */
 #define _POSIX_C_SOURCE 200809L
 #define _FILE_OFFSET_BITS 64
 #include "k3_portable_io.h"
@@ -27,6 +28,10 @@ int main(int argc, char **argv)
     }
     K3ZFile *z = NULL;
     if (k3_zopen(packed, &z)) { close(plain); close(packed); return 1; }
+    /* The engine lends its direct descriptor to a selective archive; do the same so
+     * the aligned interiors take that path here. A refusal (tmpfs, say) is fine. */
+    z->dfd = open(argv[2], O_RDONLY | O_DIRECT);
+    if (z->dfd >= 0) k3_set_direct(z->dfd);
     int64_t size = (int64_t)lseek(plain, 0, SEEK_END);
     if (size < 0 || (uint64_t)size != z->raw_size || size > (64 << 20)) {
         k3_zfree(z); close(plain); close(packed); return 1;
@@ -57,6 +62,34 @@ int main(int argc, char **argv)
     unsigned char sentinel = 123;
 #ifdef K3_WITH_ZSTD
     if (z->mapped) {
+        /* The cache's access pattern: each raw extent read through a window widened to
+         * K3_ZMAP_ALIGN boundaries in logical space, into an aligned buffer. With a
+         * direct descriptor the aligned interior must go through it, byte for byte. */
+        const uint64_t A = K3_ZMAP_ALIGN;
+        void *abuf = NULL;
+        if (posix_memalign(&abuf, (size_t)A, (size_t)size + 2 * (size_t)A)) bad++;
+        for (int pass = 0; abuf && pass < 2; pass++) {
+            /* Pass 1 swaps in a descriptor that cannot serve a read; the reader must
+             * fall back to buffered reads and still return the right bytes. */
+            const int keep = z->dfd;
+            if (pass) z->dfd = open("/dev/null", O_RDONLY);
+            for (uint32_t i = 0; i < z->count; i++) {
+                if (z->extent[i].flags != K3_ZMAP_RAW) continue;
+                const uint64_t start = i ? z->extent[i - 1].end : 0;
+                const uint64_t lo = start & ~(A - 1);
+                uint64_t hi = (z->extent[i].end + A - 1) & ~(A - 1);
+                if (hi > z->raw_size) hi = z->raw_size;
+                const int64_t len = (int64_t)(hi - lo);
+                if (k3_zread(z, abuf, len, (int64_t)lo) != len ||
+                    memcmp(abuf, want + lo, (size_t)len)) bad++;
+            }
+            if (pass) { if (z->dfd >= 0) close(z->dfd); z->dfd = keep; }
+        }
+        free(abuf);
+        if (z->dfd >= 0 && z->direct_bytes == 0) {
+            fprintf(stderr, "a direct descriptor was present but no raw bytes used it\n");
+            bad++;
+        }
         forbid_decode = 1;
         unsigned char out[127];
         for (uint32_t i = 0; i < z->count; i++) {
@@ -74,6 +107,7 @@ int main(int argc, char **argv)
     if (k3_zread(z, &sentinel, 1, size) || k3_zread(z, &sentinel, 1, -1) ||
         k3_zread(z, &sentinel, INT64_MAX, 1) ||
         k3_zread(z, &sentinel, -1, 0) || sentinel != 123) bad++;
+    if (z->dfd >= 0) close(z->dfd);
     free(want); k3_zfree(z); close(plain); close(packed);
     printf("native compressed ranges: %s\n", bad ? "FAILED" : "PASSED");
     return bad ? 1 : 0;
