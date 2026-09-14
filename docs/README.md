@@ -5,6 +5,7 @@
 | | |
 |---|---|
 | [QUICKSTART.md](QUICKSTART.md) | from nothing to generated text |
+| [STATUS.md](STATUS.md) | where every technique stands, in plain language |
 | [TUNING.md](TUNING.md) | choosing a memory budget, one decision dominates |
 
 ## Reference

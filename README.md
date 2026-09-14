@@ -1,3 +1,5 @@
+> **Where everything stands, in plain language: [docs/STATUS.md](docs/STATUS.md).**
+>
 > **This fork: offline lossless compression and prompt rereading (experimental).**
 > `make ZSTD=1` enables native C reads from compressed weights, decoding only needed
 > blocks with no network or Python process during inference. `--reread-prompt`
