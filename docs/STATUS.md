@@ -1,7 +1,7 @@
 # Where everything stands
 
 *Plain-language status of this fork, written for the project owner. Last updated
-2026-09-14 after merging pull requests #5 and #6. Every number links to the file it
+2026-09-14 with pull request #8. Every number links to the file it
 was measured in. Engineering priorities stay in [ROADMAP.md](ROADMAP.md).*
 
 ## The short version
@@ -62,7 +62,8 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Exact SIMD KDA recurrence (#5) | Hand-vectorized inner loop of the recurrent layers | done, opt-in (`KDA_SIMD=1`); **negative** | Bitwise identical across 9,504 checks and under sanitizers; 1.11x on x86, 0.72x on ARM, both inside the noise floor ([note](notes/kda-simd.md)) | Leave off by default |
 | lm_head streaming, `--stream-lm-head` (#5) | Streams the 2.35 GB output table instead of keeping it resident, funding a second trunk slot | done | Synthetic mechanism gate under a 64 MiB memory cap: ring grows from 1 to 2 slots with identical logits ([note](notes/stream-lm-head.md)) | Full-model effect unmeasured |
 | Quality harness, `tools/quality.py` (#5) | Scores how well a model predicts held-out text, so a changed model can be compared with the exact one | built, never run on K3 | Protocol tests and a tiny native check ([doc](QUALITY.md)) | Needs a checkpoint host; about 1.4 TB of reads per 128-token window |
-| Selective scale archives, K3ZMAP1 (#6) | Compresses only the 5.9% of expert bytes that compress (the scales) and reads the rest raw | done, opt-in | 24 storage tests, sanitizers, synthetic CLI parity ([doc](SELECTIVE_SCALES.md)) | Saves 0.95% of bytes per token; raw reads are buffered rather than direct I/O; unmeasured on the real model |
+| Selective scale archives, K3ZMAP1 (#6) | Compresses only the 5.9% of expert bytes that compress (the scales) and reads the rest raw | done, opt-in | 24 storage tests, sanitizers, synthetic CLI parity ([doc](SELECTIVE_SCALES.md)) | Saves 0.95% of bytes per token; unmeasured on the real model |
+| Direct I/O for selective raw extents (#8) | Reads the raw parts of a selective archive past the page cache, the way plain shards are read | done | Native test proves the direct path is taken and falls back cleanly; bytes identical | Speed unmeasured on the real model |
 
 ### Measured, no new code
 
@@ -88,7 +89,6 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Technique | What it would do | Status | What is known | Size of the job |
 |---|---|---|---|---|
 | Known-route pipelining (#6 map) | Compute each expert as soon as its bytes land, instead of waiting for all 16 | proposal | Math bound of 1.88x on the expert stage only, never whole-model | The strongest remaining exact lead; a concurrency change with real risk; testable without the checkpoint |
-| Direct I/O for selective raw extents | Make K3ZMAP1 fair at 8 GB | proposal | Nothing measured | Medium; needed before that format is worth using |
 | Asymmetric trunk ring or row tiles (#6 map) | Smaller trunk buffers so read-ahead survives at 8 GB | proposal | Pairwise arithmetic only; needs a 93-layer wraparound proof | Large exact change |
 | Chunked prefill, sampling, chat template, vision, HTTP serving | Usability features from the upstream roadmap | not started | n/a | Do not change size or speed |
 
@@ -105,10 +105,10 @@ a day of disk time.
 1. **Organization, now.** Delete the merged branches (each merged pull request page
    has a "Delete branch" button) and turn on *Settings, General, Pull Requests,
    Automatically delete head branches* so this stops recurring.
-2. **Checkpoint-free engineering, in order of value per risk.** Fix the four lint
-   findings in the test files; add direct I/O for selective raw extents; then
-   known-route pipelining, the one exact lead with a real bound; then the asymmetric
-   trunk ring. All four can be built and gated in CI without the checkpoint.
+2. **Checkpoint-free engineering, in order of value per risk.** The lint findings
+   and direct I/O for selective raw extents landed in #8. Next is known-route
+   pipelining, the one exact lead with a real bound, then the asymmetric trunk
+   ring. Both can be built and gated in CI without the checkpoint.
 3. **The rental.** Everything marked blocked needs one machine with the checkpoint for
    a day or two. Without it there will never be a laptop speed or quality number; with
    it, one core-limited ladder run answers the decisive question.

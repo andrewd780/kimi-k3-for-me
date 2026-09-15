@@ -357,10 +357,13 @@ static int scan_shard(K3St *s, Build *b, int shard, const char *path)
     s->fd[shard] = fd;
     /* A second descriptor on the same file, for streamed expert reads that must not go
      * through the page cache. Optional: if the filesystem refuses O_DIRECT the reader
-     * falls back to fd[]. */
-    if (s->dfd && !s->remote_socket && !z) {
+     * falls back to fd[]. A selective archive lends it to its own reader, which uses it
+     * only for the aligned interior of raw extents; a fixed-block archive has no raw
+     * span to serve that way and gets none. */
+    if (s->dfd && !s->remote_socket && (!z || z->mapped)) {
         s->dfd[shard] = open(path, O_RDONLY | O_DIRECT);
         k3_set_direct(s->dfd[shard]);   /* no-op off Darwin; advisory, failure is fine */
+        if (z) z->dfd = s->dfd[shard];
     }
     return ntensor;
 bad:
@@ -547,8 +550,29 @@ int64_t k3_st_read_aligned(const K3St *s, int shard, int64_t off, int64_t nbytes
         return k3_remote_read(s, shard, off, nbytes, buf);
     }
     if (s->zfile && s->zfile[shard]) {
-        if (payload_off) *payload_off = 0;
-        return k3_zread(s->zfile[shard], buf, nbytes, off);
+        const K3ZFile *z = s->zfile[shard];
+        if (z->dfd < 0 || !z->mapped) {
+            if (payload_off) *payload_off = 0;
+            return k3_zread(z, buf, nbytes, off);
+        }
+        /* The same widening as the direct path below, in LOGICAL offsets. The archive
+         * keeps raw payload at physical == logical (mod K3_ST_ALIGN), so an aligned
+         * window into this aligned buffer lets the selective reader serve the interior
+         * of every raw extent by direct I/O. Clamp to the logical size: k3_zread
+         * refuses a range past the end rather than shortening it. */
+        const int64_t lo = off & ~(int64_t)(K3_ST_ALIGN - 1);
+        int64_t hi = (off + nbytes + K3_ST_ALIGN - 1) & ~(int64_t)(K3_ST_ALIGN - 1);
+        if ((uint64_t)hi > z->raw_size) hi = (int64_t)z->raw_size;
+        const int64_t pad = off - lo;
+        if (hi - lo > bufcap) {
+            /* A buffer sized to the request alone cannot take the widened window:
+             * read exactly what was asked, through the page cache, as before. */
+            if (payload_off) *payload_off = 0;
+            return k3_zread(z, buf, nbytes, off);
+        }
+        if (payload_off) *payload_off = pad;
+        const int64_t got = k3_zread(z, buf, hi - lo, lo);
+        return got >= pad + nbytes ? nbytes : (got > pad ? got - pad : 0);
     }
     const int dfd = s->dfd ? s->dfd[shard] : -1;
 

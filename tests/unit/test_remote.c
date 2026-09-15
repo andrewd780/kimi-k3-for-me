@@ -28,10 +28,14 @@ int main(int argc, char **argv)
 
         void *aligned = NULL;
         if (posix_memalign(&aligned, K3_ST_ALIGN, n + 2 * K3_ST_ALIGN)) return 1;
+        /* The payload starts at buf + pad: zero on the buffered and remote paths,
+         * the distance to the enclosing aligned window when the read went direct
+         * (plain shards, and the raw extents of a selective archive). */
         int64_t pad = -1;
         if (k3_st_read_aligned(&remote, b->shard, b->off, b->nbytes,
                                aligned, (int64_t)n + 2 * K3_ST_ALIGN, &pad) != b->nbytes ||
-            pad != 0 || memcmp(want, aligned, n)) bad++;
+            pad < 0 || pad >= K3_ST_ALIGN ||
+            memcmp(want, (const unsigned char *)aligned + pad, n)) bad++;
         if (n && k3_st_read_aligned(&remote, b->shard, b->off, b->nbytes,
                                     aligned, (int64_t)n - 1, &pad) != 0) bad++;
         k3_aligned_free(aligned);

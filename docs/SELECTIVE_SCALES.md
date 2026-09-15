@@ -4,7 +4,10 @@
 paired E8M0 expert scale tensors are candidates for Zstandard compression.
 Packed MXFP4 weights, BF16 trunk tensors, embeddings, headers and all other bytes
 are copied verbatim. The C reader issues positioned reads directly into the
-destination for those raw extents. It never sends them through a decoder.
+destination for those raw extents and never sends them through a decoder. Into an
+aligned destination, the aligned interior of a raw extent bypasses the page cache
+through the same direct descriptor the plain shards use (`O_DIRECT` on Linux,
+`F_NOCACHE` on Darwin, unbuffered on Windows).
 An incompressible scale block also falls back to raw storage.
 
 This is an opt-in storage mechanism. Full-checkpoint conversion and model
@@ -68,10 +71,15 @@ per expert suggest roughly 16 MB for 82,432 experts, before other extents.
 This is geometry arithmetic, not full-checkpoint RSS. Conversion and Python
 metadata objects use additional memory bounded by the shard header/index.
 
-**Raw extents currently use buffered `pread`.** They are direct copies into the
-caller buffer, not Linux `O_DIRECT` reads. The existing plain-weight path retains
-its direct-I/O support. Page-cache pressure, extra system calls at extent
-boundaries, and serial scale decoding can outweigh byte savings. In particular,
+**Raw extents use direct I/O for their aligned interior.** The writer pads each
+raw extent so that its physical offset equals its logical offset modulo 4,096, and
+the shard reader widens every read to 4,096-byte boundaries into an aligned slot,
+so the interior of a raw extent is read through the same direct descriptor as a
+plain shard. The head and tail of each extent (under 4 KiB each) and every
+compressed scale frame still go through the page cache, and a filesystem that
+refuses direct I/O falls back to buffered reads of the whole span. Extra system
+calls at extent boundaries and serial scale decoding can still outweigh byte
+savings. In particular,
 for a scale compression ratio `r`, device rate `B` and decode rate `D`, serial
 read-plus-decode beats raw reading only if `D > B/(1-r)`, assuming equal device
 rates and ignoring other overhead. At 3 GB/s and `r=0.155315`, that threshold is
@@ -97,7 +105,10 @@ All integers are little-endian. The 48-byte header reuses the K3ZSTD1 layout:
 Each 32-byte index entry stores `logical_end:u64, physical_offset:u64,
 stored_size:u64, kind:u32, reserved_zero:u32`. Extents must cover the complete
 logical file exactly once, with strictly increasing ends. Stored extents follow
-the index contiguously, with no gaps, overlaps or trailing bytes. Kind 2 is raw
+the index in order, without overlaps or trailing bytes; up to 4,095 zero bytes of
+padding may precede an extent, and the writer uses that before every raw extent so
+that its physical offset equals its logical offset modulo 4,096. A gap of 4,096 or
+more is refused. Kind 2 is raw
 and its stored length must equal its logical length. Kind 0 is one checksummed
 Zstandard frame; its logical length must fit the block limit. Other kinds fail.
 
@@ -115,5 +126,7 @@ CI tests cover concurrent ranges, boundary/odd-length reads, all 256 scale value
 incompressible fallback, index bounds, truncated payloads, damaged compressed
 frames, valid frames with wrong identity/position, conversion caps, native tensor
 and trunk parity, and full synthetic CLI logits. Decoder failure injection proves
-that raw-only reads bypass the decoder. Real K3 quality and throughput remain
-unmeasured.
+that raw-only reads bypass the decoder. The native test also checks that the
+aligned interior of every raw extent goes through the direct descriptor when one is
+present, byte for byte, and that a descriptor which cannot serve a read falls back
+to buffered reads. Real K3 quality and throughput remain unmeasured.
