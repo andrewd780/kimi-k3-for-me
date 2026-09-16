@@ -144,12 +144,12 @@ int main(void)
     printf("\nper-sequence state, FIXED regardless of context:\n");
     printf("  KDA recurrent : %s at bf16\n", b1);
     printf("  ShortConv     : %s at bf16\n", b2);
-    /* What the engine ACTUALLY caches, which is not the compressed latent. Re-expanding
-     * the 576-float latent through kv_b for every cached position would cost an O(T)
-     * sweep of 24576x512 matmuls per layer per token, so k3_mla_cached stores the
-     * EXPANDED per-head keys and values plus the shared rope slot, in fp32. That is 42x
-     * the latent, and quoting the latent figure here understated the cost by the same
-     * factor. */
+    /* What the engine caches BY DEFAULT, which is not the compressed latent: the
+     * EXPANDED per-head keys and values plus the shared rope slot, in fp32. Quoting the
+     * latent figure here would understate the default by 42.8x. The latent layout does
+     * exist, behind --kv-latent (docs/notes/kv-latent.md), and it pays for the 42.8x
+     * with an O(T) sweep of 24576x512 matmuls per layer per token; this line stays on
+     * the default because that is what a run gets unless it asks otherwise. */
     const double kv_tok = ((double)c.n_heads * (c.qk_nope + c.v_head) + c.qk_rope) * 24 * 4;
     human(kv_tok, b1, sizeof b1);
     printf("  MLA KV        : %s per position (24 MLA layers, EXPANDED k and v, fp32)\n", b1);

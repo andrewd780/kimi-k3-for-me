@@ -311,6 +311,51 @@ class OfflineCliTests(unittest.TestCase):
                 self.assert_same(a, b)
                 self.assertGreater(b[0]["trunk_bytes_read"], 0)
 
+    def test_kv_latent_matches_the_expanded_cache(self):
+        # --kv-latent caches MLA's compressed latent and rebuilds k and v through kv_b
+        # on every use (docs/notes/kv-latent.md). It is a memory layout, not a different
+        # model: every generated id and every dumped logit must be bit-identical to the
+        # expanded cache, and the plan must report the smaller cache rather than the one
+        # it is not allocating.
+        for extra in ([], ["--trunk", self.ztrunk, "--trunk-gb", "0.001"],
+                      ["--gen", "4"]):
+            with self.subTest(extra=extra):
+                args = ["--ids", "1,2,3", "--incremental", *extra]
+                a = self.run_cli(self.plain, args)
+                b = self.run_cli(self.plain, [*args, "--kv-latent"])
+                self.assert_same(a, b)
+                self.assertFalse(a[0]["kv_latent"])
+                self.assertTrue(b[0]["kv_latent"])
+                self.assertLess(b[0]["memory_plan_bytes"], a[0]["memory_plan_bytes"])
+
+    def test_kv_latent_round_trips_through_saved_state(self):
+        # The state file is self-describing (kvpp floats per position per MLA layer), so
+        # the latent layout saves and resumes like any other -- and a state written in
+        # one layout must be REFUSED by a run in the other rather than read at the wrong
+        # stride, which would resume fluently from the wrong numbers.
+        expanded, latent = self.path / "exp.bin", self.path / "lat.bin"
+        self.run_cli(self.plain, ["--ids", "1,2,3", "--incremental",
+                                  "--save-state", expanded])
+        self.run_cli(self.plain, ["--ids", "1,2,3", "--incremental", "--kv-latent",
+                                  "--save-state", latent])
+        self.assertLess(latent.stat().st_size, expanded.stat().st_size)
+        a = self.run_cli(self.plain, ["--incremental", "--load-state", expanded,
+                                      "--ids", "5,6"])
+        b = self.run_cli(self.plain, ["--incremental", "--kv-latent",
+                                      "--load-state", latent, "--ids", "5,6"])
+        self.assert_same(a, b)
+        for state, flag in ((expanded, ["--kv-latent"]), (latent, [])):
+            with self.subTest(state=state.name):
+                result = self.run_cli(self.plain, ["--incremental", *flag,
+                                                   "--load-state", state,
+                                                   "--ids", "5,6"], ok=False)
+                self.assertIn("KV floats per position", result.stderr)
+                self.assertIn("--kv-latent", result.stderr)
+
+    def test_kv_latent_without_incremental_is_refused(self):
+        result = self.run_cli(self.plain, ["--ids", "1,2,3", "--kv-latent"], ok=False)
+        self.assertIn("--kv-latent needs --incremental", result.stderr)
+
     def test_reread_on_resume_repeats_new_request_only(self):
         state = self.path / "saved.bin"
         self.run_cli(self.plain, ["--ids", "1,2,3", "--incremental",

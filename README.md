@@ -456,6 +456,7 @@ shorthand. Order matters if you mix them: a later flag wins, so
 |---|---|---|---|
 | `--gen` | `N` | 8 | tokens to generate. Ceiling 4096; prompts may be up to 32768 tokens |
 | `--incremental` | none | off | carry the KV cache and the recurrent state between tokens instead of re-running the whole prefix |
+| `--kv-latent` | none | off | cache MLA's compressed latent instead of the expanded k and v and rebuild them on use: 0.055 MB per position instead of 2.37, paid for with a `kv_b` matmul per cached position per step. Logits are bitwise identical. Needs `--incremental`. See [the note](docs/notes/kv-latent.md) |
 | `--tok` | `DIR` | none | directory holding `tiktoken.model` and `tokenizer_config.json` |
 
 **Pass `--incremental` for any generation of length.** Without it every step re-runs the

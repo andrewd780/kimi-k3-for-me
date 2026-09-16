@@ -15,9 +15,22 @@ proven by tests that run in seconds with no weights (`make test`), by the
 **It is slow, and the model is enormous on disk.** The released checkpoint is
 1.56 TB. At 8 GB of RAM the measured speed was 32.7 seconds per token, on a rented
 124-core server with a fast NVMe ([environment](data/environment.txt)). On the 8 GB
-Jetson it was about 16 minutes per token. A laptop with 8 to 12 cores is expected to
-be slower than the server, because compute rather than disk becomes the limit there.
-That expectation is an estimate; it has not been measured.
+Jetson it was about 16 minutes per token. The best measured full-model speed on that
+same rental, with memory allocated well rather than at the 8 GB floor, is **10.66
+seconds per token in sustained decode, at 127.9 GB peak RSS**
+([README](../README.md), [PERFORMANCE.md](PERFORMANCE.md#longer-runs-are-faster)). A
+laptop with 8 to 12 cores is expected to be slower than the server, because compute
+rather than disk becomes the limit there. That expectation is an estimate; it has not
+been measured.
+
+**Full quality at 20 to 50 tokens per second.** No Mac configuration reaches that,
+at any price. Four 512 GB M3 Ultra Studios pipelined across the layers project to
+about 6 tokens/second for a single stream; splitting the model across them with
+tensor parallelism instead projects to about 12 to 16. Both are estimates, not
+measurements, and both are short of 20. Only a data-center node that holds the whole
+model in fast accelerator memory gets there. An 8 GB Mac can only be a *client* of
+such a node, never the machine doing the work; see
+[notes/remote-k3.md](notes/remote-k3.md) for what that costs today.
 
 **No lossless trick gets it under 200 GB, or even under 1 TB.** Every compression
 route was measured or argued to the end. The best lossless result leaves about
@@ -41,6 +54,13 @@ gives is unmeasured.
 | M1 Air disk, total | 256 |
 | The goal | 200 |
 | M4 Max free space | 90 |
+
+The context window has its own, separate cost. The attention cache is stored
+**expanded**, in fp32, across the 24 MLA layers: 2.37 MB per position, which is
+19.38 GB of cache at an 8,192-token context, read again every token
+([README](../README.md)). A latent cache, `--kv-latent`, is in progress and would
+remove most of that by keeping the cache compressed instead of expanding it; see the
+[proposed techniques](#proposed-not-started) below.
 
 ## Every technique, where it stands
 
@@ -90,6 +110,8 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Technique | What it would do | Status | What is known | Size of the job |
 |---|---|---|---|---|
 | Asymmetric trunk ring or row tiles (#6 map) | Smaller trunk buffers so read-ahead survives at 8 GB | proposal | Pairwise arithmetic only; needs a 93-layer wraparound proof | Large exact change |
+| MLA latent KV cache, `--kv-latent` | Keep the attention cache in its compressed latent form instead of expanding it, removing most of the 2.37 MB/position, 19.38 GB/8K-context cost | done, opt-in (`--kv-latent`) | n/a yet | Exact change across the 24 MLA layers |
+| Speculative decoding on resident hardware | A cheap draft proposes tokens, the exact model verifies; ~1.7x fewer weight bytes per accepted token at the measured 66.7% acceptance ([note](notes/int8-draft-container.md)) | proposal | Only pays off once the model is resident in RAM; nothing on 8 GB, where both draft and exact stream from disk | Needs a large-memory host to pay for |
 | Chunked prefill, sampling, chat template, vision, HTTP serving | Usability features from the upstream roadmap | not started | n/a | Do not change size or speed |
 
 ### Blocked on a machine that holds the checkpoint
@@ -109,9 +131,14 @@ a day of disk time.
    and direct I/O for selective raw extents landed in #8; known-route expert
    pipelining landed in #9. Next is the asymmetric trunk ring, which can also be
    built and gated in CI without the checkpoint.
-3. **The rental.** Everything marked blocked needs one machine with the checkpoint for
-   a day or two. Without it there will never be a laptop speed or quality number; with
-   it, one core-limited ladder run answers the decisive question.
+3. **The rental remains the only way to measure.** Everything marked blocked needs one
+   machine with the checkpoint for a day or two. Without it there will never be a
+   laptop speed or quality number; with it, one core-limited ladder run answers the
+   decisive question.
+4. **Remote K3 or not.** Full quality at 20 to 50 tokens/second is not a laptop
+   outcome at any price; it needs a data-center node or Moonshot's own API. See
+   [notes/remote-k3.md](notes/remote-k3.md) for the real prices found and what each
+   route costs the project owner in money versus engineering time.
 
 ## Where things live
 

@@ -388,26 +388,43 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   this function recomputes them all from x on every call. That is what makes decode
  *   O(T^2).
  *
- * WHAT IS CACHED, AND WHY NOT THE COMPRESSED LATENT
- *   The obvious saving is to cache the 576-float compressed latent and re-expand it
- *   through kv_b each step, which is 42x smaller. It is also far slower: kv_b is
- *   24576x512, so re-expanding every cached position costs an O(T) sweep of 12.6M-MAC
- *   matmuls per layer per token. The EXPANDED per-head keys and values are cached
- *   instead: 96 heads x 256 floats = 98,304 B per position per layer, and 2.37 MB per
- *   position across the 24 MLA layers. A 64-token generation is therefore 151 MB of
- *   KV cache, small enough not to affect the memory budget at any preset.
+ * WHAT IS CACHED: TWO LAYOUTS, ONE ARITHMETIC
+ *   By default the EXPANDED per-head keys and values are cached: 96 heads x 256 floats
+ *   = 98,304 B per position per layer, and 2.37 MB per position across the 24 MLA
+ *   layers. Nothing is recomputed, and a 64-token generation is 151 MB of KV cache.
  *
- *   The rope slot is cached separately because it is SHARED across heads: 64 values per
- *   position, not per head. Folding it into the per-head block would waste 96x the space
- *   and, worse, invites treating it as per-head somewhere.
+ *   kv_latent != 0 selects MLA's own design instead: kvc holds only the kv_lora_rank
+ *   latent (the post-norm output of kv_a, 512 floats), and the per-head k and v are
+ *   rebuilt through kv_b on every use. That is 2,304 B per position per layer with the
+ *   rope slot, 0.055 MB per position across the 24 layers -- 42.8x smaller -- and it
+ *   is what makes a long context a memory question rather than an impossible one.
+ *
+ *   The trade is compute, and it is not small: kv_b is 24576x512, so every cached
+ *   position costs a 12.6M-MAC matmul, paid TWICE per query token (once to score, once
+ *   to weight the values) because softmax needs every score before any value is used.
+ *   Holding the rebuilt block across the two passes would mean holding the expanded
+ *   cache again, which is the thing being avoided.
+ *
+ *   The latent is stored exactly as it was fed to kv_b in the expanded path, and the
+ *   rebuild calls the SAME kernel with the SAME reduction order, so the two layouts are
+ *   bitwise identical, not merely close. Nothing here may reorder the softmax: scores
+ *   are still formed s ascending, the running max is still taken s ascending, and the
+ *   value accumulation is still s ascending, per head. The loops are transposed (s
+ *   outer, h inner) only so that ONE rebuild serves all 96 heads.
+ *
+ *   The rope slot is cached separately in both layouts because it is SHARED across
+ *   heads: 64 values per position, not per head. Folding it into the per-head block
+ *   would waste 96x the space and, worse, invites treating it as per-head somewhere.
+ *   It is never rebuilt, because it is never projected through kv_b.
  *
  * kvc == NULL selects the self-contained path, which recomputes all keys and values
- * from x and caches nothing. Both paths must produce identical output; the op fixtures
- * gate the uncached path and tests/unit/k3_model.c gates them against each other.
+ * from x and caches nothing. All three paths must produce identical output; the op
+ * fixtures gate the uncached path and tests/unit/k3_model.c gates them against each
+ * other, logit for logit.
  */
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
-                   float *kvc, float *ropec, int cached, int cap)
+                   float *kvc, float *ropec, int cached, int cap, int kv_latent)
 {
     const int E  = c->hidden, H = c->n_heads;
     const int qn = c->qk_nope, qr = c->qk_rope, vh = c->v_head;
@@ -416,6 +433,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     const int kvd = qn + vh;                      /* 256: cached width per head    */
     const float scale = 1.0f / sqrtf((float)qh);  /* :359, over qh not qn           */
     if (!kvc) cached = 0;
+    /* The latent layout is a property of the cache, so it cannot exist without one. */
+    const int lat = (kvc && kv_latent) ? 1 : 0;
     const int last = cached + T - 1;              /* highest absolute position      */
     if (kvc && last >= cap)
         k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
@@ -430,13 +449,18 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
     float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
     float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1] scores */
+    /* Scores are per head in the latent layout, because the s loop moves outside the h
+     * loop there and every head's row must survive until its own softmax runs. */
+    float *sc   = gbuf + (size_t)H * vh;            /* [last+1], latent [H][last+1] */
+    const size_t scn = lat ? (size_t)H * (size_t)(last + 1) : (size_t)(last + 1);
+    float *kb   = sc   + scn;                       /* latent: [H][kvd] one position */
     /* Without a cache the keys/values live in scratch and cover only this call. */
-    float *kvs  = sc   + (size_t)(last + 1);        /* [T][H][kvd]    */
+    float *kvs  = kb   + (lat ? (size_t)H * kvd : 0);       /* [T][H][kvd]    */
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
     #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
+    #define K3_LAT_AT(p)  (kvc + (size_t)(p) * c->kv_lora)
 
     /* ---- per-token projections ---- */
     for (int t = 0; t < T; t++) {
@@ -451,13 +475,56 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         /* the norm covers the latent only, never the rope slot */
         k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
         memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
-        k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
+        /* The latent layout stores the kv_b INPUT and expands below; the expanded
+         * layout stores the kv_b OUTPUT. Same bytes into the same kernel either way. */
+        if (lat) memcpy(K3_LAT_AT(p), ct, (size_t)c->kv_lora * sizeof(float));
+        else     k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
     }
 
     /* ---- attention, per head, causal ---- */
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
-        for (int h = 0; h < H; h++) {
+        if (lat) {
+            /* Pass one: rebuild each cached position ONCE and score it against every
+             * head. Transposing the loops is what keeps the rebuild count at one per
+             * position rather than one per (position, head). */
+            for (int s = 0; s <= p; s++) {
+                k3_mmw(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd);
+                const float *kr = K3_ROPE_AT(s);
+                for (int h = 0; h < H; h++) {
+                    const float *qt = q + ((size_t)t * H + h) * qh;
+                    const float *ks = kb + (size_t)h * kvd;
+                    double d = 0.0;
+                    for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)ks[i];
+                    for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
+                    sc[(size_t)h * (last + 1) + s] = (float)d * scale;
+                }
+            }
+            /* Softmax per head, s ascending in both sweeps, exactly as above. The
+             * probability is folded back into sc so the second rebuild pass needs no
+             * per-head denominator: (float)(sc[s]/z) is the same value either way. */
+            for (int h = 0; h < H; h++) {
+                float *sh = sc + (size_t)h * (last + 1);
+                float m = -INFINITY;
+                for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
+                double z = 0.0;
+                for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
+                for (int s = 0; s <= p; s++) sh[s] = (float)(sh[s] / z);
+                float *o = acc + (size_t)h * vh;
+                for (int j = 0; j < vh; j++) o[j] = 0.0f;
+            }
+            /* Pass two: rebuild again and accumulate the values. Each o[j] still
+             * receives its terms s ascending, which is the order the sum must keep. */
+            for (int s = 0; s <= p; s++) {
+                k3_mmw(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd);
+                for (int h = 0; h < H; h++) {
+                    const float pr = sc[(size_t)h * (last + 1) + s];
+                    float *o = acc + (size_t)h * vh;
+                    const float *vs = kb + (size_t)h * kvd + qn;
+                    for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+                }
+            }
+        } else for (int h = 0; h < H; h++) {
             const float *qt = q + ((size_t)t * H + h) * qh;
             float m = -INFINITY;
             for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
@@ -494,12 +561,13 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     }
     #undef K3_KV_AT
     #undef K3_ROPE_AT
+    #undef K3_LAT_AT
 }
 
 void k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             int T, float *scratch)
 {
-    k3_mla_cached(out, x, w, c, T, scratch, NULL, NULL, 0, 0);
+    k3_mla_cached(out, x, w, c, T, scratch, NULL, NULL, 0, 0, 0);
 }
 
 /* ---------------------------------------------------------------- router ---- */
@@ -603,22 +671,28 @@ void k3_attn_res(float *out, const float *src, const float *fold,
 /* Scratch for the self-contained path: keys and values live here, so they scale with T.
  * `cap` is the highest position that will be attended over plus one; without a cache
  * that is just T. */
-size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode)
+size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
+                             int kv_latent)
 {
     const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, vh = c->v_head;
     const size_t kvd = (size_t)(c->qk_nope + vh);
+    const int lat = (cached_mode && kv_latent) ? 1 : 0;
+    /* The latent layout keeps one score row per head, and one rebuilt position. */
+    size_t scores = (size_t)(cap > T ? cap : T);
+    if (lat) scores *= (size_t)H;
     size_t n = (size_t)T * H * qh                      /* q            */
              + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
              + (size_t)c->q_lora
              + (size_t)2 * H * vh                      /* acc, gbuf    */
-             + (size_t)(cap > T ? cap : T);            /* scores       */
+             + scores;
+    if (lat) n += (size_t)H * kvd;                     /* rebuilt k/v  */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
 }
 
 size_t k3_mla_scratch(const K3Cfg *c, int T)
 {
-    return k3_mla_scratch_cached(c, T, T, 0);
+    return k3_mla_scratch_cached(c, T, T, 0, 0);
 }
 
 /* ------------------------------------------------------- Stable LatentMoE ---- */
@@ -1034,7 +1108,7 @@ size_t k3_layer_scratch(const K3Cfg *c, int T)
 void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                           const K3LayerW *w, const K3Cfg *c, int layer_idx,
                           int T, float *state, float *scratch,
-                          float *kvc, float *ropec, int cached, int cap)
+                          float *kvc, float *ropec, int cached, int cap, int kv_latent)
 {
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
@@ -1084,7 +1158,8 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
     if (w->kda) k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
-    else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap);
+    else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap,
+                              kv_latent);
 
     if (have_prefix) for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     else             { memcpy(pref, tmp, (size_t)T * E * sizeof(float)); have_prefix = 1; }
@@ -1128,7 +1203,7 @@ void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
                       int T, float *state, float *scratch)
 {
     k3_decoder_layer_inc(h, block_residual, n_blocks, w, c, layer_idx, T, state,
-                         scratch, NULL, NULL, 0, 0);
+                         scratch, NULL, NULL, 0, 0, 0);
 }
 
 /* ---------------------------------------------------------------- MXFP4 ---- */

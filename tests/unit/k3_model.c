@@ -241,6 +241,102 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
 static int argmax_(const float *v, int n)
 { int b = 0; for (int i = 1; i < n; i++) if (v[i] > v[b]) b = i; return b; }
 
+/* ---------------------------------------------------- incremental decode ----
+ * Prefill the prompt in one call, then feed ONE token per step, carrying the KDA
+ * recurrent state and an MLA KV cache. GATE 3 runs this twice, once per KV layout.
+ *
+ * `latent` selects the layout: 0 caches the expanded per-head k and v, 1 caches only
+ * the kv_lora latent and rebuilds k and v through kv_b on every use. The two must agree
+ * to the bit, so this returns every step's FULL logit vector rather than just the token
+ * it chose: comparing argmaxes would pass a run that is merely close, and a KV cache
+ * that is merely close is one that diverges further into the sequence.
+ *
+ * gi[] holds the prompt on entry and receives the generated ids. lgs[] receives
+ * (T - np + 1) logit vectors of c->vocab floats. Returns the number of steps, or -1 if
+ * a buffer could not be allocated. */
+static int incremental_decode(const Model *m, const K3Cfg *c, int T, int np,
+                              int latent, int *gi, float *lgs, int trace)
+{
+    const int H = c->n_heads, kvd = c->qk_nope + c->v_head;
+    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const int P = c->kda_heads * c->kda_head_dim;
+    const size_t kper = (size_t)P * (size_t)c->kda_head_dim
+                      + (size_t)3 * (size_t)P * (size_t)(c->conv_k - 1);
+    /* The whole point of the flag, in one line: the latent layout stores kv_lora floats
+     * per position, the expanded one stores n_heads*(qk_nope+v_head). */
+    const size_t kvper = (size_t)T * (latent ? (size_t)c->kv_lora : (size_t)H * kvd);
+    const size_t rpper = (size_t)T * (size_t)c->qk_rope;
+
+    size_t need = k3_mla_scratch_cached(c, T, T, 1, latent);
+    size_t li = k3_layer_scratch(c, T);
+    size_t alt = (size_t)(maxb + 2) * (size_t)c->hidden + (size_t)c->vocab;
+    if (li > need) need = li;
+    if (alt > need) need = alt;
+
+    float *kvc = (float *)calloc(kvper * (size_t)c->n_layers, sizeof(float));
+    float *rpc = (float *)calloc(rpper * (size_t)c->n_layers, sizeof(float));
+    float *sc_i = (float *)malloc(need * sizeof(float));
+    float *h_i  = (float *)malloc((size_t)T * (size_t)c->hidden * sizeof(float));
+    float *br_i = (float *)malloc((size_t)T * (size_t)maxb * (size_t)c->hidden
+                                  * sizeof(float));
+    float *ks_i = (float *)malloc(kper * (size_t)c->n_layers * sizeof(float));
+    int steps = -1;
+
+    if (kvc && rpc && sc_i && h_i && br_i && ks_i) {
+        memset(ks_i, 0, kper * (size_t)c->n_layers * sizeof(float));
+        int cached = 0;
+        steps = 0;
+        for (int step = 0; cached < T - 1 || step == 0; step++) {
+            /* first call feeds the whole prompt, later calls feed one token */
+            const int base = cached;
+            const int nT   = (step == 0) ? np : 1;
+            for (int t = 0; t < nT; t++)
+                memcpy(h_i + (size_t)t * c->hidden,
+                       m->embed + (size_t)gi[base + t] * c->hidden,
+                       (size_t)c->hidden * sizeof(float));
+            memset(br_i, 0,
+                   (size_t)nT * (size_t)maxb * (size_t)c->hidden * sizeof(float));
+            int nb_i = 0;
+            for (int L = 0; L < c->n_layers; L++)
+                k3_decoder_layer_inc(h_i, br_i, &nb_i, &m->lay[L], c, L, nT,
+                                     ks_i + kper * (size_t)L, sc_i,
+                                     kvc + kvper * (size_t)L,
+                                     rpc + rpper * (size_t)L, base, T, latent);
+            /* model-level aggregator and head, on the LAST new position */
+            float *fold = sc_i, *src = fold + c->hidden;
+            const int lastt = nT - 1;
+            if (m->out_res_norm && m->out_res_proj) {
+                for (int i = 0; i < c->hidden; i++)
+                    fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
+                for (int b = 0; b < nb_i; b++)
+                    memcpy(src + (size_t)b * c->hidden,
+                           br_i + ((size_t)lastt * maxb + b) * c->hidden,
+                           (size_t)c->hidden * sizeof(float));
+                memcpy(src + (size_t)nb_i * c->hidden, h_i + (size_t)lastt * c->hidden,
+                       (size_t)c->hidden * sizeof(float));
+                k3_attn_res(h_i + (size_t)lastt * c->hidden, src, fold,
+                            nb_i + 1, c->hidden, c->rms_eps);
+            }
+            float *nrm = sc_i;
+            float *lg_i = lgs + (size_t)steps * (size_t)c->vocab;
+            k3_rmsnorm(nrm, h_i + (size_t)lastt * c->hidden, m->final_norm,
+                       c->hidden, c->rms_eps);
+            k3_matmul(lg_i, nrm, m->lm_head, c->hidden, c->vocab);
+            /* Only the reference layout feeds the cross-build trace: the second run
+             * computes the same numbers, and appending them would change the trace
+             * every consumer of it compares against. */
+            if (trace) trace_logits(lg_i, (size_t)c->vocab);
+            steps++;
+
+            cached = base + nT;
+            if (cached >= T) break;
+            gi[cached] = argmax_(lg_i, c->vocab);
+        }
+    }
+    free(kvc); free(rpc); free(sc_i); free(h_i); free(br_i); free(ks_i);
+    return steps;
+}
+
 /* Config is read through k3_cfg.h, which never substitutes a default for a missing
  * field: it collects every absent key and refuses the load. Do not reintroduce a
  * defaulting reader here. A default turns "this program cannot understand this config"
@@ -382,73 +478,35 @@ int main(int argc, char **argv)
      * happens, not what is computed, so anything other than an exact match is a bug in
      * the state carrying, and that is exactly the failure this gate exists to catch. */
     {
-        const int H = c.n_heads, kvd = c.qk_nope + c.v_head;
-        const size_t kvper  = (size_t)T * H * kvd;      /* per layer */
-        const size_t rpper  = (size_t)T * c.qk_rope;
-        float *kvc = (float *)calloc(kvper * (size_t)c.n_layers, sizeof(float));
-        float *rpc = (float *)calloc(rpper * (size_t)c.n_layers, sizeof(float));
-        size_t need_i = k3_mla_scratch_cached(&c, T, T, 1);
-        size_t li = k3_layer_scratch(&c, T);
-        if (li > need_i) need_i = li;
-        if (alt > need_i) need_i = alt;
-        float *sc_i = (float *)malloc(need_i * sizeof(float));
-        float *h_i  = (float *)malloc((size_t)T * (size_t)c.hidden * sizeof(float));
-        float *br_i = (float *)malloc((size_t)T * (size_t)maxb * (size_t)c.hidden * sizeof(float));
-        float *ks_i = (float *)malloc(kper * (size_t)c.n_layers * sizeof(float));
-        float *lg_i = (float *)malloc((size_t)c.vocab * sizeof(float));
-        int *gi = (int *)malloc((size_t)T * sizeof(int));
-        int iok = 0;
+        const int nsteps = T - np + 1;
+        float *lg_exp = (float *)malloc((size_t)nsteps * (size_t)c.vocab * sizeof(float));
+        float *lg_lat = (float *)malloc((size_t)nsteps * (size_t)c.vocab * sizeof(float));
+        int *gi  = (int *)malloc((size_t)T * sizeof(int));
+        int *gil = (int *)malloc((size_t)T * sizeof(int));
+        int iok = 0, se = -1, sl = -1, latent_ok = 0;
 
-        if (kvc && rpc && sc_i && h_i && br_i && ks_i && lg_i && gi) {
-            memcpy(gi, full, (size_t)np * sizeof(int));
-            memset(ks_i, 0, kper * (size_t)c.n_layers * sizeof(float));
-            int cached = 0;
-            for (int step = 0; cached < T - 1 || step == 0; step++) {
-                /* first call feeds the whole prompt, later calls feed one token */
-                const int base = cached;
-                const int nT   = (step == 0) ? np : 1;
-                for (int t = 0; t < nT; t++)
-                    memcpy(h_i + (size_t)t * c.hidden,
-                           m->embed + (size_t)gi[base + t] * c.hidden,
-                           (size_t)c.hidden * sizeof(float));
-                memset(br_i, 0, (size_t)nT * (size_t)maxb * (size_t)c.hidden * sizeof(float));
-                int nb_i = 0;
-                for (int L = 0; L < c.n_layers; L++)
-                    k3_decoder_layer_inc(h_i, br_i, &nb_i, &m->lay[L], &c, L, nT,
-                                         ks_i + kper * (size_t)L, sc_i,
-                                         kvc + kvper * (size_t)L,
-                                         rpc + rpper * (size_t)L, base, T);
-                /* model-level aggregator and head, on the LAST new position */
-                float *fold = sc_i, *src = fold + c.hidden;
-                const int lastt = nT - 1;
-                if (m->out_res_norm && m->out_res_proj) {
-                    for (int i = 0; i < c.hidden; i++)
-                        fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
-                    for (int b = 0; b < nb_i; b++)
-                        memcpy(src + (size_t)b * c.hidden,
-                               br_i + ((size_t)lastt * maxb + b) * c.hidden,
-                               (size_t)c.hidden * sizeof(float));
-                    memcpy(src + (size_t)nb_i * c.hidden,
-                           h_i + (size_t)lastt * c.hidden, (size_t)c.hidden * sizeof(float));
-                    k3_attn_res(h_i + (size_t)lastt * c.hidden, src, fold,
-                                nb_i + 1, c.hidden, c.rms_eps);
-                }
-                float *nrm = sc_i;
-                k3_rmsnorm(nrm, h_i + (size_t)lastt * c.hidden, m->final_norm,
-                           c.hidden, c.rms_eps);
-                k3_matmul(lg_i, nrm, m->lm_head, c.hidden, c.vocab);
-                trace_logits(lg_i, (size_t)c.vocab);
-
-                cached = base + nT;
-                if (cached >= T) break;
-                gi[cached] = argmax_(lg_i, c.vocab);
-            }
-            for (int i = np; i < T; i++) if (gi[i] == full[i]) iok++;
+        if (lg_exp && lg_lat && gi && gil) {
+            memcpy(gi,  full, (size_t)np * sizeof(int));
+            memcpy(gil, full, (size_t)np * sizeof(int));
+            se = incremental_decode(m, &c, T, np, 0, gi,  lg_exp, 1);
+            sl = incremental_decode(m, &c, T, np, 1, gil, lg_lat, 0);
+            if (se > 0) for (int i = np; i < T; i++) if (gi[i] == full[i]) iok++;
+            latent_ok = (se > 0 && sl == se)
+                && memcmp(lg_exp, lg_lat,
+                          (size_t)se * (size_t)c.vocab * sizeof(float)) == 0
+                && memcmp(gi, gil, (size_t)T * sizeof(int)) == 0;
         }
         printf("GATE 3  incremental    : %d/%d generated tokens match full_ids"
                "  <- KV cache + carried KDA state\n", iok, T - np);
+        /* The latent cache is 4x smaller on this fixture and 42.8x on the released
+         * geometry, and it rebuilds k and v through the SAME kv_b with the SAME
+         * reduction order, so "close" is not the contract: every logit of every step
+         * must be the same float. */
+        printf("GATE 3b kv latent      : %s  <- %d steps of logits bit-identical to the"
+               " expanded cache\n", latent_ok ? "PASS" : "FAIL", se > 0 ? se : 0);
         gok = (iok == T - np) ? gok : -1;   /* fail the verdict if incremental diverged */
-        free(kvc); free(rpc); free(sc_i); free(h_i); free(br_i); free(ks_i); free(lg_i); free(gi);
+        if (!latent_ok) gok = -1;
+        free(lg_exp); free(lg_lat); free(gi); free(gil);
     }
 
     const int pass = (tf_gen_ok == tf_gen) && reuse_ok && (gok == T - np);

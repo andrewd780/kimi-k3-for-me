@@ -105,8 +105,12 @@ architecture exactly:
 - greedy decode: every generated token matches
 - incremental decode: same tokens as full recompute, with KV cache and carried
   recurrent state
+- KV latent layout: the same incremental decode run again with `--kv-latent`'s
+  compressed cache, requiring every logit of every step to be bit-identical to the
+  expanded one; see [the latent-cache note](notes/kv-latent.md)
 
-All three must be *exact*. There is no tolerance on token identity.
+Every one of these must be *exact*. There is no tolerance on token identity, and none
+on the logits of the two KV layouts either.
 
 ## Checkpoint-dependent tests
 

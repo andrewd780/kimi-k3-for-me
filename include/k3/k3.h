@@ -209,15 +209,21 @@ typedef struct {
 } K3MlaW;
 
 size_t k3_mla_scratch(const K3Cfg *c, int T);
-/* Scratch when a KV cache supplies the keys and values. cap is the cache capacity. */
-size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode);
+/* Scratch when a KV cache supplies the keys and values. cap is the cache capacity, and
+ * kv_latent must match the layout the cache was allocated for: the latent path needs a
+ * score row per head and a buffer for the position it is rebuilding. */
+size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
+                             int kv_latent);
 
-/* MLA with an optional KV cache. kvc is [cap][n_heads*(qk_nope+v_head)] and ropec is
- * [cap][qk_rope]; pass NULL for both to get the self-contained behaviour k3_mla has.
- * See the definition for why the EXPANDED keys are cached rather than the latent. */
+/* MLA with an optional KV cache; pass NULL for kvc and ropec to get the self-contained
+ * behaviour k3_mla has. ropec is [cap][qk_rope] in both layouts. kvc is
+ *   kv_latent == 0   [cap][n_heads*(qk_nope+v_head)]   expanded k and v, nothing rebuilt
+ *   kv_latent != 0   [cap][kv_lora]                    the latent, k and v rebuilt on use
+ * The two layouts are BITWISE identical in output, not merely close: see the definition
+ * for what that costs and which loop orders may not be touched. */
 void   k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                      int T, float *scratch,
-                     float *kvc, float *ropec, int cached, int cap);
+                     float *kvc, float *ropec, int cached, int cap, int kv_latent);
 void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
               int T, float *scratch);
 
@@ -401,6 +407,10 @@ extern long k3_expert_drops;
  *     131,072 positions  ->   310.6 GB
  *   1,048,576 positions  ->  2485.0 GB     the model's advertised 1M context
  *
+ * --kv-latent caches the kv_lora_rank latent instead and rebuilds k and v on use, at
+ * 0.055 MB per position: the same five rows become 0.23, 0.91, 1.81 and 7.25 GB, and
+ * the 1M context 58.0 GB. It buys that with a kv_b matmul per cached position per step.
+ *
  * The CLI computes the requirement for the request it was given and refuses, with both
  * figures side by side, when it will not fit in available memory. Reaching the model's
  * full 1M context is a hardware question, not an engine limit.
@@ -411,8 +421,13 @@ extern long k3_expert_drops;
 #define K3_MAX_PROMPT 32768
 #define K3_MAX_GEN     4096
 
-/* Bytes of MLA KV cache per position, measured on the released checkpoint. */
+/* Bytes of MLA KV cache per position, measured on the released checkpoint: 24 MLA
+ * layers x (96 heads x 256 floats + 64 shared rope floats) x 4 bytes. */
 #define K3_KV_BYTES_PER_POS 2370000.0
+
+/* The same, with --kv-latent: 24 x (512 latent + 64 rope) x 4 = 55,296 B, 42.8x less.
+ * k and v are rebuilt through kv_b on every use instead of being stored. */
+#define K3_KV_LATENT_BYTES_PER_POS 55296.0
 
 /* idx and wt must each hold topk entries. */
 void   k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
@@ -513,11 +528,14 @@ void   k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
 /* Incremental form: identical except that MLA attends over a KV cache of `cached`
  * earlier positions and appends its own. KDA and the attn-res stack need nothing
  * carried, because KDA updates its state in place and the block stack is per token.
- * Pass kvc = NULL for the full-recompute behaviour. */
+ * Pass kvc = NULL for the full-recompute behaviour. kv_latent selects the compressed
+ * cache layout and MUST match how kvc was allocated; the output is identical either
+ * way. */
 void   k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                             const K3LayerW *w, const K3Cfg *c, int layer_idx,
                             int T, float *state, float *scratch,
-                            float *kvc, float *ropec, int cached, int cap);
+                            float *kvc, float *ropec, int cached, int cap,
+                            int kv_latent);
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* Dequantise OCP MX FP4, the format Kimi K3 ships its routed experts in.
