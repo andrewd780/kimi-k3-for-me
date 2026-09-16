@@ -33,7 +33,11 @@ the routing bias fails; the SiTU-GLU fixture drives the activation to its exact
 analytic cap.
 
 **`test_cache`**, the streaming expert cache: prefetch, eviction, and mixed batch/serial
-access. Uses a synthetic shard of structurally faithful experts, a few KB.
+access. Uses a synthetic shard of structurally faithful experts, a few KB. With
+`K3_EXPERT_PIPELINE=1` it also runs a second pass covering the opt-in reader-thread
+pool: pipelined batches, duplicate and already-resident ids, a batch bigger than the
+slot count, draining on free/reset_stats before any `get()`, and an injected short
+read; see [the pipelining note](notes/expert-pipeline.md).
 
 **`test_trunk`**, the streaming trunk: ring-slot budget enforcement, one-slot
 guard, async prefetch, slot-isolation under concurrency, ring wrap-around, and

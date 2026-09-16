@@ -10,6 +10,7 @@
 #include <time.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #ifndef _WIN32
 #include <sys/mman.h>   /* MADV_HUGEPAGE; k3_portable_io.h no-ops it on Windows */
 #endif
@@ -115,6 +116,262 @@ static int admit(K3Cache *c, int layer, int expert)
     return slot;
 }
 
+/* ------------------------------------------------------------ known-route pipelining --
+ *
+ * WHAT THE BARRIER COSTS. cache_getmany below reserves every slot, reads every slot, and
+ * only then returns, so the MoE's first multiply waits for the SLOWEST of sixteen
+ * 17.55 MB reads. The routes are already decided before the first read is issued, and
+ * k3_moe consumes the top-k in a known order, so there is nothing to wait for: issue
+ * the reads in CONSUMPTION order and publish each slot the instant it lands: get()
+ * then blocks only on the expert it needs next, while the rest keep arriving behind it.
+ *
+ * Opt-in, because it trades a barrier for a mutex and a condvar on the hot path and
+ * because with it on the reads are no longer issued in disk-offset order.
+ * K3_EXPERT_PIPELINE=1 (or --expert-pipeline) turns it on; with it off not one byte of
+ * behaviour changes.
+ *
+ * LOCKING RULES, and both are load-bearing:
+ *   - Workers exist ONLY between a batch's launch and its drain(). Slot reservation and
+ *     eviction happen on the calling thread with no worker running, because drain() is
+ *     the first thing getmany does; everything else that touches the batch takes p->mu.
+ *   - No disk read ever happens with p->mu held. A worker reads unlocked into a slot that
+ *     is already reserved to it and takes the lock only to publish.
+ */
+#define K3_PIPE_MAX_THREADS 16
+#define K3_PIPE_DEF_THREADS 4
+
+/* State of one reserved entry: it is either still being read, published, or dead. */
+#define K3_PIPE_PENDING 0
+#define K3_PIPE_DONE    1
+#define K3_PIPE_FAILED  2
+
+typedef struct {
+    int         slot;
+    int         expert;
+    int         state;
+    K3ExpertRef r;
+} K3PipeWork;
+
+struct K3CachePipe {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    K3Cache    *c;
+    K3PipeWork  w[K3_MAX_TOPK];
+    int         nw;        /* entries in the current batch                          */
+    int         cursor;    /* next entry a worker will claim, in consumption order  */
+    int         ndone;     /* entries published or failed                           */
+    int         layer;     /* every entry of a batch belongs to one layer           */
+    int         active;    /* workers are running and still need joining            */
+    int         maxth;     /* thread pool ceiling, from the environment             */
+    int         nth;
+    int         warned;    /* one pthread_create warning per cache, not per batch   */
+    double      t0;        /* batch launch, for load_seconds                        */
+    pthread_t   th[K3_PIPE_MAX_THREADS];
+};
+
+/* Publish (or bury) entry i. CALLED WITH p->mu HELD.
+ *
+ * Identical bookkeeping to phase 3 of the serial batch path, one entry at a time: a slot
+ * is registered to its key only after its read succeeded, and a short read releases the
+ * reservation so the slot can never be served as a hit.
+ *
+ * STATS: load_seconds in pipeline mode is the wall clock from the batch's launch to its
+ * LAST completion, recorded here by whichever worker finishes last. Summing per-read
+ * durations would count overlapped time several times over and report a bandwidth the
+ * device never delivered; the batch's elapsed wall time keeps bytes_read/load_seconds a
+ * real rate. Every other counter keeps exactly the meaning it has on the serial path. */
+static void pipe_finish(struct K3CachePipe *p, int i, int64_t got, int64_t pad)
+{
+    K3Cache *c = p->c;
+    K3PipeWork *e = &p->w[i];
+    if (got != e->r.nbytes) {
+        fprintf(stderr, "k3_cache: short prefetch of L%d expert %d (%lld of %lld); "
+                        "leaving the slot empty so it cannot be served as a hit\n",
+                p->layer, e->expert, (long long)got, (long long)e->r.nbytes);
+        c->key_of[e->slot] = K3_SLOT_EMPTY;       /* release the reservation */
+        e->state = K3_PIPE_FAILED;
+    } else {
+        const int32_t key = p->layer * c->n_experts + e->expert;
+        c->ref[e->slot] = e->r;
+        c->pad[e->slot] = (int32_t)pad;
+        c->key_of[e->slot] = key;
+        c->slot_of[key] = e->slot;
+        c->used_at[e->slot] = ++c->clock;
+        c->fresh[e->slot] = 1;
+        c->bytes_read += (uint64_t)got;
+        c->prefetch_reads++;
+        e->state = K3_PIPE_DONE;
+    }
+    if (++p->ndone == p->nw) c->load_seconds += now_s() - p->t0;
+    pthread_cond_broadcast(&p->cv);
+}
+
+/* Read one entry and publish it. The read itself is NOT under the lock. */
+static void pipe_run_one(struct K3CachePipe *p, int i)
+{
+    K3Cache *c = p->c;
+    int64_t pad = 0;
+    const int64_t got = k3_expert_load_direct(
+        c->st, &p->w[i].r, c->arena + (size_t)p->w[i].slot * c->slot_bytes,
+        c->slot_bytes, &pad);
+    pthread_mutex_lock(&p->mu);
+    pipe_finish(p, i, got, pad);
+    pthread_mutex_unlock(&p->mu);
+}
+
+/* Pull entries off the shared cursor IN ORDER, so the expert k3_moe will multiply first
+ * is also the one the pool starts on. */
+static void *pipe_worker(void *arg)
+{
+    struct K3CachePipe *p = (struct K3CachePipe *)arg;
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        const int i = p->cursor < p->nw ? p->cursor++ : -1;
+        pthread_mutex_unlock(&p->mu);
+        if (i < 0) return NULL;
+        pipe_run_one(p, i);
+    }
+}
+
+/* Join the current batch's workers and forget it. Every entry point that inspects or
+ * mutates cache state outside the mutex calls this first, so from its return until the
+ * next launch the calling thread is the only one touching the cache. */
+static void drain(K3Cache *c)
+{
+    struct K3CachePipe *p = c->pipe;
+    if (!p || !p->active) return;
+    for (int i = 0; i < p->nth; i++) pthread_join(p->th[i], NULL);
+    p->nth = p->nw = p->cursor = p->ndone = 0;
+    p->active = 0;
+}
+
+/* Reserve a slot for one expert and read it on THIS thread, taking the mutex only around
+ * the bookkeeping. This is admit()'s miss path, split so that a worker publishing another
+ * slot cannot race the reservation. Returns the slot, or -1. */
+static int admit_sync_locked(K3Cache *c, int layer, int expert)
+{
+    struct K3CachePipe *p = c->pipe;
+    const int32_t key = layer * c->n_experts + expert;
+
+    K3ExpertRef r;
+    if (k3_expert_ref(c->st, layer, expert, &r) != 0) return -1;
+    if (r.nbytes > c->slot_bytes) {
+        fprintf(stderr, "k3_cache: L%d expert %d is %lld bytes, slot holds %lld\n",
+                layer, expert, (long long)r.nbytes, (long long)c->slot_bytes);
+        return -1;
+    }
+
+    pthread_mutex_lock(&p->mu);
+    const int slot = pick_victim(c, 0);
+    if (slot < 0) {
+        pthread_mutex_unlock(&p->mu);
+        fprintf(stderr, "k3_cache: every slot is pinned, cannot admit L%d expert %d\n",
+                layer, expert);
+        return -1;
+    }
+    if (c->key_of[slot] >= 0) { c->slot_of[c->key_of[slot]] = -1; c->evictions++; }
+    /* INFLIGHT while the read runs, so a worker publishing elsewhere and a later victim
+     * search both keep their hands off it. */
+    c->key_of[slot] = K3_SLOT_INFLIGHT;
+    c->used_at[slot] = ++c->clock;
+    pthread_mutex_unlock(&p->mu);
+
+    const double t0 = now_s();
+    int64_t pad = 0;
+    const int64_t got = k3_expert_load_direct(c->st, &r,
+                            c->arena + (size_t)slot * c->slot_bytes,
+                            c->slot_bytes, &pad);
+
+    pthread_mutex_lock(&p->mu);
+    c->load_seconds += now_s() - t0;
+    if (got != r.nbytes) {
+        fprintf(stderr, "k3_cache: short load of L%d expert %d (%lld of %lld)\n",
+                layer, expert, (long long)got, (long long)r.nbytes);
+        c->key_of[slot] = K3_SLOT_EMPTY;
+        pthread_mutex_unlock(&p->mu);
+        return -1;
+    }
+    c->bytes_read += (uint64_t)got;
+    c->ref[slot] = r;
+    c->pad[slot] = (int32_t)pad;
+    c->key_of[slot] = key;
+    c->slot_of[key] = slot;
+    c->used_at[slot] = ++c->clock;
+    c->fresh[slot] = 1;
+    pthread_mutex_unlock(&p->mu);
+    return slot;
+}
+
+/* admit() for pipeline mode. Three cases, in this order:
+ *   resident              serve it, exactly as admit() does;
+ *   pending in this batch  wait on the condvar rather than starting a second read of the
+ *                         same expert into a second slot;
+ *   anything else         the ordinary synchronous miss path.
+ * A batch entry whose read FAILED falls through to that same miss path, so a short read
+ * costs a retry rather than a dropped expert. */
+static int admit_pipelined(K3Cache *c, int layer, int expert)
+{
+    struct K3CachePipe *p = c->pipe;
+    const int32_t key = layer * c->n_experts + expert;
+
+    pthread_mutex_lock(&p->mu);
+    for (;;) {
+        const int slot = c->slot_of[key];
+        if (slot >= 0) {
+            c->hits++;
+            c->used_at[slot] = ++c->clock;
+            pthread_mutex_unlock(&p->mu);
+            return slot;
+        }
+        int pending = 0;
+        if (p->active && p->layer == layer)
+            for (int i = 0; i < p->nw; i++)
+                if (p->w[i].expert == expert && p->w[i].state == K3_PIPE_PENDING) {
+                    pending = 1; break;
+                }
+        if (!pending) break;
+        pthread_cond_wait(&p->cv, &p->mu);
+    }
+    c->misses++;
+    pthread_mutex_unlock(&p->mu);
+    return admit_sync_locked(c, layer, expert);
+}
+
+/* Hand the reserved batch to the pool and RETURN, without waiting for a single read.
+ * Returns the number of entries launched; get() is what waits, per expert. */
+static int pipe_launch(K3Cache *c, int layer, int nw)
+{
+    struct K3CachePipe *p = c->pipe;
+    p->layer = layer;
+    p->nw = nw;
+    p->cursor = p->ndone = p->nth = 0;
+    p->t0 = now_s();
+    p->active = 1;
+
+    const int want = nw < p->maxth ? nw : p->maxth;
+    int rc = 0;
+    for (int i = 0; i < want; i++) {
+        rc = pthread_create(&p->th[i], NULL, pipe_worker, p);
+        if (rc != 0) break;
+        p->nth++;
+    }
+    if (p->nth > 0) return nw;      /* one surviving worker still drains the whole list */
+
+    /* Not a single thread: do the remaining entries here. That is the old barrier back
+     * again, which is slower but not wrong. Warn once per cache, not once per batch. */
+    p->active = 0;
+    if (!p->warned) {
+        p->warned = 1;
+        fprintf(stderr, "k3_cache: cannot create pipeline threads (%s); falling back to "
+                        "synchronous batch reads\n", strerror(rc));
+    }
+    for (int i = 0; i < nw; i++) pipe_run_one(p, i);
+    int ok = 0;
+    for (int i = 0; i < nw; i++) if (p->w[i].state == K3_PIPE_DONE) ok++;
+    p->nw = p->cursor = p->ndone = 0;
+    return ok;
+}
+
 /* Bring a whole top-k resident, with the reads issued CONCURRENTLY.
  *
  * The serial path admits one expert per call, so the drive sees a queue depth of one:
@@ -137,6 +394,9 @@ static int admit(K3Cache *c, int layer, int expert)
 static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
 {
     K3Cache *c = (K3Cache *)self;
+    /* The previous batch owns its slots until its workers are joined. No-op when
+     * pipelining is off. */
+    drain(c);
     if (layer < 0 || layer >= c->n_layers || n < 0 || (n && !ids)) return -1;
     if (n == 0) return 0;
 
@@ -183,6 +443,20 @@ static int cache_getmany(K3ExpertSrc *self, int layer, const int *ids, int n)
         if (ids[i] >= 0 && ids[i] < c->n_experts)
             c->requested[layer * c->n_experts + ids[i]] = 0;
     if (nw == 0) return 0;
+
+    /* Pipelined: keep CONSUMPTION order. Disk-offset order is the right answer when the
+     * caller waits for the whole batch anyway, and the wrong one here -- it would put the
+     * expert k3_moe multiplies first at an arbitrary place in the queue. */
+    if (c->pipeline) {
+        struct K3CachePipe *p = c->pipe;
+        for (int i = 0; i < nw; i++) {
+            p->w[i].slot = w[i].slot;
+            p->w[i].expert = w[i].expert;
+            p->w[i].r = w[i].r;
+            p->w[i].state = K3_PIPE_PENDING;
+        }
+        return pipe_launch(c, layer, nw);
+    }
 
     /* Issue in DISK-OFFSET order. Experts are not stored id-ordered inside a shard, so
      * sorting by where the bytes actually live turns a scattered set of seeks into a
@@ -244,10 +518,13 @@ static int cache_resident(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *o
     if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
         return 0;
     const int32_t key = layer * c->n_experts + expert;
+    /* Pipelined, a worker may be publishing a slot right now: read slot_of under the same
+     * mutex it is published with. This never waits -- "resident" means resident NOW. */
+    if (c->pipeline) pthread_mutex_lock(&c->pipe->mu);
     const int slot = c->slot_of[key];
-    if (slot < 0) return 0;
-    if (out) fill_q(c, slot, out);
-    return 1;
+    if (slot >= 0 && out) fill_q(c, slot, out);
+    if (c->pipeline) pthread_mutex_unlock(&c->pipe->mu);
+    return slot >= 0;
 }
 
 static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
@@ -272,12 +549,16 @@ static int cache_get(K3ExpertSrc *self, int layer, int expert, K3ExpertQ *out)
         c->trace[c->ntrace++] = expert;
     }
 
-    const int slot = admit(c, layer, expert);
+    const int slot = c->pipeline ? admit_pipelined(c, layer, expert)
+                                 : admit(c, layer, expert);
     if (slot < 0) return -1;
+    /* fresh[] is written by the workers, so read-modify-write it under their mutex. */
+    if (c->pipeline) pthread_mutex_lock(&c->pipe->mu);
     c->demand_requests++;
     if (!c->fresh[slot]) c->demand_reuses++;
     c->fresh[slot] = 0;
     fill_q(c, slot, out);
+    if (c->pipeline) pthread_mutex_unlock(&c->pipe->mu);
     return 0;
 }
 
@@ -293,6 +574,12 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     c->src.getmany = getenv("K3_NOPREFETCH") ? NULL : cache_getmany;
     if (!c->src.getmany)
         fprintf(stderr, "k3_cache: batch prefetch DISABLED by K3_NOPREFETCH\n");
+    /* Known-route pipelining is OPT-IN: K3_EXPERT_PIPELINE=1, or --expert-pipeline, which
+     * sets it. Off, every path below is the one that shipped, byte for byte. */
+    {
+        const char *v = getenv("K3_EXPERT_PIPELINE");
+        c->pipeline = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
     c->src.ctx = c;
     c->st = st;
     c->n_layers = cfg->n_layers;
@@ -375,11 +662,42 @@ int k3_cache_init(K3Cache *c, const K3St *st, const K3Cfg *cfg, int64_t budget_b
     }
     for (size_t i = 0; i < nkey; i++) c->slot_of[i] = -1;
     for (int i = 0; i < c->nslot; i++) c->key_of[i] = -1;
+
+    if (c->pipeline) {
+        struct K3CachePipe *p = (struct K3CachePipe *)calloc(1, sizeof *p);
+        if (!p) { k3_cache_free(c); return -1; }
+        p->c = c;
+        /* A handful of threads is enough to keep an NVMe queue deep; more of them just
+         * compete for the same device and for the publishing mutex. */
+        p->maxth = K3_PIPE_DEF_THREADS;
+        const char *nt = getenv("K3_EXPERT_PIPELINE_THREADS");
+        if (nt && *nt) {
+            const long v = strtol(nt, NULL, 10);
+            if (v > 0)
+                p->maxth = (int)(v > K3_PIPE_MAX_THREADS ? K3_PIPE_MAX_THREADS : v);
+        }
+        if (pthread_mutex_init(&p->mu, NULL) != 0) {
+            free(p); k3_cache_free(c); return -1;
+        }
+        if (pthread_cond_init(&p->cv, NULL) != 0) {
+            pthread_mutex_destroy(&p->mu); free(p); k3_cache_free(c); return -1;
+        }
+        c->pipe = p;
+        fprintf(stderr, "k3_cache: known-route pipelining ON, %d reader thread(s)\n",
+                p->maxth);
+    }
     return 0;
 }
 
 void k3_cache_free(K3Cache *c)
 {
+    drain(c);
+    if (c->pipe) {
+        pthread_cond_destroy(&c->pipe->cv);
+        pthread_mutex_destroy(&c->pipe->mu);
+        free(c->pipe);
+        c->pipe = NULL;
+    }
     k3_aligned_free(c->arena); free(c->slot_of); free(c->key_of);
     free(c->used_at); free(c->pinned); free(c->ref); free(c->pad); free(c->hist);
     free(c->trace);
@@ -390,6 +708,7 @@ void k3_cache_free(K3Cache *c)
 
 int k3_cache_dump_trace(const K3Cache *c, const char *path)
 {
+    drain((K3Cache *)c);        /* const is about the TRACE, not about the worker pool */
     if (!c->trace || c->ntrace == 0) return -1;
     FILE *f = fopen(path, "wb");
     if (!f) return -1;
@@ -402,6 +721,7 @@ int k3_cache_dump_trace(const K3Cache *c, const char *path)
 
 int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 {
+    drain(c);
     if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
         return 0;
     const int32_t key = layer * c->n_experts + expert;
@@ -419,6 +739,7 @@ int k3_cache_pin(K3Cache *c, int layer, int expert, int pin)
 
 int k3_cache_prefetch(K3Cache *c, int layer, int expert)
 {
+    drain(c);
     if (layer < 0 || layer >= c->n_layers || expert < 0 || expert >= c->n_experts)
         return -1;
     return admit(c, layer, expert) >= 0 ? 0 : -1;
@@ -502,6 +823,7 @@ int k3_cache_check_profile(const char *path, int count)
 
 int k3_cache_load_profile(K3Cache *c, const char *path, int count)
 {
+    drain(c);
     if (c->clock || count <= 0 || count > c->nslot - c->topk - 1) {
         fprintf(stderr, "k3_cache: profile needs an unused cache and 1..%d pins "
                         "(keep top-%d plus one slots evictable)\n",
@@ -513,6 +835,7 @@ int k3_cache_load_profile(K3Cache *c, const char *path, int count)
 
 void k3_cache_reset_stats(K3Cache *c)
 {
+    drain(c);                   /* a running batch still has counters to add */
     c->hits = c->misses = c->evictions = c->bytes_read = 0;
     c->demand_requests = c->demand_reuses = 0;
     c->load_seconds = 0.0;
@@ -523,6 +846,7 @@ void k3_cache_reset_stats(K3Cache *c)
 
 void k3_cache_report(const K3Cache *c, const char *label)
 {
+    drain((K3Cache *)c);        /* reporting mid-batch would print half a batch */
     const uint64_t n = c->demand_requests;
     int resident = 0, pinned = 0;
     for (int i = 0; i < c->nslot; i++) {
@@ -545,6 +869,7 @@ void k3_cache_report(const K3Cache *c, const char *label)
 
 int k3_cache_dump_hist(const K3Cache *c, const char *path)
 {
+    drain((K3Cache *)c);
     FILE *f = fopen(path, "w");
     if (!f) return -1;
     fprintf(f, "{\"n_layers\":%d,\"n_experts\":%d,\"counts\":{",

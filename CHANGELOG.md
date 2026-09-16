@@ -7,6 +7,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--expert-pipeline`** (also `K3_EXPERT_PIPELINE=1`), off by default: the routed-expert
+  batch prefetch stops waiting for the whole top-k before it returns. The routes are known
+  before the first read is issued, so the reads are handed to a small pthread pool in
+  CONSUMPTION order and each slot is published the instant its read lands; `get()` then
+  blocks only on the expert the MoE needs next instead of on the slowest read in the batch.
+  `K3_EXPERT_PIPELINE_THREADS` sets the pool size (default 4, capped at 16). Nothing about
+  routing, top-k, the combining weights or the float summation order changes, and with the
+  flag off the cache is byte-for-byte the code that shipped, stats included. In pipeline
+  mode `load_seconds` is the wall clock from a batch's launch to its last completion, since
+  summing overlapped per-read durations would report a bandwidth the device never delivered.
+
 - **`--stop-id N`** (repeatable, up to 8): generation halts as soon as the model emits
   a listed token id. Off by default, so `--gen N` still means exactly N tokens for
   every benchmark and oracle gate. The stop id stays in the sequence, so `--save-state`

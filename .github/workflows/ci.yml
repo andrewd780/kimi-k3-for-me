@@ -261,6 +261,18 @@ jobs:
           # on every load. It is run for what ASan sees, not for what it reports.
           ./bin/bench_kernels
 
+      # test_cache carries its own pipeline-mode cases (see tests/unit/test_cache.c), but
+      # they only run when K3_EXPERT_PIPELINE is set, so the line above never puts the
+      # reader-thread pool's locking under the sanitizers. Re-running the whole binary
+      # rather than filtering is deliberate: the non-pipeline cases must keep passing with
+      # the env var present too, since setting it must not perturb them.
+      - name: Re-run test_cache with expert pipelining on
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          K3_EXPERT_PIPELINE: "1"
+        run: ./bin/test_cache tests/fixtures/cache
+
       # Everything above builds the SCALAR fallbacks. Overriding CFLAGS drops $(ARCH)
       # from the command line, so no -m flag reaches the compiler and __AVX2__ is
       # undefined -- the `ARCH=` above is already a no-op for that reason. That leaves

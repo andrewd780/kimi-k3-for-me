@@ -364,6 +364,9 @@ static void usage(FILE *f)
 "  --cache-gb X          routed-expert cache budget\n"
 "  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
 "                        recurrent-state slot during full recompute; needs --trunk\n"
+"  --expert-pipeline     overlap routed-expert reads with the MoE multiply: publish\n"
+"                        each expert as its read lands instead of waiting for the\n"
+"                        whole top-k. Off by default; same arithmetic either way\n"
 "\n"
 "generation:\n"
 "  --stream-lm-head      stream exact lm_head chunks while keeping embedding/state\n"
@@ -730,7 +733,7 @@ int main(int argc, char **argv)
     double draft_gb = 6.0;
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
-    int incremental = 0, ultra = 0, stream_lm_head = 0;
+    int incremental = 0, ultra = 0, stream_lm_head = 0, expert_pipeline = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -800,6 +803,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--incremental")) incremental = 1;
         else if (!strcmp(argv[i], "--ultra-low-memory")) ultra = 1;
+        else if (!strcmp(argv[i], "--expert-pipeline")) expert_pipeline = 1;
         else if (!strcmp(argv[i], "--stream-lm-head")) stream_lm_head = 1;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
@@ -1231,6 +1235,17 @@ int main(int argc, char **argv)
     /* Reject checkpoint geometry, missing selected tensors and impossible pin budgets
      * after metadata indexing but before binding any trunk, embedding or head weights. */
     K3Cache cache;
+    /* The cache reads its own switch out of the environment, so that a run driven by
+     * K3_EXPERT_PIPELINE and one driven by the flag are the same run. Set it BEFORE init,
+     * which is where the cache looks. */
+    if (expert_pipeline) {
+#ifdef _WIN32
+        _putenv_s("K3_EXPERT_PIPELINE", "1");
+#else
+        setenv("K3_EXPERT_PIPELINE", "1", 1);
+#endif
+        printf("expert pipelining: ON (experts are published as their reads land)\n");
+    }
     if (k3_cache_init(&cache, &st, &c, (int64_t)(cache_gb * 1e9)) != 0) return 1;
     if (expert_profile) {
         if (k3_cache_load_profile(&cache, expert_profile, pin_experts)) {
