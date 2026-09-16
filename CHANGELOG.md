@@ -7,6 +7,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`--kv-latent`**, off by default: the incremental decoder's MLA KV cache holds only
+  the `kv_lora_rank` latent and the shared rope row per position, and rebuilds the
+  per-head k and v through `kv_b` on every use, which is what MLA's own design caches.
+  That is 0.055 MB per position across the 24 MLA layers instead of 2.37 MB, 42.8x less,
+  and it turns a 131,072-position context from 310.04 GB of cache into 7.25 GB. It is
+  paid for in arithmetic: every cached position is re-expanded twice per decode step,
+  once to score and once to weight the values. Output is BITWISE identical, not close:
+  the latent stored is exactly the bytes the expanded path fed to `kv_b`, the rebuild
+  uses the same kernel, and every softmax reduction keeps its order, so GATE 3b of the
+  oracle compares all logits of all steps rather than tokens. The memory plan, the KV
+  line and `k3_run.json` report the layout actually allocated; `--save-state` records it
+  in the header and a cross-layout `--load-state` is refused by name rather than read at
+  the wrong stride. Needs `--incremental`; full recompute is untouched. See
+  [docs/notes/kv-latent.md](docs/notes/kv-latent.md).
+
 - **`--expert-pipeline`** (also `K3_EXPERT_PIPELINE=1`), off by default: the routed-expert
   batch prefetch stops waiting for the whole top-k before it returns. The routes are known
   before the first read is issued, so the reads are handed to a small pthread pool in
