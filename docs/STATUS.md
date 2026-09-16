@@ -85,6 +85,7 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Selective scale archives, K3ZMAP1 (#6) | Compresses only the 5.9% of expert bytes that compress (the scales) and reads the rest raw | done, opt-in | 24 storage tests, sanitizers, synthetic CLI parity ([doc](SELECTIVE_SCALES.md)) | Saves 0.95% of bytes per token; unmeasured on the real model |
 | Direct I/O for selective raw extents (#8) | Reads the raw parts of a selective archive past the page cache, the way plain shards are read | done | Native test proves the direct path is taken and falls back cleanly; bytes identical | Speed unmeasured on the real model |
 | Known-route expert pipelining, `--expert-pipeline` (#9) | Publishes each routed expert as its read lands instead of waiting for the whole top-k | done, opt-in | Native pipeline-mode cases plus sanitizers; CLI parity for full recompute and `--incremental` at pool sizes 1 and 16 ([note](notes/expert-pipeline.md)) | Speed unmeasured on the real model |
+| MLA latent KV cache, `--kv-latent` (#10) | Keeps the attention cache in its 512-wide latent form and rebuilds keys and values on use: 55 KB per position instead of 2.37 MB, 42.8x less | done, opt-in | GATE 3b holds all 20 incremental steps bit-identical between layouts; state save/load round-trips; 20 CI checks green ([note](notes/kv-latent.md)) | Costs one kv_b matmul per cached position per use; speed unmeasured on the real model |
 
 ### Measured, no new code
 
@@ -100,7 +101,7 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 
 | Technique | What it would do | Status | Why it closed | What would reopen it |
 |---|---|---|---|---|
-| Huffman-coded trunk (upstream) | A 1.45x smaller trunk, lossless | shelved | Decoder ran at 0.31 GB/s per core; a laptop SSD would need about 10 cores decoding ([note](notes/compressed-trunk.md)) | A small decoder above 1 GB/s per core |
+| Huffman-coded trunk (upstream) | A 1.45x smaller trunk, lossless | shelved, queued second | Decoder ran at 0.31 GB/s per core; reference Huff0 reached 1.72 GB/s on the same bytes, so the bar is reachable ([note](notes/compressed-trunk.md)) | A small multi-stream decoder above 1 GB/s per core; pays only where disk time exceeds compute ([queue](notes/research-queue.md)) |
 | Expert pruning (studied) | Drop rarely used experts | dead | Held-out coverage plateaus at 35%; usage is deliberately flattened by the router | It changes the model, so the quality harness first |
 | Shared base plus low-rank delta (studied, closed PR #3) | Store one expert per layer plus small differences | dead on paper | Needs 0.99 correlation between experts; real expert weights look random. The write-up itself had errors and was closed unmerged | Kept only at PR #3 for the record |
 | Int8 trunk as the main model (upstream note) | Halve the trunk by rounding | not validated | The 90.9% figure was a 22-token draft with the exact model verifying, not a quality result | A real quality evaluation |
@@ -109,8 +110,10 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 
 | Technique | What it would do | Status | What is known | Size of the job |
 |---|---|---|---|---|
-| Asymmetric trunk ring or row tiles (#6 map) | Smaller trunk buffers so read-ahead survives at 8 GB | proposal | Pairwise arithmetic only; needs a 93-layer wraparound proof | Large exact change |
-| MLA latent KV cache, `--kv-latent` | Keep the attention cache in its compressed latent form instead of expanding it, removing most of the 2.37 MB/position, 19.38 GB/8K-context cost | done, opt-in (`--kv-latent`) | n/a yet | Exact change across the 24 MLA layers |
+| Tensor-granular trunk ring (#6 map) | Streams the trunk one tensor at a time so two ring slots cost about 1 GB instead of 2.37 GB for one, restoring read-ahead at 8 GB | proposal, next to build | Arithmetic from the reader's own slot rule and the 0.49 GB largest tensor; 1.75x ceiling at 8 GB on the measured host ([queue](notes/research-queue.md)) | Large exact change, staged; oracle, allocator and ThreadSanitizer gates |
+| Next-layer expert prefetch | Predicts the next layer's experts from the current hidden state and reads them early; routing still decides what is computed | proposal | Option-map arithmetic: 1.3x expert traffic for earlier arrival, at most 1.06x on total bytes ([queue](notes/research-queue.md)) | Large; predictor needs real routing data |
+| Bounded lookahead verification | Drafts without a history match, verified by the exact model | proposal, flagged | The engine's own 0.91x eager-drafter result says wide windows lose ([queue](notes/research-queue.md)) | Small window and evidence gating only; acceptance unmeasurable here |
+| io_uring reads | Async read submission without a thread per read, Linux only | proposal | Measurable on any Linux box without a model ([queue](notes/research-queue.md)) | An enabler for the ring on small-core machines, not a lever alone |
 | Speculative decoding on resident hardware | A cheap draft proposes tokens, the exact model verifies; ~1.7x fewer weight bytes per accepted token at the measured 66.7% acceptance ([note](notes/int8-draft-container.md)) | proposal | Only pays off once the model is resident in RAM; nothing on 8 GB, where both draft and exact stream from disk | Needs a large-memory host to pay for |
 | Chunked prefill, sampling, chat template, vision, HTTP serving | Usability features from the upstream roadmap | not started | n/a | Do not change size or speed |
 
@@ -129,8 +132,11 @@ a day of disk time.
    Automatically delete head branches* so this stops recurring.
 2. **Checkpoint-free engineering, in order of value per risk.** The lint findings
    and direct I/O for selective raw extents landed in #8; known-route expert
-   pipelining landed in #9. Next is the asymmetric trunk ring, which can also be
-   built and gated in CI without the checkpoint.
+   pipelining landed in #9; the latent KV cache landed in #10. The ranked list of
+   what is left is [notes/research-queue.md](notes/research-queue.md): the
+   tensor-granular trunk ring first (overlap pays on every machine), the small
+   Huffman decoder second (pays only where disk time exceeds compute), three more
+   recorded and not recommended.
 3. **The rental remains the only way to measure.** Everything marked blocked needs one
    machine with the checkpoint for a day or two. Without it there will never be a
    laptop speed or quality number; with it, one core-limited ladder run answers the

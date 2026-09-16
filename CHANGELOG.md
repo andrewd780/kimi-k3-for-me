@@ -7,6 +7,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Research queue**, `docs/notes/research-queue.md`: the ranked list of what is left to
+  build without the checkpoint, each item exact and gated on the synthetic model, with
+  the per-machine arithmetic that orders it. The status board now points at it, carries
+  the four new proposal rows, and lists `--kv-latent` under shipped with its evidence.
 - **`--kv-latent`**, off by default: the incremental decoder's MLA KV cache holds only
   the `kv_lora_rank` latent and the shared rope row per position, and rebuilds the
   per-head k and v through `kv_b` on every use, which is what MLA's own design caches.
