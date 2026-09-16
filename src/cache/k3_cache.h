@@ -96,6 +96,17 @@ typedef struct {
      * each, is 12 KB per token. */
     int32_t     *trace;
     int64_t      ntrace, captrace;
+
+    /* KNOWN-ROUTE PIPELINING, off unless K3_EXPERT_PIPELINE=1 (see k3_cache.c).
+     *
+     * The batch path normally reads every expert of a top-k and only then returns, so
+     * the MoE waits for the SLOWEST read before multiplying the first expert. The routes
+     * are already known, so the reads can be issued in consumption order and each slot
+     * published the moment it lands: get() then blocks only on the expert it actually
+     * needs next. pipe is opaque here because it carries pthread objects and this header
+     * is included by callers that have no business seeing them. */
+    int          pipeline;
+    struct K3CachePipe *pipe;     /* owned; NULL unless pipeline */
 } K3Cache;
 
 /* budget_bytes is the arena size; it is rounded down to whole experts. Fails if that

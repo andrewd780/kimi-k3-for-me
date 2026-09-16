@@ -436,6 +436,7 @@ printf 'La capitale de la France est' > /tmp/p.txt
 | `--cache-gb` | `X` | 64 | budget for the routed-expert LRU cache |
 | `--ultra-low-memory` | none | off | stream exact embedding rows and lm_head chunks; full recompute also reuses one recurrent-state slot. Requires `--trunk` |
 | `--stream-lm-head` | none | off | stream only the output table; give the net freed memory to `--trunk-gb` to fund another ring slot. [Mechanism and limits](docs/notes/stream-lm-head.md) |
+| `--expert-pipeline` | none | off | publish each routed expert as its read lands instead of waiting for the whole top-k; `K3_EXPERT_PIPELINE_THREADS` sets the reader pool size (default 4, max 16). Exact; no speedup claimed. [Design and math bound](docs/notes/expert-pipeline.md) |
 
 The `ultra` preset selects `--ultra-low-memory` with a 2.5 GB trunk ring and a
 0.31 GB expert cache. It is a proof-of-life path for 8 GB-class machines, not an

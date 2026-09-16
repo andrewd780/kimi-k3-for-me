@@ -64,6 +64,7 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Quality harness, `tools/quality.py` (#5) | Scores how well a model predicts held-out text, so a changed model can be compared with the exact one | built, never run on K3 | Protocol tests and a tiny native check ([doc](QUALITY.md)) | Needs a checkpoint host; about 1.4 TB of reads per 128-token window |
 | Selective scale archives, K3ZMAP1 (#6) | Compresses only the 5.9% of expert bytes that compress (the scales) and reads the rest raw | done, opt-in | 24 storage tests, sanitizers, synthetic CLI parity ([doc](SELECTIVE_SCALES.md)) | Saves 0.95% of bytes per token; unmeasured on the real model |
 | Direct I/O for selective raw extents (#8) | Reads the raw parts of a selective archive past the page cache, the way plain shards are read | done | Native test proves the direct path is taken and falls back cleanly; bytes identical | Speed unmeasured on the real model |
+| Known-route expert pipelining, `--expert-pipeline` (#9) | Publishes each routed expert as its read lands instead of waiting for the whole top-k | done, opt-in | Native pipeline-mode cases plus sanitizers; CLI parity for full recompute and `--incremental` at pool sizes 1 and 16 ([note](notes/expert-pipeline.md)) | Speed unmeasured on the real model |
 
 ### Measured, no new code
 
@@ -88,7 +89,6 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 
 | Technique | What it would do | Status | What is known | Size of the job |
 |---|---|---|---|---|
-| Known-route pipelining (#6 map) | Compute each expert as soon as its bytes land, instead of waiting for all 16 | proposal | Math bound of 1.88x on the expert stage only, never whole-model | The strongest remaining exact lead; a concurrency change with real risk; testable without the checkpoint |
 | Asymmetric trunk ring or row tiles (#6 map) | Smaller trunk buffers so read-ahead survives at 8 GB | proposal | Pairwise arithmetic only; needs a 93-layer wraparound proof | Large exact change |
 | Chunked prefill, sampling, chat template, vision, HTTP serving | Usability features from the upstream roadmap | not started | n/a | Do not change size or speed |
 
@@ -106,9 +106,9 @@ a day of disk time.
    has a "Delete branch" button) and turn on *Settings, General, Pull Requests,
    Automatically delete head branches* so this stops recurring.
 2. **Checkpoint-free engineering, in order of value per risk.** The lint findings
-   and direct I/O for selective raw extents landed in #8. Next is known-route
-   pipelining, the one exact lead with a real bound, then the asymmetric trunk
-   ring. Both can be built and gated in CI without the checkpoint.
+   and direct I/O for selective raw extents landed in #8; known-route expert
+   pipelining landed in #9. Next is the asymmetric trunk ring, which can also be
+   built and gated in CI without the checkpoint.
 3. **The rental.** Everything marked blocked needs one machine with the checkpoint for
    a day or two. Without it there will never be a laptop speed or quality number; with
    it, one core-limited ladder run answers the decisive question.

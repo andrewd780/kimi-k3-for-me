@@ -21,15 +21,32 @@
  *                   appeared under pressure, because with a roomy cache pick_victim
  *                   returns genuinely free slots and the aliasing never happens.
  *   4 ACCOUNTING    requests, hits and prefetch_reads stay mutually consistent.
+ *   5 PIPELINE      with K3_EXPERT_PIPELINE=1 (see k3_cache.c), a second pass over the
+ *                   same fixture: a pipelined batch is byte-exact against the same
+ *                   ground truth as the serial path; duplicate and already-resident ids
+ *                   in one batch are handled; a batch bigger than the slot count still
+ *                   serves every expert via get(), just not all from the prefetch; free
+ *                   and reset_stats called right after getmany, before any get(), drain
+ *                   cleanly; a truncated shard leaves the short expert's slot empty and
+ *                   get() failing for it alone.
  *
  * usage: test_cache <fixture_dir> [n_experts]
  *        fixture_dir comes from tools/make_cache_fixture.py
  */
+#define _GNU_SOURCE             /* mkdtemp, ftruncate */
 #define _POSIX_C_SOURCE 200809L
 
+#include "k3_portable_io.h"     /* first: establishes Darwin feature macros */
+
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>             /* ftruncate */
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "k3.h"
 #include "k3_cache.h"
@@ -79,6 +96,280 @@ static int same_expert(const K3St *st, int layer, int e, const K3ExpertQ *q)
     }
     free(truth);
     return ok;
+}
+
+/* ---------------------------------------------------------------- pipeline mode --
+ *
+ * K3_EXPERT_PIPELINE=1 turns on the reader-thread pool (see k3_cache.c). Every case
+ * below reuses the identity check above (same_expert), which is what makes it a
+ * parity check against the non-pipeline path: both are compared to the same
+ * straight-off-disk ground truth, so a byte pipeline mode gets wrong is a byte the
+ * non-pipeline path was already proven right on.
+ */
+
+static void set_env(const char *name, const char *val)
+{
+#ifdef _WIN32
+    _putenv_s(name, val ? val : "");
+#else
+    if (val) setenv(name, val, 1); else unsetenv(name);
+#endif
+}
+
+/* A temp directory, portable enough for this test: POSIX mkdtemp on Linux/macOS, a
+ * small CreateDirectoryA retry loop on Windows (mirrors test_trunk.c). */
+static int make_tmpdir(char *out, size_t cap)
+{
+#if defined(_WIN32)
+    char base[MAX_PATH];
+    DWORD blen = GetTempPathA((DWORD)sizeof base, base);
+    if (blen == 0 || blen >= sizeof base) return -1;
+    for (unsigned attempt = 0; attempt < 1000; attempt++) {
+        snprintf(out, cap, "%sk3_test_cache_%lu_%u", base,
+                 (unsigned long)GetCurrentProcessId(), attempt);
+        if (CreateDirectoryA(out, NULL)) return 0;
+    }
+    return -1;
+#else
+    snprintf(out, cap, "/tmp/k3_test_cache_XXXXXX");
+    return mkdtemp(out) ? 0 : -1;
+#endif
+}
+
+/* Byte-for-byte file copy, no shelling out. */
+static int copy_file(const char *src, const char *dst)
+{
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    char buf[65536];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0)
+        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    if (ferror(in)) ok = 0;
+    fclose(in); fclose(out);
+    return ok ? 0 : -1;
+}
+
+/* Grow the budget until init accepts. A cache needs room for whole, O_DIRECT-widened
+ * slots, so a budget sized only off the raw expert byte count can come up short by a
+ * slot; the fixture experts are small enough that this happens routinely. Mirrors the
+ * growing loop main() already uses to size its own cache above. */
+static int init_grown(K3Cache *cache, const K3St *st, const K3Cfg *cfg, int64_t unit)
+{
+    int64_t budget = unit * 8;
+    for (int tries = 0; tries < 14; tries++, budget *= 2)
+        if (k3_cache_init(cache, st, cfg, budget) == 0) return 1;
+    return 0;
+}
+
+/* (a) a pipelined batch, consumed in the same order getmany was given, must be
+ * byte-exact -- exactly the check the serial and non-pipeline-batch paths are held
+ * to above. (b) duplicate ids and an already-resident id together in one batch must
+ * not corrupt or drop anything. */
+static void pipeline_batch_case(K3St *st, K3Cache *cache, int NE, int topk)
+{
+    int bad = 0, batches = 0;
+    for (int start = 0; start + topk <= NE; start += topk) {
+        int ids[16];
+        for (int j = 0; j < topk; j++) ids[j] = start + j;
+        cache->src.getmany(&cache->src, 0, ids, topk);
+        batches++;
+        for (int j = 0; j < topk; j++) {
+            K3ExpertQ q;
+            if (cache->src.get(&cache->src, 0, ids[j], &q) != 0) { bad++; continue; }
+            if (!same_expert(st, 0, ids[j], &q)) bad++;
+        }
+    }
+    char b[96];
+    snprintf(b, sizeof b, "%d batches of %d, %d wrong", batches, topk, bad);
+    ck(bad == 0, "pipeline: batch prefetch is byte-exact", b);
+
+    /* Warm expert 0 first, so the mixed batch below also names an already-resident
+     * id, alongside expert 1 named twice. */
+    K3ExpertQ q0;
+    cache->src.get(&cache->src, 0, 0, &q0);
+    int mix[6] = { 0, 1, 1, 2, 0, 1 };
+    cache->src.getmany(&cache->src, 0, mix, 6);
+    int bad_mix = 0;
+    for (int j = 0; j < 6; j++) {
+        K3ExpertQ q;
+        if (cache->src.get(&cache->src, 0, mix[j], &q) != 0) { bad_mix++; continue; }
+        if (!same_expert(st, 0, mix[j], &q)) bad_mix++;
+    }
+    ck(bad_mix == 0, "pipeline: duplicate/resident ids in one batch", NULL);
+}
+
+/* (c) a batch bigger than the slot count. Reservation runs out of slots partway
+ * through, so getmany launches fewer reads than the batch asked for -- the
+ * remaining experts must still come back correct through get()'s own miss path,
+ * with nothing dropped overall. */
+static void pipeline_short_cache_case(K3St *st, const K3Cfg *cfg, int64_t expert_nbytes)
+{
+    K3Cache cache;
+    if (!init_grown(&cache, st, cfg, expert_nbytes)) {
+        ck(0, "pipeline: short cache init", NULL); return;
+    }
+
+    int n = cache.nslot + 4;               /* always more unique ids than slots */
+    if (n > cfg->n_experts) n = cfg->n_experts;
+    if (n > 16) n = 16;
+    int ids[16];
+    for (int i = 0; i < n; i++) ids[i] = i;
+    cache.src.getmany(&cache.src, 0, ids, n);
+    int bad = 0;
+    for (int i = 0; i < n; i++) {
+        K3ExpertQ q;
+        if (cache.src.get(&cache.src, 0, ids[i], &q) != 0) { bad++; continue; }
+        if (!same_expert(st, 0, ids[i], &q)) bad++;
+    }
+    char b[96];
+    snprintf(b, sizeof b, "%d slots, %d ids requested, %d wrong", cache.nslot, n, bad);
+    ck(bad == 0, "pipeline: oversized batch on a short cache, no drop", b);
+    k3_cache_free(&cache);
+}
+
+/* (d) k3_cache_free and k3_cache_reset_stats called right after getmany, before any
+ * get(), must drain the workers cleanly rather than race or hang. */
+static void pipeline_drain_case(K3St *st, const K3Cfg *cfg, int64_t expert_nbytes)
+{
+    K3Cache cache;
+    if (!init_grown(&cache, st, cfg, expert_nbytes)) {
+        ck(0, "pipeline: drain-on-reset cache init", NULL);
+    } else {
+        int ids[4] = { 0, 1, 2, 3 };
+        cache.src.getmany(&cache.src, 0, ids, 4);
+        k3_cache_reset_stats(&cache);          /* drains before touching a counter */
+        int bad = 0;
+        for (int i = 0; i < 4; i++) {
+            K3ExpertQ q;
+            if (cache.src.get(&cache.src, 0, ids[i], &q) != 0) { bad++; continue; }
+            if (!same_expert(st, 0, ids[i], &q)) bad++;
+        }
+        ck(bad == 0, "pipeline: reset_stats right after getmany drains clean", NULL);
+        k3_cache_free(&cache);
+    }
+
+    K3Cache cache2;
+    if (!init_grown(&cache2, st, cfg, expert_nbytes)) {
+        ck(0, "pipeline: drain-on-free cache init", NULL);
+    } else {
+        int ids[4] = { 4, 5, 6, 7 };
+        cache2.src.getmany(&cache2.src, 0, ids, 4);
+        k3_cache_free(&cache2);        /* reaching the next line is the assertion */
+        ck(1, "pipeline: free right after getmany drains clean", NULL);
+    }
+}
+
+/* One K3Cfg for the failed-read case, which builds its own K3St on a temp dir and so
+ * cannot simply reuse the caller's. */
+static K3Cfg *cfg_here(int NE)
+{
+    static K3Cfg cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.n_layers = 1; cfg.n_experts = NE; cfg.topk = 4;
+    return &cfg;
+}
+
+/* (e) an injected read failure: copy the fixture shard to a temp file and truncate
+ * it mid-way through the LAST expert's bytes (every expert is the same on-disk
+ * size, and they are laid out back-to-back in id order, so this shortens exactly
+ * one expert). That slot must come back empty and get() must fail for it alone. */
+static void pipeline_failed_read_case(const char *fixture_dir, int NE,
+                                      int64_t expert_nbytes)
+{
+    char tmpdir[512];
+    if (make_tmpdir(tmpdir, sizeof tmpdir) != 0) {
+        ck(0, "pipeline: failed-read tmpdir", "mkdtemp failed"); return;
+    }
+    char src[600], dst[600];
+    snprintf(src, sizeof src, "%s/model-00001-of-00001.safetensors", fixture_dir);
+    snprintf(dst, sizeof dst, "%s/model-00001-of-00001.safetensors", tmpdir);
+    if (copy_file(src, dst) != 0) {
+        ck(0, "pipeline: failed-read fixture copy", NULL); rmdir(tmpdir); return;
+    }
+
+    /* Open on the INTACT copy first: k3_st_open validates every tensor's declared
+     * span against the file size, so opening on an already-truncated file would be
+     * refused at open time rather than exercising a failed READ. Truncate only
+     * after the header is parsed and the fd is held open, the same order
+     * test_trunk.c uses for its own truncated-read case. */
+    K3St st;
+    if (k3_st_open(&st, tmpdir) != 0) {
+        ck(0, "pipeline: failed-read fixture open", NULL);
+        remove(dst); rmdir(tmpdir); return;
+    }
+
+    int wfd = open(dst, O_WRONLY);
+    if (wfd < 0) {
+        ck(0, "pipeline: failed-read open for truncate", NULL);
+        k3_st_close(&st); remove(dst); rmdir(tmpdir); return;
+    }
+    struct stat sb;
+    fstat(wfd, &sb);
+    const off_t cut = sb.st_size - (off_t)(expert_nbytes / 2);
+    const int trunc_ok = ftruncate(wfd, cut) == 0;
+    close(wfd);
+    if (!trunc_ok) {
+        ck(0, "pipeline: failed-read ftruncate", NULL);
+        k3_st_close(&st); remove(dst); rmdir(tmpdir); return;
+    }
+
+    K3Cache cache;
+    if (!init_grown(&cache, &st, cfg_here(NE), expert_nbytes)) {
+        ck(0, "pipeline: failed-read cache init", NULL);
+    } else {
+        const int bad_id = NE - 1;
+        const int good[3] = { 0, 1, 2 };
+        int ids[4] = { good[0], good[1], bad_id, good[2] };
+        cache.src.getmany(&cache.src, 0, ids, 4);
+
+        K3ExpertQ q;
+        ck(cache.src.get(&cache.src, 0, bad_id, &q) == -1,
+           "pipeline: short read leaves the slot empty", NULL);
+
+        int ok_others = 1;
+        for (int i = 0; i < 3; i++) {
+            K3ExpertQ q2;
+            if (cache.src.get(&cache.src, 0, good[i], &q2) != 0 ||
+                !same_expert(&st, 0, good[i], &q2))
+                ok_others = 0;
+        }
+        ck(ok_others, "pipeline: other experts in the batch still serve", NULL);
+        k3_cache_free(&cache);
+    }
+    k3_st_close(&st);
+    remove(dst);
+    rmdir(tmpdir);
+}
+
+static void run_pipeline_tests(const char *dir, int NE, const K3Cfg *cfg, int64_t nbytes)
+{
+    printf("\npipeline mode (K3_EXPERT_PIPELINE=1)\n\n");
+    set_env("K3_EXPERT_PIPELINE", "1");
+
+    K3St st;
+    if (k3_st_open(&st, dir) != 0) {
+        ck(0, "pipeline: reopen fixture", NULL);
+    } else {
+        K3Cache cache;
+        if (!init_grown(&cache, &st, cfg, nbytes)) {
+            ck(0, "pipeline: cache init", NULL);
+        } else {
+            ck(cache.pipeline != 0, "pipeline: cache.pipeline is set", NULL);
+            pipeline_batch_case(&st, &cache, NE, cfg->topk);
+            k3_cache_free(&cache);
+        }
+        pipeline_short_cache_case(&st, cfg, nbytes);
+        pipeline_drain_case(&st, cfg, nbytes);
+        k3_st_close(&st);
+    }
+
+    pipeline_failed_read_case(dir, NE, nbytes);
+
+    set_env("K3_EXPERT_PIPELINE", NULL);
 }
 
 int main(int argc, char **argv)
@@ -257,6 +548,9 @@ int main(int argc, char **argv)
         if (cache.src.get(&cache.src, 0, e, &q) || !same_expert(&st, 0, e, &q)) exact = 0;
     ck(exact, "oversized batch demand fallback exact", NULL);
     k3_cache_free(&cache);
+
+    run_pipeline_tests(dir, NE, &c, probe.nbytes);
+
     k3_st_close(&st);
     printf("\n%s\n", g_fail ? "CACHE TESTS FAILED" : "CACHE TESTS PASSED");
     return g_fail ? 1 : 0;

@@ -110,6 +110,28 @@ class OfflineCliTests(unittest.TestCase):
                     self.assert_same(self.run_cli(self.plain, args),
                                      self.run_cli(self.selective, args))
 
+    def test_expert_pipeline_matches_serial_batch(self):
+        # --expert-pipeline overlaps routed-expert reads with the MoE multiply (see
+        # docs/notes/expert-pipeline.md); it must not change a single generated id or
+        # logit. Cover both consumers of the batch path (full recompute, --incremental)
+        # and let the thread-pool size vary, including the single-worker fallback shape
+        # and the documented ceiling, since neither changes what gets served.
+        for mode in ([], ["--incremental"]):
+            for threads in ("1", "16"):
+                with self.subTest(mode=mode, threads=threads):
+                    args = ["--ids", "1,2,3", *mode]
+                    base = self.run_cli(self.plain, args)
+                    env = {**self.env, "K3_EXPERT_PIPELINE_THREADS": threads}
+                    piped = self.run_cli(self.plain, [*args, "--expert-pipeline"])
+                    self.assert_same(base, piped)
+                    old_env = self.env
+                    self.env = env
+                    try:
+                        piped_env = self.run_cli(self.plain, [*args, "--expert-pipeline"])
+                    finally:
+                        self.env = old_env
+                    self.assert_same(base, piped_env)
+
     def test_native_score_primitive_on_synthetic_logits(self):
         # Does not invoke the corpus harness or produce a K3 quality measurement.
         # Compare the new native score path to ordinary prefix logits of this toy.
