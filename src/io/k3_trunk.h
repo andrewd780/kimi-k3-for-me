@@ -99,6 +99,9 @@ typedef struct {
     /* One asynchronous reader owns one spare ring slot. The worker never publishes a
      * layer name before its read succeeds; bind waits for completion before consuming it. */
     void         *io_state;
+    void         *row_state;   /* opt-in bounded row pipeline, separate from layer ring */
+    int           read_error;  /* sticky: never emit output after a failed matrix read */
+    uint64_t      row_buffer_bytes, small_buffer_bytes, matrix_calls;
 
     /* stats */
     uint64_t     hits, misses;
@@ -109,6 +112,9 @@ typedef struct {
 /* budget_bytes sizes the slot array. Layers 0..K-1 are pinned, where K is as large as
  * the budget allows minus a small streaming ring. Returns 0 on success. */
 int  k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes);
+/* Exact row tiling: two buffers of at most 8 MiB each, plus current-layer vectors.
+ * No pinning and no cross-layer prefetch. Batched tokens can reread matrices. */
+int  k3_trunk_open_rows(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes);
 void k3_trunk_close(K3Trunk *tr);
 
 /* Make layer L resident and point b's weight pointers at it. b must already have been

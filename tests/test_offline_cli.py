@@ -132,6 +132,24 @@ class OfflineCliTests(unittest.TestCase):
                         self.env = old_env
                     self.assert_same(base, piped_env)
 
+    def test_trunk_rows_all_logits_and_bounded_buffers(self):
+        for trunk in (self.trunk, self.ztrunk):
+            for mode in ([], ["--incremental"], ["--incremental", "--kv-latent"]):
+                with self.subTest(trunk=trunk, mode=mode):
+                    args = ["--ids", "3,7,11", "--trunk", trunk, "--trunk-gb", "0.00005", *mode]
+                    baseline = self.run_cli(self.selective, args)
+                    rows = self.run_cli(self.selective, [*args, "--trunk-rows", "--expert-pipeline"])
+                    self.assert_same(baseline, rows)
+                    self.assertTrue(rows[0]["trunk_rows"])
+                    self.assertEqual(rows[0]["trunk_ring_slots"], 2)
+                    self.assertGreater(rows[0]["trunk_matrix_calls"], 0)
+                    self.assertLess(rows[0]["trunk_row_buffer_bytes"] +
+                                    rows[0]["trunk_small_buffer_bytes"], 50000)
+
+    def test_trunk_rows_invalid_mode_is_refused_before_loading(self):
+        result = self.run_cli("absent", ["--ids", "1", "--trunk-rows"], ok=False)
+        self.assertIn("--trunk-rows needs --trunk", result.stderr)
+
     def test_native_score_primitive_on_synthetic_logits(self):
         # Does not invoke the corpus harness or produce a K3 quality measurement.
         # Compare the new native score path to ordinary prefix logits of this toy.

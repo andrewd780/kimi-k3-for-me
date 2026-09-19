@@ -273,7 +273,15 @@ void k3_attn_res(float *out, const float *src, const float *fold,
  * never emitted directly and it carries no exactness contract, which is what lets it use
  * a fast, non-deterministic kernel. Each row is stored inline as [f32 scale][int8 * in],
  * so a matrix stays a single tagged pointer. Never tagged on the exact model. */
-enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2 };
+enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2, K3_WSTREAM = 3 };
+
+/* A streamed matrix owns no weight bytes. apply completes every output row before
+ * returning; its owner records I/O errors and the caller must check them before
+ * consuming a layer's output. Keeping this callback here avoids an I/O dependency
+ * in the arithmetic-only library and fixtures. */
+typedef struct K3WeightStream {
+    void (*apply)(const struct K3WeightStream *, float *, const float *, int, int);
+} K3WeightStream;
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
  * no table, no exponent rebias. */
@@ -297,6 +305,10 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
 {
     if (wdt == K3_WBF16)     k3_matmul_bf16(y, x, (const uint16_t *)W, in, out);
     else if (wdt == K3_WI8)  k3_matmul_q8(y, x, W, in, out);
+    else if (wdt == K3_WSTREAM) {
+        const K3WeightStream *stream = (const K3WeightStream *)W;
+        stream->apply(stream, y, x, in, out);
+    }
     else                     k3_matmul(y, x, (const float *)W, in, out);
 }
 
