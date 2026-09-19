@@ -40,10 +40,11 @@ int main(int argc, char **argv)
     fclose(f);
     K3HufTable table;
     if (k3_huf_build(&table, hdr + 28)) return 1;
+    uint32_t pairs[4096]; huf_pairs(pairs, &table);
     const uint8_t *lanes[4]; size_t off = single;
     for (int j = 0; j < 4; j++) { lanes[j] = data + off; off += len[j]; }
     const uint8_t *low = data + packed, *raw = low + low_bytes;
-    printf("{\"raw_bytes\":%u,\"table_bytes\":%zu,\"arms\":[", n, sizeof table);
+    printf("{\"raw_bytes\":%u,\"table_bytes\":%zu,\"arms\":[", n, sizeof table + sizeof pairs);
     for (int arm = 0; arm < 2; arm++) {
         printf("%s{\"name\":\"%s\",\"decoded_BF16_GBps_runs\":[", arm ? "," : "",
                arm ? "four_streams" : "shelved_single_stream");
@@ -52,7 +53,7 @@ int main(int argc, char **argv)
             unsigned rounds = 0;
             double elapsed;
             do {
-                const int rc = arm ? huf4_decode(&table, lanes, len, low, out, n)
+                const int rc = arm ? huf4_decode(&table, pairs, lanes, len, low, out, n)
                     : k3_huf_decode_stripe(&table, data, single, low, (uint32_t)low_bytes, out, n);
                 if (rc) return 1;
                 rounds++;

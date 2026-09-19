@@ -10,7 +10,7 @@ typedef struct {
     unsigned held;
 } HufReader;
 
-static inline int huf_symbol(HufReader *r, const K3HufTable *t)
+static inline void huf_refill(HufReader *r)
 {
     if (r->held < 12) {
         if ((size_t)(r->end - r->p) >= 4) {
@@ -27,16 +27,55 @@ static inline int huf_symbol(HufReader *r, const K3HufTable *t)
             }
         }
     }
-    const unsigned at = r->held >= 12
+}
+
+static inline unsigned huf_index(const HufReader *r)
+{
+    return r->held >= 12
         ? (unsigned)(r->bits >> (r->held - 12)) & 4095u
         : (unsigned)(r->bits << (12 - r->held)) & 4095u;
+}
+
+static inline int huf_symbol(HufReader *r, const K3HufTable *t)
+{
+    huf_refill(r);
+    const unsigned at = huf_index(r);
     const unsigned value = t->sym_len[at], n = value & 15u;
     if (!n || n > r->held) return -1;
     r->held -= n;
     return (int)(value >> 4);
 }
 
-static int huf4_decode(const K3HufTable *table, const uint8_t *src[4],
+/* A 12-bit prefix holds TWO symbols only when their combined code length fits.
+ * Otherwise it holds one. Count and consumed bits are stored explicitly; neither
+ * the stream layout nor the symbol count is guessed from output capacity. */
+static void huf_pairs(uint32_t pairs[4096], const K3HufTable *table)
+{
+    for (unsigned i = 0; i < 4096; i++) {
+        const unsigned a = table->sym_len[i], na = a & 15u;
+        if (!na) { pairs[i] = 0; continue; }
+        const unsigned b = table->sym_len[(i << na) & 4095u], nb = b & 15u;
+        pairs[i] = (a >> 4) | (na << 16);
+        if (nb && na + nb <= 12)
+            pairs[i] = (a >> 4) | ((b >> 4) << 8) | ((na + nb) << 16) | (1u << 20);
+    }
+}
+
+static inline int huf_pair(HufReader *r, const uint32_t *pairs,
+                           uint8_t *out, size_t *pos)
+{
+    huf_refill(r);
+    const uint32_t entry = pairs[huf_index(r)];
+    const unsigned bits = (entry >> 16) & 15u, two = entry >> 20;
+    if (!bits || bits > r->held) return -1;
+    r->held -= bits;
+    out[2 * *pos + 1] = (uint8_t)entry;
+    if (two) out[2 * *pos + 9] = (uint8_t)(entry >> 8);
+    *pos += 4u * (1u + two);
+    return 0;
+}
+
+static int huf4_decode(const K3HufTable *table, const uint32_t pairs[4096], const uint8_t *src[4],
                        const size_t len[4], const uint8_t *low, uint8_t *out, size_t n)
 {
     HufReader r[4];
@@ -45,24 +84,23 @@ static int huf4_decode(const K3HufTable *table, const uint8_t *src[4],
         r[lane].bits = 0; r[lane].held = 0;
     }
     const size_t symbols = n / 2;
-    size_t i = 0;
-    for (; i + 3 < symbols; i += 4) {
-        const int a = huf_symbol(&r[0], table);
-        const int b = huf_symbol(&r[1], table);
-        const int c = huf_symbol(&r[2], table);
-        const int d = huf_symbol(&r[3], table);
+    size_t p0 = 0, p1 = 1, p2 = 2, p3 = 3;
+    while (p0 + 4 < symbols && p1 + 4 < symbols && p2 + 4 < symbols && p3 + 4 < symbols) {
+        const int a = huf_pair(&r[0], pairs, out, &p0);
+        const int b = huf_pair(&r[1], pairs, out, &p1);
+        const int c = huf_pair(&r[2], pairs, out, &p2);
+        const int d = huf_pair(&r[3], pairs, out, &p3);
         if ((a | b | c | d) < 0) return -1;
-        out[2*i] = low[i]; out[2*i+1] = (uint8_t)a;
-        out[2*i+2] = low[i+1]; out[2*i+3] = (uint8_t)b;
-        out[2*i+4] = low[i+2]; out[2*i+5] = (uint8_t)c;
-        out[2*i+6] = low[i+3]; out[2*i+7] = (uint8_t)d;
     }
-    for (; i < symbols; i++) {
-        const int value = huf_symbol(&r[i % 4], table);
-        if (value < 0) return -1;
-        out[2*i] = low[i]; out[2*i+1] = (uint8_t)value;
+    const size_t positions[4] = {p0, p1, p2, p3};
+    for (int lane = 0; lane < 4; lane++) {
+        for (size_t i = positions[lane]; i < symbols; i += 4) {
+            const int value = huf_symbol(&r[lane], table);
+            if (value < 0) return -1;
+            out[2*i+1] = (uint8_t)value;
+        }
     }
-    if (n % 2) out[n-1] = low[n/2];
+    for (size_t i = 0; i < (n + 1)/2; i++) out[2*i] = low[i];
     /* Accept only the encoder's zero bit padding, no trailing bytes. */
     for (int lane = 0; lane < 4; lane++) {
         if (r[lane].p != r[lane].end || r[lane].held > 7 ||
