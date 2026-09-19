@@ -49,12 +49,19 @@
 #define KDA_HEADS   2
 #define KDA_HEAD_DIM 4    /* A_log ships 4 elements, engine takes first 2 */
 #define CONV_K      2
+#ifdef K3_TEST_ROWS_ONLY
+#define DENSE_INTER 257       /* ragged rows across multiple 4 KiB tiles */
+#define N_LAYERS    93
+#define FIXTURE_RUN_BYTES 32768
+#else
 #define DENSE_INTER 16
+#define N_LAYERS    3
+#define FIXTURE_RUN_BYTES 4096
+#endif
 #define N_EXPERTS   1
 #define LATENT      4
 #define N_SHARED    1
 #define MOE_INTER   8
-#define N_LAYERS    3
 
 static int g_fail = 0;
 
@@ -281,25 +288,23 @@ static int gen_fixture(const char *dir)
     FILE *f = fopen(path, "wb");
     if (!f) { perror("trunk.bin"); return -1; }
 
-    unsigned char buf[4096];
+    unsigned char buf[FIXTURE_RUN_BYTES];
     int64_t file_off = 0;
     int nlayers = N_LAYERS;
-    int is_dense[] = {1, 0, 0};
-    int is_mla[]   = {0, 0, 1};
 
     for (int L = 0; L < nlayers; L++) {
         memset(buf, 0, sizeof buf);
         int ti = 0;
-        int nw = gen_layer_run(buf, L, is_dense[L], is_mla[L], &ti);
-        if (nw <= 0 || nw > 4096) { fclose(f); return -1; }
+        int nw = gen_layer_run(buf, L, L == 0, L % 3 == 2, &ti);
+        if (nw <= 0 || nw > FIXTURE_RUN_BYTES) { fclose(f); return -1; }
         /* Write the full 4096-byte slot: raw[L] valid bytes + zero tail. */
         size_t wrote = 0;
-        while (wrote < 4096) {
-            size_t chunk = fwrite(buf + wrote, 1, 4096 - wrote, f);
+        while (wrote < FIXTURE_RUN_BYTES) {
+            size_t chunk = fwrite(buf + wrote, 1, FIXTURE_RUN_BYTES - wrote, f);
             if (chunk == 0) { fclose(f); return -1; }
             wrote += chunk;
         }
-        file_off += 4096;
+        file_off += FIXTURE_RUN_BYTES;
     }
     fclose(f);
 
@@ -313,10 +318,10 @@ static int gen_fixture(const char *dir)
     for (int L = 0; L < nlayers; L++) {
         fprintf(jf, "    {\n      \"layer\": %d,\n      \"file_off\": %lld,"
                       "\n      \"nbytes\": %lld,\n      \"tensors\": {\n",
-                L, (long long)file_off, (long long)4096);
+                L, (long long)file_off, (long long)FIXTURE_RUN_BYTES);
 
         TensorDef defs[36];
-        int nd = layer_tensor_defs(defs, 36, is_dense[L], is_mla[L]);
+        int nd = layer_tensor_defs(defs, 36, L == 0, L % 3 == 2);
 
         int64_t off = 0;
         for (int t = 0; t < nd; t++) {
@@ -332,7 +337,7 @@ static int gen_fixture(const char *dir)
 
         fprintf(jf, "      }\n    }%s\n",
                 L + 1 < nlayers ? "," : "");
-        file_off += 4096;
+        file_off += FIXTURE_RUN_BYTES;
     }
     fprintf(jf, "  ]\n}\n");
     fclose(jf);
@@ -534,6 +539,60 @@ static int test_truncated(const char *dir, const K3Cfg *c)
     return 0;
 }
 
+static int test_rows(const char *dir, const K3Cfg *c)
+{
+    K3Trunk tr, resident;
+    if (k3_trunk_open_rows(&tr, dir, c, 32768)) return 1;
+    if (k3_trunk_open(&resident, dir, c, 2 * FIXTURE_RUN_BYTES + 32768)) {
+        k3_trunk_close(&tr); return 1;
+    }
+    ck(tr.row_buffer_bytes + tr.small_buffer_bytes < 32768,
+       "rows: bounded two-buffer arena", "metadata also charged at allocation");
+    int same = 1;
+    for (int walk = 0; walk < 2; walk++) {
+        for (int L = 0; L < N_LAYERS; L++) {
+            K3LayerBind a, b;
+            if (k3_trunk_bind(&tr, c, L, &a) || k3_trunk_bind(&resident, c, L, &b)) {
+                same = 0; break;
+            }
+            float x[DENSE_INTER > HIDDEN ? DENSE_INTER : HIDDEN];
+            float got[DENSE_INTER > HIDDEN ? DENSE_INTER : HIDDEN];
+            float want[DENSE_INTER > HIDDEN ? DENSE_INTER : HIDDEN];
+            for (size_t i = 0; i < sizeof x / sizeof *x; i++) x[i] = (float)((int)i % 7 - 3) / 8;
+            if (L == 0) {
+                k3_mmw(got, x, a.lay.dense_gate, a.lay.wdt, HIDDEN, DENSE_INTER);
+                k3_mmw(want, x, b.lay.dense_gate, b.lay.wdt, HIDDEN, DENSE_INTER);
+                if (memcmp(got, want, sizeof(float) * DENSE_INTER)) same = 0;
+                k3_mmw(got, x, a.lay.dense_down, a.lay.wdt, DENSE_INTER, HIDDEN);
+                k3_mmw(want, x, b.lay.dense_down, b.lay.wdt, DENSE_INTER, HIDDEN);
+                if (memcmp(got, want, sizeof(float) * HIDDEN)) same = 0;
+            } else {
+                k3_mmw(got, x, a.moe.up, a.moe.wdt, LATENT, HIDDEN);
+                k3_mmw(want, x, b.moe.up, b.moe.wdt, LATENT, HIDDEN);
+                if (memcmp(got, want, sizeof(float) * HIDDEN)) same = 0;
+            }
+            if (memcmp(a.lay.in_norm, b.lay.in_norm, HIDDEN * sizeof(float))) same = 0;
+            if (tr.read_error) same = 0;
+            k3_trunk_prefetch(&tr, (L + 1) % N_LAYERS); /* must not race row reads */
+        }
+    }
+    ck(same, "rows: two full walks, exact matrices", "including final -> first layer and ragged row tiles");
+    k3_trunk_close(&resident);
+    K3LayerBind b;
+    if (k3_trunk_bind(&tr, c, 0, &b)) { k3_trunk_close(&tr); return 1; }
+    char path[1024]; snprintf(path, sizeof path, "%s/trunk.bin", dir);
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) { k3_trunk_close(&tr); return 1; }
+    const int rc = ftruncate(fd, 0); close(fd);
+    float x[HIDDEN] = {0}, y[DENSE_INTER];
+    k3_mmw(y, x, b.lay.dense_gate, b.lay.wdt, HIDDEN, DENSE_INTER);
+    ck(rc == 0 && tr.read_error, "rows: failed read is sticky", "no partial layer may be emitted");
+    ck(k3_trunk_bind(&tr, c, 1, &b) != 0, "rows: failure refuses next layer", "");
+    k3_trunk_close(&tr);
+    ck(k3_trunk_open_rows(&tr, dir, c, 1) != 0, "rows: insufficient budget refused", "");
+    return 0;
+}
+
 int main(void)
 {
     /* Construct a minimal K3Cfg matching the fixture dimensions. */
@@ -567,8 +626,9 @@ int main(void)
     c.situ_b1      = 4.0f;
     c.situ_b2      = 25.0f;
     /* Layer map: one-based MLA indices. 3 means layer 2 is MLA. */
-    static int fa[128] = {3};
-    c.n_full_attn  = 1;
+    static int fa[128];
+    c.n_full_attn = N_LAYERS / 3;
+    for (int i = 0; i < c.n_full_attn; i++) fa[i] = (i + 1) * 3;
     c.full_attn    = fa;
 
     /* Create a temp directory for the fixture. mkdtemp() and /tmp are both POSIX
@@ -608,11 +668,11 @@ int main(void)
            (double)(3 * 4096) / 1024.0);
 
     /* §1 one-slot budget */
-    if (test_one_slot(tmpdir, &c) != 0) g_fail++;
+    if (N_LAYERS == 3 && test_one_slot(tmpdir, &c) != 0) g_fail++;
     printf("\n");
 
     /* §2 two-slot budget (isolation + ring-wrap) */
-    if (test_two_slot(tmpdir, &c) != 0) g_fail++;
+    if (N_LAYERS == 3 && test_two_slot(tmpdir, &c) != 0) g_fail++;
     printf("\n");
 
     /* §3 truncated read (fresh open) */
@@ -620,8 +680,9 @@ int main(void)
     if (gen_fixture(tmpdir) != 0) {
         fprintf(stderr, "FAILED to re-generate fixture\n"); g_fail++;
     } else {
-        if (test_truncated(tmpdir, &c) != 0) g_fail++;
+        if (N_LAYERS == 3 && test_truncated(tmpdir, &c) != 0) g_fail++;
     }
+    if (gen_fixture(tmpdir) || test_rows(tmpdir, &c)) g_fail++;
 
     /* Clean up temp files */
     {

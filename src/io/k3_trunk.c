@@ -6,6 +6,7 @@
 #include "k3_portable_io.h"   /* first: sets _DARWIN_C_SOURCE before any libc header */
 
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +71,17 @@ static int dt_of(const char *s)
     return K3_DT_UNKNOWN;
 }
 
+static int json_size(jval *object, const char *key, int64_t *out)
+{
+    jval *value = json_get(object, key);
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        value->num < 0 || value->num >= 9223372036854775808.0) return -1;
+    const int64_t n = (int64_t)value->num;
+    if ((double)n != value->num) return -1;
+    *out = n;
+    return 0;
+}
+
 static char *slurp(const char *p, size_t *n)
 {
     FILE *f = fopen(p, "rb");
@@ -81,6 +93,16 @@ static char *slurp(const char *p, size_t *n)
     b[sz] = 0; fclose(f);
     if (n) *n = (size_t)sz;
     return b;
+}
+
+static void trunk_json_free(jval *v)
+{
+    if (!v) return;
+    for (int i = 0; i < v->len; i++) {
+        trunk_json_free(v->kids[i]);
+        if (v->keys) free(v->keys[i]);
+    }
+    free(v->kids); free(v->keys); free(v->str); free(v);
 }
 
 /* Resolver handed to k3_bind_layer_mem: linear over one layer's ~28 tensors, which is
@@ -99,7 +121,222 @@ static int find_in_layer(void *ctx, const char *name,
     return -1;
 }
 
-int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes)
+/* Row buffers never escape apply(). The reader writes only the spare buffer while
+ * the existing matmul consumes the other one, then a condition-variable handoff
+ * publishes completed bytes. A layer change and the 92 -> 0 seam therefore have
+ * no outstanding reads or live matrix pointers to drain. */
+typedef struct K3Rows K3Rows;
+typedef struct {
+    K3WeightStream stream;       /* first: dispatched by k3_mmw */
+    K3Rows *owner;
+    int64_t off, nbytes;
+    int dtype;
+} K3RowMatrix;
+
+struct K3Rows {
+    K3Trunk *tr;
+    pthread_t thread;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int started, stop, busy, result, job_slot;
+    int64_t job_off;
+    size_t job_len, payload, cap, small_cap, small_used;
+    unsigned char *buf[2], *small;
+    K3RowMatrix matrix[64];
+    int count, layer;
+};
+
+/* Offset, length and destination must all be aligned for O_DIRECT. Each slot has
+ * two extra pages; row starts need not be page aligned. Padding stays inside the
+ * packed layer's aligned run. Count actual requested bytes, including padding. */
+static int rows_read(K3Rows *r, int slot, int64_t off, size_t len)
+{
+    if (off < 0 || len > r->payload) return -1;
+    const size_t prefix = r->tr->direct ? (size_t)(off % K3_TRUNK_ALIGN) : 0;
+    const int64_t base = off - (int64_t)prefix;
+    size_t want = len + prefix;
+    if (r->tr->direct) want = (want + K3_TRUNK_ALIGN - 1) & ~(size_t)(K3_TRUNK_ALIGN - 1);
+    if (want > r->cap) return -1;
+    size_t got = 0;
+    const double start = now_s();
+    while (got < want) {
+        const int64_t n = r->tr->zfile
+            ? k3_zread(r->tr->zfile, r->buf[slot] + got, (int64_t)(want - got), base + (int64_t)got)
+            : pread(r->tr->fd, r->buf[slot] + got, want - got, (off_t)(base + (int64_t)got));
+        if (n < 0 && errno == EINTR && !r->tr->zfile) continue;
+        if (n <= 0) return -1;
+        got += (size_t)n;
+        if (r->tr->direct && got < want && got % K3_TRUNK_ALIGN) return -1;
+    }
+    r->tr->load_seconds += now_s() - start;
+    r->tr->bytes_read += got;
+    return 0;
+}
+
+static void *rows_worker(void *arg)
+{
+    K3Rows *r = (K3Rows *)arg;
+    pthread_mutex_lock(&r->mu);
+    for (;;) {
+        while (!r->busy && !r->stop) pthread_cond_wait(&r->cv, &r->mu);
+        if (r->stop) break;
+        pthread_mutex_unlock(&r->mu);
+        const int rc = rows_read(r, r->job_slot, r->job_off, r->job_len);
+        pthread_mutex_lock(&r->mu);
+        r->result = rc;
+        r->busy = 0;
+        pthread_cond_broadcast(&r->cv);
+    }
+    pthread_mutex_unlock(&r->mu);
+    return NULL;
+}
+
+static void rows_submit(K3Rows *r, int slot, int64_t off, size_t len)
+{
+    pthread_mutex_lock(&r->mu);
+    r->job_slot = slot; r->job_off = off; r->job_len = len;
+    r->busy = 1;
+    pthread_cond_signal(&r->cv);
+    pthread_mutex_unlock(&r->mu);
+}
+
+static int rows_wait(K3Rows *r)
+{
+    pthread_mutex_lock(&r->mu);
+    while (r->busy) pthread_cond_wait(&r->cv, &r->mu);
+    const int result = r->result;
+    pthread_mutex_unlock(&r->mu);
+    return result;
+}
+
+static void rows_apply(const K3WeightStream *stream, float *y, const float *x, int in, int out)
+{
+    const K3RowMatrix *m = (const K3RowMatrix *)stream;
+    K3Rows *r = m->owner;
+    const size_t esz = m->dtype == K3_DT_BF16 ? 2u : 4u;
+    if (in <= 0 || out <= 0 || (uint64_t)in * (uint64_t)out > INT64_MAX / esz ||
+        (int64_t)((uint64_t)in * (uint64_t)out * esz) != m->nbytes) goto failed;
+    const size_t row = (size_t)in * esz;
+    if (r->tr->read_error || row > r->payload) goto failed;
+    const size_t per = r->payload / row;
+    r->tr->matrix_calls++;
+    int first = 0, slot = 0;
+    size_t count = (size_t)out < per ? (size_t)out : per;
+    rows_submit(r, slot, m->off, count * row);
+    while (first < out) {
+        if (rows_wait(r)) goto failed;
+        const int next = first + (int)count;
+        const size_t nnext = (size_t)(out - next) < per ? (size_t)(out - next) : per;
+        if (nnext) rows_submit(r, 1 - slot, m->off + (int64_t)next * (int64_t)row, nnext * row);
+        const int64_t off = m->off + (int64_t)first * (int64_t)row;
+        const size_t prefix = r->tr->direct ? (size_t)(off % K3_TRUNK_ALIGN) : 0;
+        const void *weight = r->buf[slot] + prefix;
+        k3_mmw(y + first, x, weight, m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32,
+               in, (int)count);
+        first = next; count = nnext; slot = 1 - slot;
+    }
+    return;
+failed:
+    r->tr->read_error = 1;
+    if (out > 0) memset(y, 0, (size_t)out * sizeof(float));
+}
+
+static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
+                        int64_t take, int narrow, const void **dest)
+{
+    K3Rows *r = (K3Rows *)ctx;
+    off += r->tr->lay[r->layer].file_off;
+    if (narrow) {
+        if (r->count == 64) return -1;
+        K3RowMatrix *m = &r->matrix[r->count++];
+        m->stream.apply = rows_apply; m->owner = r;
+        m->off = off; m->nbytes = nb; m->dtype = dt;
+        *dest = m;
+        return 0;
+    }
+    const size_t start = (r->small_used + 7u) & ~(size_t)7u;
+    if ((uint64_t)take > SIZE_MAX / 4 || start > r->small_cap ||
+        (size_t)take * 4 > r->small_cap - start) return -1;
+    const size_t esz = dt == K3_DT_BF16 ? 2u : 4u;
+    size_t done = 0;
+    float *dst = (float *)(r->small + start);
+    while (done < (size_t)take) {
+        size_t count = (size_t)take - done;
+        if (count > r->payload / esz) count = r->payload / esz;
+        const int64_t at = off + (int64_t)(done * esz);
+        if (rows_read(r, 0, at, count * esz)) return -1;
+        const size_t prefix = r->tr->direct ? (size_t)(at % K3_TRUNK_ALIGN) : 0;
+        if (dt == K3_DT_F32) memcpy(dst + done, r->buf[0] + prefix, count * 4);
+        else {
+            const uint16_t *sp = (const uint16_t *)(r->buf[0] + prefix);
+            for (size_t j = 0; j < count; j++) dst[done + j] = k3_bf16f(sp[j]);
+        }
+        done += count;
+    }
+    *dest = dst; r->small_used = start + (size_t)take * 4;
+    return 0;
+}
+
+static void rows_close(K3Rows *r)
+{
+    if (!r) return;
+    if (r->started) {
+        pthread_mutex_lock(&r->mu); r->stop = 1;
+        pthread_cond_signal(&r->cv); pthread_mutex_unlock(&r->mu);
+        pthread_join(r->thread, NULL);
+        pthread_cond_destroy(&r->cv); pthread_mutex_destroy(&r->mu);
+    }
+    k3_aligned_free(r->buf[0]); k3_aligned_free(r->buf[1]);
+    free(r->small); free(r);
+}
+
+static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
+{
+    K3Rows *r = (K3Rows *)calloc(1, sizeof *r);
+    if (!r) return -1;
+    r->tr = tr;
+    for (int L = 0; L < tr->n_layers; L++) {
+        Finder f = { &tr->lay[L] }; K3MemSrc src = { find_in_layer, &f };
+        K3LayerBind tmp; size_t small = 0;
+        if (k3_bind_layer_stream(c, L, &tmp, &src, NULL, NULL, &small)) goto bad;
+        if (small > r->small_cap) r->small_cap = small;
+    }
+    const uint64_t fixed = r->small_cap + sizeof *r;
+    if (budget <= 0 || (uint64_t)budget < fixed + 6u * K3_TRUNK_ALIGN) goto bad;
+    r->cap = (size_t)(((uint64_t)budget - fixed) / 2);
+    if (r->cap > (8u << 20) + 2u * K3_TRUNK_ALIGN) r->cap = (8u << 20) + 2u * K3_TRUNK_ALIGN;
+    r->cap &= ~(size_t)(K3_TRUNK_ALIGN - 1);
+    r->payload = r->cap - 2u * K3_TRUNK_ALIGN;
+    const int64_t cols[] = {c->hidden, c->dense_inter, c->q_lora, c->kv_lora,
+        (int64_t)c->n_heads * c->v_head, (int64_t)c->kda_heads * c->kda_head_dim,
+        (int64_t)c->moe_inter * c->n_shared, c->latent, c->kda_head_dim};
+    for (size_t i = 0; i < sizeof cols / sizeof *cols; i++) {
+        /* Conservatively allow F32 matrices too; reject an undersized row buffer
+         * during opening, before any forward pass can start. */
+        if (cols[i] < 0 || (uint64_t)cols[i] > r->payload / 4) goto bad;
+    }
+    r->small = (unsigned char *)malloc(r->small_cap ? r->small_cap : 1);
+    if (!r->small || posix_memalign((void **)&r->buf[0], K3_TRUNK_ALIGN, r->cap) ||
+        posix_memalign((void **)&r->buf[1], K3_TRUNK_ALIGN, r->cap)) goto bad;
+    if (pthread_mutex_init(&r->mu, NULL)) goto bad;
+    if (pthread_cond_init(&r->cv, NULL)) { pthread_mutex_destroy(&r->mu); goto bad; }
+    if (pthread_create(&r->thread, NULL, rows_worker, r)) {
+        pthread_cond_destroy(&r->cv); pthread_mutex_destroy(&r->mu); goto bad;
+    }
+    r->started = 1; tr->row_state = r;
+    tr->nslot = 2; tr->slot_bytes = (int64_t)r->cap;
+    tr->row_buffer_bytes = 2 * r->cap;
+    tr->small_buffer_bytes = r->small_cap;
+    printf("trunk: row pipeline, two %zu-byte buffers + %zu-byte current-layer vectors\n",
+           r->cap, r->small_cap);
+    return 0;
+bad:
+    fprintf(stderr, "k3_trunk: row pipeline metadata, allocation or budget failed\n");
+    rows_close(r);
+    return -1;
+}
+
+static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes, int rows)
 {
     memset(tr, 0, sizeof *tr);
     /* memset leaves fd == 0, which is stdin. Every failure path below returns without
@@ -117,11 +354,13 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
     tr->json_arena = arena;
+    tr->json_root = root;
     if (!root) { fprintf(stderr, "k3_trunk: %s is not valid JSON\n", p); free(txt); return -1; }
 
     jval *jl = json_get(root, "layers");
     if (!jl || jl->t != J_ARR) { fprintf(stderr, "k3_trunk: no layers array\n"); goto bad; }
     tr->n_layers = jl->len;
+    if (tr->n_layers <= 0 || tr->n_layers > c->n_layers) goto bad;
     tr->lay = (K3TrunkLayer *)calloc((size_t)tr->n_layers, sizeof(K3TrunkLayer));
     if (!tr->lay) goto bad;
 
@@ -129,8 +368,8 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         jval *e = jl->kids[i];
         jval *v;
         K3TrunkLayer *L = &tr->lay[i];
-        if ((v = json_get(e, "file_off")) && v->t == J_NUM) L->file_off = (int64_t)v->num;
-        if ((v = json_get(e, "nbytes"))   && v->t == J_NUM) L->nbytes   = (int64_t)v->num;
+        if (json_size(e, "file_off", &L->file_off) || json_size(e, "nbytes", &L->nbytes)) goto bad;
+        if (L->file_off < 0 || L->nbytes <= 0 || L->file_off > INT64_MAX - L->nbytes) goto bad;
         jval *ts = json_get(e, "tensors");
         if (!ts || ts->t != J_OBJ) { fprintf(stderr, "k3_trunk: layer %d has no tensors\n", i); goto bad; }
         L->nt = ts->len;
@@ -141,9 +380,12 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
             /* keys live in the parser arena, which is kept for the process lifetime */
             t->name = ts->keys[k];
             jval *o = ts->kids[k];
-            if ((v = json_get(o, "off"))    && v->t == J_NUM) t->off    = (int64_t)v->num;
-            if ((v = json_get(o, "nbytes")) && v->t == J_NUM) t->nbytes = (int64_t)v->num;
+            if (json_size(o, "off", &t->off) || json_size(o, "nbytes", &t->nbytes)) goto bad;
             if ((v = json_get(o, "dtype"))  && v->t == J_STR) t->dtype  = dt_of(v->str);
+            if (t->off < 0 || t->nbytes <= 0 || t->off > L->nbytes ||
+                t->nbytes > L->nbytes - t->off ||
+                (t->dtype == K3_DT_F32 && t->off % 4) ||
+                (t->dtype == K3_DT_BF16 && t->off % 2)) goto bad;
         }
     }
     free(txt);                      /* arena holds the strings; txt itself is done */
@@ -198,6 +440,7 @@ int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_b
         }
     }
 
+    if (rows) return rows_open(tr, c, budget_bytes);
     const size_t widen = k3_bind_widen_bytes(c);
     int64_t total = 0;
     for (int i = 0; i < tr->n_layers; i++) total += tr->lay[i].nbytes;
@@ -348,8 +591,23 @@ bad:
     return -1;
 }
 
+int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget)
+{
+    const int result = trunk_open(tr, dir, c, budget, 0);
+    if (result) k3_trunk_close(tr);
+    return result;
+}
+
+int k3_trunk_open_rows(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget)
+{
+    const int result = trunk_open(tr, dir, c, budget, 1);
+    if (result) k3_trunk_close(tr);
+    return result;
+}
+
 void k3_trunk_close(K3Trunk *tr)
 {
+    rows_close((K3Rows *)tr->row_state);
     K3TrunkIO *io = (K3TrunkIO *)tr->io_state;
     if (io) {
         pthread_mutex_lock(&io->mu);
@@ -366,7 +624,8 @@ void k3_trunk_close(K3Trunk *tr)
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) k3_aligned_free(tr->pin[i]); free(tr->pin); }
     k3_aligned_free(tr->arena); free(tr->layer_of); free(tr->slot_of);
     if (tr->lay) { for (int i = 0; i < tr->n_layers; i++) free(tr->lay[i].t); free(tr->lay); }
-    free(tr->json_arena);   /* every K3TrunkTensor.name points into this */
+    trunk_json_free((jval *)tr->json_root);
+    free(tr->json_arena);
     memset(tr, 0, sizeof *tr);
     tr->fd = -1;            /* see k3_trunk_open: 0 is stdin, not "closed" */
 }
@@ -419,12 +678,11 @@ static int load_run(K3Trunk *tr, int L, unsigned char *dst)
     const double t0 = now_s();
     const int64_t nb = lay->nbytes;
     const int nchunk = (int)((nb + K3_TRUNK_CHUNK - 1) / K3_TRUNK_CHUNK);
-    volatile int failed = 0;
+    int failed = 0;
 #ifdef _OPENMP
-#   pragma omp parallel for schedule(dynamic, 1)
+#   pragma omp parallel for schedule(dynamic, 1) reduction(|:failed)
 #endif
     for (int ci = 0; ci < nchunk; ci++) {
-        if (failed) continue;
         const int64_t base = (int64_t)ci * K3_TRUNK_CHUNK;
         const int64_t len = (nb - base < K3_TRUNK_CHUNK) ? nb - base : K3_TRUNK_CHUNK;
         int64_t got = 0;
@@ -498,6 +756,14 @@ static int trunk_io_wait(K3Trunk *tr, int L)
 int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
 {
     if (L < 0 || L >= tr->n_layers) return -1;
+    if (tr->row_state) {
+        K3Rows *r = (K3Rows *)tr->row_state;
+        if (tr->read_error || rows_wait(r)) return -1;
+        r->small_used = 0; r->count = 0; r->layer = L;
+        Finder f = { &tr->lay[L] }; K3MemSrc src = { find_in_layer, &f };
+        tr->misses++;
+        return k3_bind_layer_stream(c, L, b, &src, rows_acquire, r, NULL);
+    }
     const double t_bind0 = now_s();
     k3_trunk_binds++;
     unsigned char *base;
@@ -552,6 +818,7 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
 
 void k3_trunk_prefetch(K3Trunk *tr, int L)
 {
+    if (tr->row_state) return;   /* rows_apply owns the reader and both buffers */
     if (L < 0 || L >= tr->n_layers || L < tr->npin) return;
     for (int i = 0; i < tr->nslot; i++) if (tr->layer_of[i] == L) return;
 

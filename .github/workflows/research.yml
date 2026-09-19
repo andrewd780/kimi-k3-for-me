@@ -1,0 +1,98 @@
+name: Research gates
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  submission:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare bounded raw-syscall submission with blocking reads
+        env:
+          OMP_WAIT_POLICY: PASSIVE
+        run: |
+          cc -O3 -std=gnu99 -Wall -Wextra -Werror -fopenmp benchmarks/bench_uring.c -o bench-uring
+          ./bench-uring > uring.json
+          cat uring.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uring-submission
+          path: uring.json
+
+  decoder:
+    name: Compact decoder (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Independent decoding and corruption checks
+        run: |
+          cc -O1 -g -std=c99 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            tests/unit/test_huf4.c -o test-huf4
+          ./test-huf4
+      - name: Three kernel runs per arm on explicit synthetic bytes
+        run: |
+          cc -O3 -std=c99 -Wall -Wextra -Werror benchmarks/bench_huf4.c -o bench-huf4
+          python3 tools/bench_huf4.py --binary ./bench-huf4 --out huf4.json
+      - name: Three runs per arm on the same four pinned K3 ranges (4 MiB total)
+        run: python3 tools/bench_huf4.py --binary ./bench-huf4 --sample-k3 --out huf4-k3.json
+      - name: Preserve complete timings and input identity
+        uses: actions/upload-artifact@v4
+        with:
+          name: huf4-${{ matrix.os }}
+          path: |
+            huf4.json
+            huf4-k3.json
+
+  routing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install numpy==2.3.5
+      - name: Separable routes, permuted held-out labels and replay leakage
+        run: |
+          python3 -m unittest discover -s tests -p test_routing_probe.py -v
+          python3 -m unittest discover -s tests -p test_lookahead_gate.py -v
+
+  row-lifetimes:
+    name: Row pipeline lifetimes (${{ matrix.sanitizer }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [thread, 'address,undefined']
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure address space for ThreadSanitizer
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Compile 93-layer fixture (no OpenMP runtime)
+        env:
+          SANITIZER: ${{ matrix.sanitizer }}
+        run: |
+          cc -O1 -g -std=gnu99 -Wall -Wextra -Werror -ffp-contract=off \
+            -DK3_TEST_ROWS_ONLY -fsanitize="$SANITIZER" -fno-omit-frame-pointer -no-pie \
+            -Iinclude -Iinclude/k3 -Isrc/model -Isrc/io -Ithird_party \
+            tests/unit/test_trunk.c src/io/k3_trunk.c src/io/k3_st.c \
+            src/model/k3_bind.c src/core/k3_ops.c -pthread -lm -o test-row-lifetimes
+      - name: Check two complete 93-layer walks, row tails and failed reads
+        run: ./test-row-lifetimes

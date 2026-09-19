@@ -378,6 +378,8 @@ static void usage(FILE *f)
 "  --list-presets        show each preset's split and expected speed\n"
 "  --trunk DIR           packed trunk directory; enables streaming (see scripts/)\n"
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
+"  --trunk-rows          exact double-buffered matrix rows; needs --trunk\n"
+"                        bounded buffers, no pins; batched prompts reread matrices\n"
 "  --cache-gb X          routed-expert cache budget\n"
 "  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
 "                        recurrent-state slot during full recompute; needs --trunk\n"
@@ -666,6 +668,10 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
                                  layer_state, scratch,
                                  NULL, NULL, 0, 0, 0);
         }
+        if (w->trunk && w->trunk->read_error) {
+            fprintf(stderr, "trunk row read failed at layer %d; refusing partial output\n", L);
+            return -1;
+        }
         if (k3_expert_drops != drops_before) {
             fprintf(stderr, "routed expert load failed at layer %d; refusing partial "
                             "MoE output\n", L);
@@ -766,7 +772,7 @@ int main(int argc, char **argv)
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0, ultra = 0, stream_lm_head = 0, expert_pipeline = 0;
-    int kv_latent = 0;
+    int kv_latent = 0, trunk_rows = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -823,6 +829,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--layers") && i + 1 < argc) want_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
+        else if (!strcmp(argv[i], "--trunk-rows")) trunk_rows = 1;
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
@@ -880,6 +887,15 @@ int main(int argc, char **argv)
         return 2;
     }
     const int head_streamed = ultra || stream_lm_head;
+    if (trunk_rows && (!trunk_dir || draft_dir || budget_auto)) {
+        fprintf(stderr, "--trunk-rows needs --trunk and an explicit --trunk-gb; "
+                        "draft trunks are unsupported\n");
+        return 2;
+    }
+    if (trunk_rows && (!isfinite(trunk_gb) || trunk_gb <= 0 || trunk_gb * 1e9 >= (double)INT64_MAX)) {
+        fprintf(stderr, "--trunk-rows requires a finite positive trunk budget\n");
+        return 2;
+    }
     if (stream_lm_head && draft_dir) {
         fprintf(stderr, "--stream-lm-head does not yet support --draft-trunk\n");
         return 2;
@@ -1321,7 +1337,10 @@ int main(int argc, char **argv)
          * and becomes a dial, and unlike quantisation it costs no accuracy, which
          * matters because the K3 report (4.1.4) keeps exactly these tensors in higher
          * precision on purpose. */
-        if (k3_trunk_open(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9)) != 0) return 1;
+        const int rc = trunk_rows
+            ? k3_trunk_open_rows(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9))
+            : k3_trunk_open(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9));
+        if (rc != 0) return 1;
         if (trunk.n_layers < NL) {
             fprintf(stderr, "packed trunk has %d layers, need %d\n", trunk.n_layers, NL);
             return 1;
@@ -1887,7 +1906,9 @@ int main(int argc, char **argv)
                 "\"lm_head_streamed\":%s,\"kv_latent\":%s,\"trunk_ring_slots\":%d,"
                 "\"trunk_slot_bytes\":%lld,\"trunk_budget_bytes\":%.0f,"
                 "\"model_resident_bytes\":%zu,\"model_stream_buffer_bytes\":%zu,"
-                "\"memory_plan_bytes\":%.0f,"
+                "\"memory_plan_bytes\":%.0f,\"trunk_rows\":%s,"
+                "\"trunk_row_buffer_bytes\":%llu,\"trunk_small_buffer_bytes\":%llu,"
+                "\"trunk_matrix_calls\":%llu,"
                 "\"stopped_at\":%d,"
                 "\"generated_text\":",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
@@ -1902,7 +1923,10 @@ int main(int argc, char **argv)
                 w.trunk ? w.trunk->nslot : 0,
                 (long long)(w.trunk ? w.trunk->slot_bytes : 0),
                 w.trunk ? trunk_gb * 1e9 : 0.0, w.mb.nbytes, w.ms.bufcap,
-                memory_plan_bytes, stopped_at);
+                memory_plan_bytes, trunk_rows ? "true" : "false",
+                (unsigned long long)(w.trunk ? w.trunk->row_buffer_bytes : 0),
+                (unsigned long long)(w.trunk ? w.trunk->small_buffer_bytes : 0),
+                (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0), stopped_at);
         json_string(f, generated_text);
         fputs("}\n", f);
         fclose(f);

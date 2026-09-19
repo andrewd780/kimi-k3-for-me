@@ -142,6 +142,15 @@ int k3_bind_layer_mem(const K3Cfg *c, int layer, K3LayerBind *b,
 /* Upper bound on the widen area one layer needs, so a slot can be sized once. */
 size_t k3_bind_widen_bytes(const K3Cfg *c);
 
+/* The same canonical plan, with matrices represented by K3WeightStream descriptors
+ * and ALL elementwise tensors copied into a layer-owned float arena. Passing NULL
+ * for acquire validates metadata and measures that arena without reading weights. */
+typedef int (*K3AcquireWeight)(void *ctx, int64_t off, int64_t nbytes, int dtype,
+                             int64_t take, int narrow, const void **dest);
+int k3_bind_layer_stream(const K3Cfg *c, int layer, K3LayerBind *b,
+                         const K3MemSrc *src, K3AcquireWeight acquire, void *ctx,
+                         size_t *small_bytes);
+
 /* Gather one embedding row into dst[hidden], widening if the table is bf16. The table
  * is indexed rather than multiplied, so it cannot go through k3_mmw: a plain memcpy
  * with a float stride would read half a row of the wrong values. */

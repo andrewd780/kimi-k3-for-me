@@ -7,6 +7,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Bounded trunk row streaming**, opt-in `--trunk-rows`: two small read/compute
+  buffers, unchanged per-row arithmetic, and an explicitly sized current-layer
+  vector arena. Synthetic gates cover compressed/plain logits, a 64 MiB cgroup,
+  93-layer wraparound, ThreadSanitizer and ASan/UBSan. Batched prompts can reread
+  weights; no full-model speedup is claimed. Fixes the trunk JSON ownership leak
+  and parallel read error-flag race uncovered by those gates.
+- **Executable research gates** for the other four proposals: a compact
+  four-stream/two-symbol Huffman decoder benchmark with pinned K3 range samples,
+  prompt-separated routing calibration, bounded Jacobi/lookahead cost analysis,
+  and raw-syscall io_uring versus pread-pool experiments. They do not add default
+  inference behavior. See [research results](docs/notes/research-results.md).
+  The decoder is 2.63x/3.35x faster than the old kernel by median on the four
+  sampled K3 ranges (hosted x86/ARM respectively), but fails the strict every-run
+  throughput gate and remains outside inference. No model-level gain is claimed.
+
+- **Research queue**, `docs/notes/research-queue.md`: the ranked list of what is left to
+  build without the checkpoint, each item exact and gated on the synthetic model, with
+  the per-machine arithmetic that orders it. The status board now points at it, carries
+  the four new proposal rows, and lists `--kv-latent` under shipped with its evidence.
 - **`--kv-latent`**, off by default: the incremental decoder's MLA KV cache holds only
   the `kv_lora_rank` latent and the shared rope row per position, and rebuilds the
   per-head k and v through `kv_b` on every use, which is what MLA's own design caches.
