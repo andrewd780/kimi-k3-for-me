@@ -22,20 +22,24 @@ import tempfile
 
 def codes_for(raw):
     counts = Counter(raw)
-    lengths = [0] * 256
-    queue = [(weight, (symbol,)) for symbol, weight in counts.items()]
-    heapq.heapify(queue)
-    while len(queue) > 1:
-        a, sa = heapq.heappop(queue)
-        b, sb = heapq.heappop(queue)
-        for symbol in sa + sb:
-            lengths[symbol] += 1
-        heapq.heappush(queue, (a + b, sa + sb))
-    if len(queue) == 1 and len(queue[0][1]) == 1:
-        lengths[queue[0][1][0]] = 1
-    if max(lengths) > 12:
-        # Safe bounded fallback; never silently truncate an overlong Huffman tree.
-        lengths = [8] * 256
+    floor = 1
+    while True:
+        lengths = [0] * 256
+        queue = [(max(weight, floor), (symbol,)) for symbol, weight in counts.items()]
+        heapq.heapify(queue)
+        while len(queue) > 1:
+            a, sa = heapq.heappop(queue)
+            b, sb = heapq.heappop(queue)
+            for symbol in sa + sb:
+                lengths[symbol] += 1
+            heapq.heappush(queue, (a + b, sa + sb))
+        if len(queue) == 1 and len(queue[0][1]) == 1:
+            lengths[queue[0][1][0]] = 1
+        if max(lengths) <= 12:
+            break
+        # Reweight and REBUILD a valid tree; never truncate code lengths. At a
+        # floor >= max(counts), at most 256 equally weighted leaves need <=8 bits.
+        floor *= 2
     code, previous, codes = 0, 0, {}
     for width, symbol in sorted((width, s) for s, width in enumerate(lengths) if width):
         code <<= width - previous
@@ -75,10 +79,33 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--raw", type=Path)
+    parser.add_argument("--sample-k3", action="store_true",
+                        help="4 MiB of SHA-verified HTTP ranges from the committed pinned sample manifest")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     rng = random.Random(39487)
-    if args.raw:
+    sample_ids = []
+    if args.raw and args.sample_k3:
+        parser.error("choose --raw or --sample-k3")
+    if args.sample_k3:
+        from remote_model import read_range
+        manifest = json.loads((Path(__file__).resolve().parents[1] /
+                               "docs/measurements/lossless-samples.json").read_text())
+        chunks = []
+        for row in [r for r in manifest["samples"] if r["kind"] == "dense"][:4]:
+            if row["bytes"] != 1 << 20:
+                raise ValueError("expected four bounded 1 MiB ranges")
+            url = ("https://huggingface.co/moonshotai/Kimi-K3/resolve/" +
+                   manifest["revision"] + "/" + row["shard"])
+            chunk, _ = read_range(url, row["offset"], row["bytes"])
+            if hashlib.sha256(chunk).hexdigest() != row["sha256"]:
+                raise ValueError("pinned sample hash mismatch")
+            chunks.append(chunk)
+            sample_ids.append({key: row[key] for key in ("shard", "tensor", "offset", "bytes", "sha256")})
+        if len(chunks) != 4:
+            raise ValueError("four dense samples required")
+        raw = b"".join(chunks)
+    elif args.raw:
         if not 1 <= args.raw.stat().st_size <= 16 << 20:
             parser.error("--raw must contain 1 byte to 16 MiB")
         raw = args.raw.read_bytes()
@@ -90,14 +117,21 @@ def main():
         raw = bytes(raw)
     with tempfile.TemporaryDirectory() as work:
         path = Path(work) / "input.hf4b"
-        path.write_bytes(encode(raw))
+        encoded = encode(raw)
+        path.write_bytes(encoded)
         result = subprocess.run([str(args.binary.resolve()), str(path)], capture_output=True,
                                 text=True, check=True, timeout=60)
     report = json.loads(result.stdout)
     report.update({"machine": platform.machine(), "system": platform.platform(),
-                   "source": "user_supplied_range" if args.raw else "synthetic_heavy_tailed_bytes",
+                   "source": "pinned_K3_ranges" if args.sample_k3 else
+                             ("user_supplied_range" if args.raw else "synthetic_heavy_tailed_bytes"),
+                   "samples": sample_ids,
                    "sha256": hashlib.sha256(raw).hexdigest(),
-                   "scope": "kernel only; no real-model compression or inference speed claim"})
+                   "scope": "kernel only; no full-model compression or inference speed claim"})
+    sizes = struct.unpack_from("<6I", encoded, 4)
+    report["four_stream_payload_ratio"] = (sum(sizes[2:]) + (len(raw)+1)//2) / len(raw)
+    histogram = Counter(raw[1::2])
+    report["high_byte_histogram"] = [histogram[i] for i in range(256)]
     report["four_streams_clear_1_GBps_all_runs"] = all(
         rate >= 1 for rate in report["arms"][1]["decoded_BF16_GBps_runs"])
     args.out.write_text(json.dumps(report, indent=2) + "\n")

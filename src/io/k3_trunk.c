@@ -6,6 +6,7 @@
 #include "k3_portable_io.h"   /* first: sets _DARWIN_C_SOURCE before any libc header */
 
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +69,17 @@ static int dt_of(const char *s)
     if (!strcmp(s, "F16"))  return K3_DT_F16;
     if (!strcmp(s, "I8R"))  return K3_DT_I8R;
     return K3_DT_UNKNOWN;
+}
+
+static int json_size(jval *object, const char *key, int64_t *out)
+{
+    jval *value = json_get(object, key);
+    if (!value || value->t != J_NUM || !isfinite(value->num) ||
+        value->num < 0 || value->num >= 9223372036854775808.0) return -1;
+    const int64_t n = (int64_t)value->num;
+    if ((double)n != value->num) return -1;
+    *out = n;
+    return 0;
 }
 
 static char *slurp(const char *p, size_t *n)
@@ -295,6 +307,14 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
     if (r->cap > (8u << 20) + 2u * K3_TRUNK_ALIGN) r->cap = (8u << 20) + 2u * K3_TRUNK_ALIGN;
     r->cap &= ~(size_t)(K3_TRUNK_ALIGN - 1);
     r->payload = r->cap - 2u * K3_TRUNK_ALIGN;
+    const int64_t cols[] = {c->hidden, c->dense_inter, c->q_lora, c->kv_lora,
+        (int64_t)c->n_heads * c->v_head, (int64_t)c->kda_heads * c->kda_head_dim,
+        (int64_t)c->moe_inter * c->n_shared, c->latent, c->kda_head_dim};
+    for (size_t i = 0; i < sizeof cols / sizeof *cols; i++) {
+        /* Conservatively allow F32 matrices too; reject an undersized row buffer
+         * during opening, before any forward pass can start. */
+        if (cols[i] < 0 || (uint64_t)cols[i] > r->payload / 4) goto bad;
+    }
     r->small = (unsigned char *)malloc(r->small_cap ? r->small_cap : 1);
     if (!r->small || posix_memalign((void **)&r->buf[0], K3_TRUNK_ALIGN, r->cap) ||
         posix_memalign((void **)&r->buf[1], K3_TRUNK_ALIGN, r->cap)) goto bad;
@@ -340,6 +360,7 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
     jval *jl = json_get(root, "layers");
     if (!jl || jl->t != J_ARR) { fprintf(stderr, "k3_trunk: no layers array\n"); goto bad; }
     tr->n_layers = jl->len;
+    if (tr->n_layers <= 0 || tr->n_layers > c->n_layers) goto bad;
     tr->lay = (K3TrunkLayer *)calloc((size_t)tr->n_layers, sizeof(K3TrunkLayer));
     if (!tr->lay) goto bad;
 
@@ -347,8 +368,7 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
         jval *e = jl->kids[i];
         jval *v;
         K3TrunkLayer *L = &tr->lay[i];
-        if ((v = json_get(e, "file_off")) && v->t == J_NUM) L->file_off = (int64_t)v->num;
-        if ((v = json_get(e, "nbytes"))   && v->t == J_NUM) L->nbytes   = (int64_t)v->num;
+        if (json_size(e, "file_off", &L->file_off) || json_size(e, "nbytes", &L->nbytes)) goto bad;
         if (L->file_off < 0 || L->nbytes <= 0 || L->file_off > INT64_MAX - L->nbytes) goto bad;
         jval *ts = json_get(e, "tensors");
         if (!ts || ts->t != J_OBJ) { fprintf(stderr, "k3_trunk: layer %d has no tensors\n", i); goto bad; }
@@ -360,8 +380,7 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
             /* keys live in the parser arena, which is kept for the process lifetime */
             t->name = ts->keys[k];
             jval *o = ts->kids[k];
-            if ((v = json_get(o, "off"))    && v->t == J_NUM) t->off    = (int64_t)v->num;
-            if ((v = json_get(o, "nbytes")) && v->t == J_NUM) t->nbytes = (int64_t)v->num;
+            if (json_size(o, "off", &t->off) || json_size(o, "nbytes", &t->nbytes)) goto bad;
             if ((v = json_get(o, "dtype"))  && v->t == J_STR) t->dtype  = dt_of(v->str);
             if (t->off < 0 || t->nbytes <= 0 || t->off > L->nbytes ||
                 t->nbytes > L->nbytes - t->off ||

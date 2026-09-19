@@ -50,11 +50,15 @@ jobs:
         run: |
           cc -O3 -std=c99 -Wall -Wextra -Werror benchmarks/bench_huf4.c -o bench-huf4
           python3 tools/bench_huf4.py --binary ./bench-huf4 --out huf4.json
+      - name: Three runs per arm on the same four pinned K3 ranges (4 MiB total)
+        run: python3 tools/bench_huf4.py --binary ./bench-huf4 --sample-k3 --out huf4-k3.json
       - name: Preserve complete timings and input identity
         uses: actions/upload-artifact@v4
         with:
           name: huf4-${{ matrix.os }}
-          path: huf4.json
+          path: |
+            huf4.json
+            huf4-k3.json
 
   routing:
     runs-on: ubuntu-latest

@@ -13,9 +13,18 @@ typedef struct {
 static inline int huf_symbol(HufReader *r, const K3HufTable *t)
 {
     if (r->held < 12) {
-        while (r->held <= 56 && r->p < r->end) {
-            r->bits = (r->bits << 8) | *r->p++;
-            r->held += 8;
+        if ((size_t)(r->end - r->p) >= 4) {
+            /* Four-byte refill keeps at most 43 bits live. Compilers recognize
+             * this portable big-endian load; no unaligned or speculative overread. */
+            const uint32_t word = ((uint32_t)r->p[0] << 24) | ((uint32_t)r->p[1] << 16)
+                                | ((uint32_t)r->p[2] << 8) | r->p[3];
+            r->bits = (r->bits << 32) | word;
+            r->held += 32; r->p += 4;
+        } else {
+            while (r->p < r->end) {
+                r->bits = (r->bits << 8) | *r->p++;
+                r->held += 8;
+            }
         }
     }
     const unsigned at = r->held >= 12
