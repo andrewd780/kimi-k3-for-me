@@ -79,9 +79,10 @@ typedef struct {
     int          n_layers;
     K3TrunkLayer *lay;
 
-    /* Backs every K3TrunkTensor.name, so it must outlive the whole struct. Owned here
-     * and freed by k3_trunk_close; do not free the parser arena separately. */
+    /* The parser now allocates strings/nodes separately. Keep the tree as well as
+     * its optional arena alive because K3TrunkTensor.name borrows its object keys. */
     char          *json_arena;
+    void          *json_root;
 
     /* Pinned layers get exact-size allocations; only the streaming ring is uniform.
      * Uniform slots everywhere would size EVERY slot for layer 0, whose dense MLP makes

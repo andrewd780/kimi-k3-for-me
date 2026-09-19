@@ -83,6 +83,16 @@ static char *slurp(const char *p, size_t *n)
     return b;
 }
 
+static void trunk_json_free(jval *v)
+{
+    if (!v) return;
+    for (int i = 0; i < v->len; i++) {
+        trunk_json_free(v->kids[i]);
+        if (v->keys) free(v->keys[i]);
+    }
+    free(v->kids); free(v->keys); free(v->str); free(v);
+}
+
 /* Resolver handed to k3_bind_layer_mem: linear over one layer's ~28 tensors, which is
  * nothing next to a 1.27 GB read. */
 typedef struct { const K3TrunkLayer *L; } Finder;
@@ -324,6 +334,7 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
     tr->json_arena = arena;
+    tr->json_root = root;
     if (!root) { fprintf(stderr, "k3_trunk: %s is not valid JSON\n", p); free(txt); return -1; }
 
     jval *jl = json_get(root, "layers");
@@ -353,7 +364,9 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
             if ((v = json_get(o, "nbytes")) && v->t == J_NUM) t->nbytes = (int64_t)v->num;
             if ((v = json_get(o, "dtype"))  && v->t == J_STR) t->dtype  = dt_of(v->str);
             if (t->off < 0 || t->nbytes <= 0 || t->off > L->nbytes ||
-                t->nbytes > L->nbytes - t->off || t->off % 4) goto bad;
+                t->nbytes > L->nbytes - t->off ||
+                (t->dtype == K3_DT_F32 && t->off % 4) ||
+                (t->dtype == K3_DT_BF16 && t->off % 2)) goto bad;
         }
     }
     free(txt);                      /* arena holds the strings; txt itself is done */
@@ -561,7 +574,9 @@ bad:
 
 int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget)
 {
-    return trunk_open(tr, dir, c, budget, 0);
+    const int result = trunk_open(tr, dir, c, budget, 0);
+    if (result) k3_trunk_close(tr);
+    return result;
 }
 
 int k3_trunk_open_rows(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget)
@@ -590,7 +605,8 @@ void k3_trunk_close(K3Trunk *tr)
     if (tr->pin) { for (int i = 0; i < tr->npin; i++) k3_aligned_free(tr->pin[i]); free(tr->pin); }
     k3_aligned_free(tr->arena); free(tr->layer_of); free(tr->slot_of);
     if (tr->lay) { for (int i = 0; i < tr->n_layers; i++) free(tr->lay[i].t); free(tr->lay); }
-    free(tr->json_arena);   /* every K3TrunkTensor.name points into this */
+    trunk_json_free((jval *)tr->json_root);
+    free(tr->json_arena);
     memset(tr, 0, sizeof *tr);
     tr->fd = -1;            /* see k3_trunk_open: 0 is stdin, not "closed" */
 }
