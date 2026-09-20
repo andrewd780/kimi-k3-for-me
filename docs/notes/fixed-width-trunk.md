@@ -30,7 +30,42 @@ Adversarial CI tests include diffuse support, individually compressible but
 incompatible local dictionaries, a bad range hidden by pooling, threshold edges,
 wrong plane/sign handling, missing ranges, truncation and hash corruption.
 
-Results are pending the first CI run. No codec or performance result is claimed.
+Gate 1 **passed** in [CI run 35497304209](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/35497304209)
+at head `c03cf52e328eebb064d7aaab76775fbfc8c667a1`. All nine adversarial tests
+passed. [The complete counts and identities](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/35497304209/artifacts/10601201984)
+are preserved; the pooled global-dictionary coverage is **99.954653%**.
+
+| Range | Distinct | 90% | 99% | 99.9% | 99.99% | Local 15 % | Global 15 % | Payload r |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Layer 1 | 25 | 6 | 9 | 13 | 18 | 99.968910 | 99.951553 | 0.750242233 |
+| Layer 12 | 25 | 6 | 9 | 13 | 18 | 99.970436 | 99.941254 | 0.750293732 |
+| Layer 24 | 22 | 6 | 9 | 12 | 17 | 99.977493 | 99.947929 | 0.750260353 |
+| Layer 36 | 23 | 6 | 9 | 13 | 18 | 99.965096 | 99.953842 | 0.750230789 |
+| Layer 48 | 23 | 6 | 9 | 14 | 18 | 99.953079 | 99.952698 | 0.750236511 |
+| Layer 60 | 25 | 6 | 9 | 14 | 17 | 99.961472 | 99.960518 | 0.750197411 |
+| Layer 72 | 22 | 5 | 10 | 14 | 17 | 99.970055 | 99.970055 | 0.750149727 |
+| Layer 92 | 24 | 6 | 11 | 14 | 18 | 99.959373 | 99.959373 | 0.750203133 |
+| Pooled | 29 | 6 | 9 | 14 | 18 | 99.954653 | 99.954653 | 0.750226736 |
+
+The pooled high-byte count is 4,194,304 with **1,902 escapes** (0.0453472%).
+The shared table, in code order, is
+`[188,60,61,189,59,187,58,186,185,57,190,62,56,184,183]`.
+All ranges are `self_attn.f_a_proj.weight` except layer 92's `self_attn.g_proj.weight`;
+this is not coverage of every trunk tensor family. The historical "roughly a
+dozen at 99.9%" becomes 14 values pooled; 15 entries comfortably clear 99%.
+
+The 4-bit FD4B prototype now implements scalar reference, SSSE3 `pshufb` and
+AArch64 NEON `tbl` decoders. It is benchmark-only. CI first repeats the histogram,
+then runs ASan/UBSan correctness on both ISAs, then enables rate jobs. Real-range
+round trips, independent golden bytes, all byte values, escape underflow/surplus,
+odd tails, corrupt payload/reference and deliberate sanitizer faults guard the
+comparison. Timing includes low-plane assembly and escape patching.
+
+The benchmark reports only public model identifiers, byte counts, dictionaries,
+hashes, timings and hosted-runner metadata. Artifact paths are explicit; raw
+model ranges and unrelated workspace files are not uploaded. No user secrets
+or personal files are inputs. Standard GitHub logs retain the public repository
+identity. Gates 2-5 are pending hosted CI; no rate result is claimed yet.
 
 ## Remaining gates, only if gate 1 passes
 
