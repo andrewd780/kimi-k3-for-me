@@ -90,13 +90,19 @@ jobs:
           cc --version
           cc $flags tests/unit/test_fixed_dictionary.c -o test-fixed-dictionary
           cc $flags benchmarks/bench_fixed_dictionary.c -o bench-fixed-dictionary
+          # Isolate deliberate faults so one sanitizer cannot intercept the
+          # other's control. The actual codec tests keep BOTH sanitizers.
+          asan_flags="${flags/-fsanitize=address,undefined/-fsanitize=address}"
+          ubsan_flags="${flags/-fsanitize=address,undefined/-fsanitize=undefined}"
+          cc $asan_flags tests/unit/test_fixed_dictionary.c -o control-asan
+          cc $ubsan_flags tests/unit/test_fixed_dictionary.c -o control-ubsan
       - name: Tails, escape paths, bounds and corrupt-input controls
         run: ./test-fixed-dictionary
       - name: Demonstrate both sanitizer gates detect deliberate faults
         run: |
-          if ./test-fixed-dictionary trip-asan > asan-control.txt 2>&1; then exit 1; fi
-          grep -q AddressSanitizer asan-control.txt
-          if ./test-fixed-dictionary trip-ubsan > ubsan-control.txt 2>&1; then exit 1; fi
+          if ./control-asan trip-asan > asan-control.txt 2>&1; then exit 1; fi
+          grep -q 'ERROR: AddressSanitizer: heap-buffer-overflow' asan-control.txt
+          if ./control-ubsan trip-ubsan > ubsan-control.txt 2>&1; then exit 1; fi
           grep -q 'runtime error: signed integer overflow' ubsan-control.txt
       - name: Byte-exact scalar and SIMD round trips on all eight pinned ranges
         run: python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode correctness --out dictionary-exactness.json
