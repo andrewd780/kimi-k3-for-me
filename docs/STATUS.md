@@ -1,7 +1,7 @@
 # Where everything stands
 
 *Plain-language status of this fork, written for the project owner. Last updated
-2026-09-19 with merged work through #10 and the under-review experiments in
+2026-09-20 with merged work through #10 and the under-review experiments in
 [PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12). Measurements and
 projections are distinguished below. Engineering priorities stay in [ROADMAP.md](ROADMAP.md).*
 
@@ -108,7 +108,7 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Technique | What it would do | Status | What is known | Size of the job |
 |---|---|---|---|---|
 | Bounded trunk rows | Overlaps matrix-row reads and exact compute with two small buffers | implemented, opt-in `--trunk-rows` in #12 | 93-layer wraparound, sanitizer, CLI logit and capped-allocation gates ([results](notes/research-results.md)) | Real speed unmeasured; prefill and latent-cache rereads can hurt |
-| Next-layer expert prefetch | Predicts upcoming routes; true routing still decides computation | calibration tool built in #12 | Prompt-separated centroid/ridge probes; 70% recall would add about 5.76% total traffic before cancellations | Hidden-state capture and real held-out recall blocked; no engine predictor |
+| Next-layer expert prefetch | Would predict upcoming routes; true routing still decides computation | paused at gate 1; diagnostic only in #12 | Synthetic validation only; [audit](notes/predictive-prefetch-gates.md) records unmeasured k=1/2/4, equal-slot static null and bytes/decode token | Needs real generation trajectories; prefix replay is ineligible; no engine predictor |
 | Bounded lookahead verification | Drafts without a matching history suffix | reference and cost gate built in #12 | Exhaustive toy-model exactness; proposal and replay work explicitly charged ([results](notes/research-results.md)) | K3 acceptance and state integration blocked; `--spec` unchanged |
 | io_uring reads | Linux asynchronous read submission | standalone experiment built in #12 | Three runs per arm at five queue depths; noisy overlapping timings, no consistent meaningful gain ([results](notes/research-results.md)) | No engine backend replacement justified |
 | Speculative decoding on resident hardware | A cheap draft proposes tokens, the exact model verifies; ~1.7x fewer weight bytes per accepted token at the measured 66.7% acceptance ([note](notes/int8-draft-container.md)) | proposal | Only pays off once the model is resident in RAM; nothing on 8 GB, where both draft and exact stream from disk | Needs a large-memory host to pay for |

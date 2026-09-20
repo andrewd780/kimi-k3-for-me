@@ -68,7 +68,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install numpy==2.3.5
-      - name: Separable routes, permuted held-out labels and replay leakage
+      - name: Synthetic routing, source lead, decode phase and leakage checks
         run: |
           python3 -m unittest discover -s tests -p test_routing_probe.py -v
           python3 -m unittest discover -s tests -p test_lookahead_gate.py -v

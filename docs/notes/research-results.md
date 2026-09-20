@@ -1,6 +1,6 @@
 # Five proposals: code, experiments and unresolved gates
 
-2026-09-19. Follow-up to [the research queue](research-queue.md), in
+Updated 2026-09-20. Follow-up to [the research queue](research-queue.md), in
 [PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12). All native runs are
 hosted CI. Andrew's machines were not used. There is no full-checkpoint host and
 no new full-model seconds/token result.
@@ -108,26 +108,26 @@ time and reach `B/r = 4.35 GB/s` to feed a saturated compressed stream. Sharing
 cores with matmuls changes this again. The format/reader, bounded workspace,
 parallel decode and concurrent-compute gates remain before engine integration.
 
-## 3. Predictive expert reads: calibration ready, real-data gate blocked
+## 3. Predictive expert reads: paused at the generation/lead-time gate
 
-`tools/routing_probe.py` takes NPZ hidden vectors available **before** the target
-layer, true routed experts, layer, position and Unicode prompt ID. It compares
-cosine nearest centroids with a ridge probe. Split by whole prompt; duplicate
-`(prompt, position, layer)` rows are rejected to prevent repeated-prefill leakage.
-The dual ridge solve has explicit size limits. This is calibration, not a router
-deployed in the engine.
+The [ordered review audit](predictive-prefetch-gates.md) supersedes the earlier
+"calibration ready" description. **Only synthetic tests were run.** There is no
+real generation capture to re-score at k=1,2,4, and no measured static-pin or
+byte comparison. The prefix-replay fixture cannot supply that evidence.
 
-```sh
-python3 tools/routing_probe.py hidden-routes.npz --train-prompts calibration-a,calibration-b --out recall.json
-```
+`tools/routing_probe.py` retains centroid/ridge scoring as a recall diagnostic.
+It now requires explicit source layer, source position, decode phase, feature
+site, evidence kind and `--lead`. Zero lead is labelled oracle-only; ambiguous
+old NPZ files and even deduplicated prefill rows are refused. Prompt-separated
+splits, duplicate checks and the bounded dual solve remain. Declared metadata
+does not authenticate a real capture. Synthetic tests establish validation and
+scoring mechanics only.
 
-Synthetic tests give perfect recall on separable held-out examples, zero after
-held-out labels are deliberately permuted, and refusal of leaking splits/replayed
-positions. **No real recall is reported.** The committed trace has IDs, not the
-paired hidden vectors. A host must capture them, test diverse held-out prompts
-and measure predictor cost. Passing the tentative 70% recall gate still needs a
-scheduling experiment. Uncancelled wrong predictions add traffic; true routing
-must remain authoritative. The primary
+The recall-derived read multiplier and 70% gate flag have been removed. The
+tool explicitly marks the equal-slot global static-pin null, bytes per decode
+token, time available and gain over known-route pipelining as **unmeasured**.
+No predictor reader is being built before the ordered gates pass. Uncancelled
+wrong predictions can add traffic; true routing remains authoritative. The primary
 [Pre-gated MoE paper](https://arxiv.org/html/2308.12066v3) is prior art for earlier
 routing, not evidence for a training-free K3 predictor or a CPU speedup.
 

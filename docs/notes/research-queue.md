@@ -1,6 +1,6 @@
 # Research queue: implementation and remaining gates
 
-Updated 2026-09-19 in [PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12),
+Updated 2026-09-20 in [PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12),
 following the five proposals in #11. The implementation is under review; this
 page does not call it merged. [Research results](research-results.md) records
 scope, measurements, usage and remaining work.
@@ -9,7 +9,7 @@ scope, measurements, usage and remaining work.
 |---|---|---|
 | Smaller trunk ring | Opt-in `--trunk-rows`: two row buffers, unchanged matrix arithmetic, current-layer vector arena; no cross-layer read in flight | Real-model latency, queue depth and prefill cost |
 | Compact Huffman decoder | Four streams, bounded word refill and two-symbol lookup; independent encoder, corruption checks, x86/ARM CI timings on synthetic and pinned K3 ranges | Results in the results note; production container, concurrent reader and resource-cost gate remain separate |
-| Predictive expert prefetch | Centroid and ridge calibration; prompt-level holdout and duplicate-position rejection | Real hidden-state capture, held-out recall, predictor cost and scheduled reads |
+| Predictive expert prefetch | Lead-labelled centroid/ridge diagnostic, synthetic tests only; [ordered gate audit](predictive-prefetch-gates.md) | Paused: real generation trajectory and k=1/2/4 recall, then equal-slot static null and bytes/decode token |
 | Bounded lookahead | Bounded Jacobi reference, exhaustive toy exactness checks and rational break-even calculator | Useful early acceptance on K3, engine snapshot/replay integration, measured total work |
 | Linux async submission | Raw-syscall `io_uring` versus blocking-pool experiment, queue depths 1/2/4/8/16, three runs per arm | A repeatable benefit under concurrent real compute before adding an engine backend |
 
@@ -38,8 +38,9 @@ full-model measurement exists here.
 - Four independent Huffman streams need an encoder layout change. The shelved
   single-stream archive is not compatible. Exponent-plane GB/s and reconstructed
   BF16 GB/s are different units; the new benchmark names its unit.
-- Predicting 16 experts at 70% recall costs up to `16 + 16*(1-.7) = 20.8`
-  reads on average if wrong guesses cannot be canceled before transfer.
+- Predicting 16 experts at 70% recall costs `16 + 16*(1-.7) = 20.8`
+  reads on average with no cache hits, no cancellation and correct guesses
+  retained until use. Eviction can cost more; this is not an upper bound.
   `1 + (25.83/134.64)*.3 = 1.0576` is **more total traffic**, not a speedup
   ceiling. Earlier arrival helps only when its scheduling benefit exceeds cost.
 - Blocking read threads sleep while waiting for I/O. Thread count is not a count
