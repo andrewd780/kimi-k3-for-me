@@ -1,5 +1,14 @@
 # Compressed trunk: investigated, shelved, with the measurement that decided it
 
+**2026-09-20 qualification:** the high-byte support assertion below came from
+one 4 MB sample and is not evidence for a 15-entry dictionary across the trunk.
+Entropy does not determine support size. The [fixed-width falsifier](fixed-width-trunk.md)
+checks all eight existing dense ranges before any codec work. The four-stream
+and two-symbol routes suggested below have since been measured in
+[the research results](research-results.md#2-compact-huffman-decoder-research-prototype);
+their decode rate does not clear the 3 GB/s floor. Those entropy-coder routes
+are finished for this campaign.
+
 ## The idea
 
 The trunk is bf16. A bf16 value's high byte (sign + exponent) carries about 2.8 bits of

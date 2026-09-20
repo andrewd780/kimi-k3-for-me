@@ -1,0 +1,40 @@
+name: Trunk dictionary falsifier
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/trunk-dictionary.yml'
+      - 'tools/trunk_dictionary_gate.py'
+      - 'tools/remote_model.py'
+      - 'tests/test_trunk_dictionary_gate.py'
+      - 'docs/measurements/lossless-samples.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  histogram:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Prove the coverage and input-identity gates can fail
+        run: python3 -m unittest discover -s tests -p test_trunk_dictionary_gate.py -v
+      - name: Falsifier first (exactly eight hash-verified 1 MiB dense ranges)
+        env:
+          RESEARCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/trunk_dictionary_gate.py --out trunk-dictionary-histogram.json
+      - name: Preserve counts and decision, including a scientific STOP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trunk-dictionary-histogram
+          path: trunk-dictionary-histogram.json
+          if-no-files-found: error
