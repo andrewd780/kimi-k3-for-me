@@ -108,6 +108,54 @@ time and reach `B/r = 4.35 GB/s` to feed a saturated compressed stream. Sharing
 cores with matmuls changes this again. The format/reader, bounded workspace,
 parallel decode and concurrent-compute gates remain before engine integration.
 
+## 2b. Fixed-width high-byte dictionary: gates 1–3 passed
+
+Follow-up to the entropy decoder above, as the [fixed-width note](fixed-width-trunk.md)
+specifies: a 4-bit index per BF16 high byte into one pooled 15-entry table plus
+an escape code, the low byte raw. `benchmarks/fixed_dictionary.h` decodes with a
+scalar reference, SSSE3 `pshufb` and AArch64 NEON `tbl`; `tools/bench_fixed_dictionary.py`
+independently encodes. Benchmark-only; not an archive format and not in inference.
+
+Gate 1, the histogram falsifier, ran on all eight dense 1 MiB ranges: one pooled
+dictionary covers **99.954653%** of high bytes, 1,902 escapes in 4,194,304, worst
+range 99.941254% (layer 12), payload r = **0.7502** before framing. Gate 2, byte-exact
+scalar and SIMD round trips under ASan/UBSan on both ISAs with five negative
+controls rejected, passed. Gate 3, the rate gate, from
+[CI run 35498176696](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/35498176696)
+at head `9f0c07f`, three runs per arm, reconstructed BF16 GB/s in `bench_huf4`
+units, recorded in
+[fixed-dictionary-rate-x86_64.json](../measurements/fixed-dictionary-rate-x86_64.json) and
+[fixed-dictionary-rate-arm64.json](../measurements/fixed-dictionary-rate-arm64.json):
+
+| Hosted CI ISA, real K3 ranges | Scalar reference | SIMD, eight 1 MiB ranges, 24 runs | SIMD, pooled 8 MiB, 3 runs | Every run >=3 GB/s | Every run >=4 GB/s |
+|---|---:|---:|---:|---|---|
+| x86_64 `ssse3_pshufb` | 1.50–1.58 | min 24.274, median 25.302, max 25.705 | 16.220, 16.263, 16.332 | yes | yes |
+| arm64 `neon_tbl` | 1.20–2.38 | min 16.361, median 19.764, max 26.662 | 14.844, 17.473, 19.071 | yes | yes |
+
+`rate_gate.status = PASS` on both ISAs. The slowest of the 54 SIMD runs is
+14.844 GB/s, against the compact Huffman decoder's best real-range runs of
+1.100 (x86_64) and 1.350 (arm64) in §2: a 13x–15x kernel-rate difference bought
+with a 6.1-point ratio premium (0.750 versus 0.689). The 8 MiB pooled figure is
+the one to quote; the 1 MiB cases sit in cache. The arm64 spread on identical
+input (16.4–26.7 GB/s) is the shared three-core hosted runner; the gate is on
+the minimum.
+
+These are warm-buffer, single-thread kernel ceilings with no competing model
+compute, as the report's `scope` field states, and §2's break-even arithmetic
+applies unchanged: at `B = 3 GB/s` and `r = .75`, serial read+decode needs
+`D > 12 GB/s` and the overlapped saturated stream needs `D > 4 GB/s`. The kernel
+clears both on the hosted runners. Whether it does so while sharing cores with
+the matmuls, the row-seekable layout and its padding cost, the 5-bit variant,
+and a supported reader are the open gates. No full-model speedup, storage-size
+result or ratio win over Huffman is claimed.
+
+The measurement files were recorded from the CI jobs' stdout `CODEC_REPORT`
+lines rather than copied from the artifact zips; every derived field (per-arm
+mean, median, minimum, payload and framed ratios, escape counts, gate status)
+was recomputed from the primitives and matched exactly before the files were
+written. The run's artifacts `dictionary-rate-ubuntu-latest` (ID 10601747318)
+and `dictionary-rate-macos-14` (ID 10600672892) hold the originals.
+
 ## 3. Predictive expert reads: closed
 
 Andrew's follow-up closes this route independently of any future generation

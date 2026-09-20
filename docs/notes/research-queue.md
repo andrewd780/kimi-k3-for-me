@@ -10,7 +10,7 @@ scope, measurements, usage and remaining work.
 | Smaller trunk ring | Opt-in `--trunk-rows`: two row buffers, unchanged matrix arithmetic, current-layer vector arena; no cross-layer read in flight | Real-model latency, queue depth and prefill cost |
 | Compact Huffman decoder | Four streams, bounded word refill and two-symbol lookup; independent encoder, corruption checks, x86/ARM CI timings on synthetic and pinned K3 ranges | Results in the results note; production container, concurrent reader and resource-cost gate remain separate |
 | Predictive expert prefetch | Lead-labelled centroid/ridge diagnostic, synthetic tests only; [ordered gate audit](predictive-prefetch-gates.md) | Closed; do not reopen on a generation capture |
-| Fixed-width trunk dictionary | [Eight-range high-byte histogram falsifier](fixed-width-trunk.md), one pooled 15-entry dictionary | Run coverage gate first; stop if it fails before writing a codec |
+| Fixed-width trunk dictionary | [Eight-range falsifier, SIMD codec and rate gates](fixed-width-trunk.md), one pooled 15-entry dictionary, benchmark-only | Gates 1–3 passed in CI: 99.95% coverage, r = 0.7502, SIMD decode 14.8–26.7 reconstructed GB/s, every run above the 4 GB/s target. Open: 5-bit ratio-versus-rate curve, row-seekable layout cost, decode under concurrent compute, supported reader |
 | Bounded lookahead | Bounded Jacobi reference, exhaustive toy exactness checks and rational break-even calculator | Useful early acceptance on K3, engine snapshot/replay integration, measured total work |
 | Linux async submission | Raw-syscall `io_uring` versus blocking-pool experiment, queue depths 1/2/4/8/16, three runs per arm | A repeatable benefit under concurrent real compute before adding an engine backend |
 

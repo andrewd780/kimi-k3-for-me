@@ -1,0 +1,406 @@
+{
+  "schema": "fixed-dictionary-v1",
+  "mode": "rate",
+  "index_bits": 4,
+  "dictionary": [
+    188,
+    60,
+    61,
+    189,
+    59,
+    187,
+    58,
+    186,
+    185,
+    57,
+    190,
+    62,
+    56,
+    184,
+    183
+  ],
+  "cases": [
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786718,
+      "escape_values": 254,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.541455496,
+            1.548506462,
+            1.547007795
+          ],
+          "mean": 1.5456565843333334,
+          "median": 1.547007795,
+          "minimum": 1.541455496
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            24.91885731,
+            24.846787599,
+            25.093625984
+          ],
+          "mean": 24.953090297666666,
+          "median": 24.91885731,
+          "minimum": 24.846787599
+        }
+      ],
+      "sample": {
+        "shard": "model-00002-of-000096.safetensors",
+        "tensor": "language_model.model.layers.1.self_attn.f_a_proj.weight",
+        "offset": 383171600,
+        "bytes": 1048576,
+        "sha256": "af6149644f8c98ac0b68d95e7758fe9adf5f3b7cda3c9f299293428cb0b10f41"
+      },
+      "sha256": "af6149644f8c98ac0b68d95e7758fe9adf5f3b7cda3c9f299293428cb0b10f41",
+      "payload_ratio": 0.7502422332763672,
+      "framed_ratio": 0.7502727508544922
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786772,
+      "escape_values": 308,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.530558103,
+            1.531722702,
+            1.541146004
+          ],
+          "mean": 1.534475603,
+          "median": 1.531722702,
+          "minimum": 1.530558103
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            24.27393896,
+            24.47655833,
+            24.406448919
+          ],
+          "mean": 24.385648736333334,
+          "median": 24.406448919,
+          "minimum": 24.27393896
+        }
+      ],
+      "sample": {
+        "shard": "model-00013-of-000096.safetensors",
+        "tensor": "language_model.model.layers.12.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "eaa7a075045667f284be1cd50a85094f8cab21c1d7130cf19a10af32eb654c46"
+      },
+      "sha256": "eaa7a075045667f284be1cd50a85094f8cab21c1d7130cf19a10af32eb654c46",
+      "payload_ratio": 0.7502937316894531,
+      "framed_ratio": 0.7503242492675781
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786737,
+      "escape_values": 273,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.504651919,
+            1.573454333,
+            1.57976212
+          ],
+          "mean": 1.5526227906666668,
+          "median": 1.573454333,
+          "minimum": 1.504651919
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            25.138769462,
+            25.287689528,
+            25.329846836
+          ],
+          "mean": 25.252101942,
+          "median": 25.287689528,
+          "minimum": 25.138769462
+        }
+      ],
+      "sample": {
+        "shard": "model-00025-of-000096.safetensors",
+        "tensor": "language_model.model.layers.24.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "7e7062fa555acdf8b1fd5be5c0d834034a6077be38f418462292ab31d5a3ca22"
+      },
+      "sha256": "7e7062fa555acdf8b1fd5be5c0d834034a6077be38f418462292ab31d5a3ca22",
+      "payload_ratio": 0.7502603530883789,
+      "framed_ratio": 0.7502908706665039
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786706,
+      "escape_values": 242,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.546022572,
+            1.5598877,
+            1.568478198
+          ],
+          "mean": 1.55812949,
+          "median": 1.5598877,
+          "minimum": 1.546022572
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            25.339280506,
+            25.49104826,
+            25.302566049
+          ],
+          "mean": 25.377631605,
+          "median": 25.339280506,
+          "minimum": 25.302566049
+        }
+      ],
+      "sample": {
+        "shard": "model-00037-of-000096.safetensors",
+        "tensor": "language_model.model.layers.36.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "c2b8c94f6568817f5b1ed008658d2e59125f30f7d4e83ccfa8a284de48c06efe"
+      },
+      "sha256": "c2b8c94f6568817f5b1ed008658d2e59125f30f7d4e83ccfa8a284de48c06efe",
+      "payload_ratio": 0.7502307891845703,
+      "framed_ratio": 0.7502613067626953
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786712,
+      "escape_values": 248,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.554579321,
+            1.560372919,
+            1.566364457
+          ],
+          "mean": 1.560438899,
+          "median": 1.560372919,
+          "minimum": 1.554579321
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            25.704522127,
+            25.41904152,
+            25.34168523
+          ],
+          "mean": 25.488416292333334,
+          "median": 25.41904152,
+          "minimum": 25.34168523
+        }
+      ],
+      "sample": {
+        "shard": "model-00049-of-000096.safetensors",
+        "tensor": "language_model.model.layers.48.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "7a852464cb2a6656703f2ab9ca7eb4cb7517217c2165c9905dcff13f306ff397"
+      },
+      "sha256": "7a852464cb2a6656703f2ab9ca7eb4cb7517217c2165c9905dcff13f306ff397",
+      "payload_ratio": 0.7502365112304688,
+      "framed_ratio": 0.7502670288085938
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786671,
+      "escape_values": 207,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.538570081,
+            1.542351137,
+            1.547105966
+          ],
+          "mean": 1.542675728,
+          "median": 1.542351137,
+          "minimum": 1.538570081
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            25.300910521,
+            25.633713179,
+            25.42393284
+          ],
+          "mean": 25.45285218,
+          "median": 25.42393284,
+          "minimum": 25.300910521
+        }
+      ],
+      "sample": {
+        "shard": "model-00061-of-000096.safetensors",
+        "tensor": "language_model.model.layers.60.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "41d82ccae961b673e1749cfc5f3f2f88fb4c789b25083e8b255ffa8328b6fa81"
+      },
+      "sha256": "41d82ccae961b673e1749cfc5f3f2f88fb4c789b25083e8b255ffa8328b6fa81",
+      "payload_ratio": 0.7501974105834961,
+      "framed_ratio": 0.7502279281616211
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786621,
+      "escape_values": 157,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.574916768,
+            1.55193686,
+            1.555627428
+          ],
+          "mean": 1.5608270186666666,
+          "median": 1.555627428,
+          "minimum": 1.55193686
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            25.094961449,
+            24.867961595,
+            24.996137761
+          ],
+          "mean": 24.986353601666668,
+          "median": 24.996137761,
+          "minimum": 24.867961595
+        }
+      ],
+      "sample": {
+        "shard": "model-00073-of-000096.safetensors",
+        "tensor": "language_model.model.layers.72.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "40af77a82237fbd6e2bdf3edfe47e8cedb4f8b2342936f17e1ccc85d07422378"
+      },
+      "sha256": "40af77a82237fbd6e2bdf3edfe47e8cedb4f8b2342936f17e1ccc85d07422378",
+      "payload_ratio": 0.7501497268676758,
+      "framed_ratio": 0.7501802444458008
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 1048576,
+      "packed_bytes": 786677,
+      "escape_values": 213,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.542666574,
+            1.557639014,
+            1.558918073
+          ],
+          "mean": 1.5530745536666668,
+          "median": 1.557639014,
+          "minimum": 1.542666574
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            25.58112356,
+            25.60150897,
+            25.580009858
+          ],
+          "mean": 25.587547462666667,
+          "median": 25.58112356,
+          "minimum": 25.580009858
+        }
+      ],
+      "sample": {
+        "shard": "model-00093-of-000096.safetensors",
+        "tensor": "language_model.model.layers.92.self_attn.g_proj.weight",
+        "offset": 468322536,
+        "bytes": 1048576,
+        "sha256": "03391ddc641d2ad60ad362550f865ed73d0ae714a552bd773942b383d2e45927"
+      },
+      "sha256": "03391ddc641d2ad60ad362550f865ed73d0ae714a552bd773942b383d2e45927",
+      "payload_ratio": 0.7502031326293945,
+      "framed_ratio": 0.7502336502075195
+    },
+    {
+      "native": "ssse3_pshufb",
+      "raw_bytes": 8388608,
+      "packed_bytes": 6293390,
+      "escape_values": 1902,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.540819106,
+            1.541195298,
+            1.54550637
+          ],
+          "mean": 1.5425069246666667,
+          "median": 1.541195298,
+          "minimum": 1.540819106
+        },
+        {
+          "name": "ssse3_pshufb",
+          "decoded_BF16_GBps_runs": [
+            16.331512932,
+            16.263162905,
+            16.219657033
+          ],
+          "mean": 16.27144429,
+          "median": 16.263162905,
+          "minimum": 16.219657033
+        }
+      ],
+      "sample": {
+        "tensor": "pooled_eight_ranges"
+      },
+      "sha256": "ab4a5b943da9c1ea128aa4b59ed61759bbd3982012a906e141f150dd79145f4b",
+      "payload_ratio": 0.7502267360687256,
+      "framed_ratio": 0.7502305507659912
+    }
+  ],
+  "controls": null,
+  "execution": {
+    "machine": "x86_64",
+    "system": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "cpu": "x86_64",
+    "cpu_count": 4,
+    "compiler_flags": "-O3 -std=c99 -Wall -Wextra -Werror -mssse3",
+    "head_sha": "9f0c07f5f98688ffab51f23cf17051bf74e2e324",
+    "checkout_sha": "59b2b81a84375077f700b0ea4e692c49ac2fbb9c",
+    "run_id": "35498176696"
+  },
+  "scope": "repeated 1 MiB and pooled 8 MiB buffers, cache-friendly single-thread kernel; all escape handling and BF16 assembly timed, parse/allocation/I/O/encoding excluded; no competing model compute, storage or speedup claim",
+  "rate_gate": {
+    "status": "PASS",
+    "rule": "SIMD >=3 reconstructed BF16 GB/s in every one of 27 runs; scalar is a reference, not the proposed SIMD decoder",
+    "target_4_GBps_all_runs": true
+  }
+}
