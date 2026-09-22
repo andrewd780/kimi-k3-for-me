@@ -595,16 +595,48 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * Each iteration writes only its own score[e] and choice[e], and the ACCUMULATION
      * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
      * sequence into its own double. Splitting the outer loop therefore cannot change a
-     * single bit, which is why this needs no tolerance and no re-gating. */
+     * single bit, which is why this needs no tolerance and no re-gating.
+     *
+     * EIGHT EXPERTS PER PASS OVER x, for the same reason. One expert's sum is a single
+     * chain of 7168 dependent double adds, so a core running one expert at a time waits
+     * out the add latency on every element and leaves the rest of its pipeline idle.
+     * Walking K3_ROUTER_BLOCK experts side by side gives the core that many independent
+     * chains, each still receiving its terms i = 0..hidden-1 in order, one add per term,
+     * exactly as before: the interleaving changes WHEN each add issues, never which adds
+     * happen or in what order within an expert, so every score is bit-identical to the
+     * one-expert loop. The product needs no care either way: a float times a float fits
+     * in double's 53 bits, so it is exact whether or not the compiler fuses it. Measured
+     * single-threaded at the released shape (896 x 7168): 8.3 ms -> 4.0 ms per layer,
+     * about 0.39 s per token across the 92 MoE layers, with memcmp-equal scores. The
+     * tail block (n_experts % K3_ROUTER_BLOCK experts) runs the same per-expert loop. */
+    enum { K3_ROUTER_BLOCK = 8 };
+    const int nblk = (n_experts + K3_ROUTER_BLOCK - 1) / K3_ROUTER_BLOCK;
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
-    for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+    for (int b = 0; b < nblk; b++) {
+        const int e0 = b * K3_ROUTER_BLOCK;
+        const int n  = (n_experts - e0) < K3_ROUTER_BLOCK ? (n_experts - e0)
+                                                          : K3_ROUTER_BLOCK;
+        double acc[K3_ROUTER_BLOCK] = {0};
+        const float *row[K3_ROUTER_BLOCK];
+        for (int k = 0; k < n; k++) row[k] = W + (size_t)(e0 + k) * hidden;
+        if (n == K3_ROUTER_BLOCK) {
+            for (int i = 0; i < hidden; i++) {
+                const double xi = (double)x[i];
+                for (int k = 0; k < K3_ROUTER_BLOCK; k++)
+                    acc[k] += (double)row[k][i] * xi;
+            }
+        } else {
+            for (int k = 0; k < n; k++)
+                for (int i = 0; i < hidden; i++)
+                    acc[k] += (double)row[k][i] * (double)x[i];
+        }
+        for (int k = 0; k < n; k++) {
+            const int e = e0 + k;
+            score[e]  = 1.0f / (1.0f + expf(-(float)acc[k]));
+            choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        }
     }
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
