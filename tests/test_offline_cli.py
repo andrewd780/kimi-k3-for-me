@@ -146,6 +146,31 @@ class OfflineCliTests(unittest.TestCase):
                     self.assertLess(rows[0]["trunk_row_buffer_bytes"] +
                                     rows[0]["trunk_small_buffer_bytes"], 50000)
 
+    def test_trunk_rows_batched_positions_read_each_matrix_once(self):
+        # A forward over T positions applies every trunk matrix to all of them in one
+        # pass (k3_mmw_batch -> K3WeightStream.apply_batch), so under --trunk-rows it
+        # must read exactly what a one-position forward reads: the same matrix passes and
+        # the same bytes. Before batching, each position reread every matrix from disk,
+        # so an 8-token prompt cost about eight passes. --gen 1 makes each run a single
+        # forward; the prompt is the only thing that varies.
+        for trunk in (self.trunk, self.ztrunk):
+            for mode in ([], ["--incremental"]):
+                with self.subTest(trunk=trunk.name, mode=mode):
+                    common = ["--gen", "1", "--trunk", trunk, "--trunk-gb", "0.00005",
+                              "--trunk-rows", *mode]
+                    one = self.run_cli(self.selective, ["--ids", "3", *common])[0]
+                    self.assertGreater(one["trunk_matrix_calls"], 0)
+                    self.assertGreater(one["trunk_bytes_read"], 0)
+                    for ids in ("3,7,11", "3,7,11,5,2,8,1,4"):
+                        many = self.run_cli(self.selective, ["--ids", ids, *common])[0]
+                        self.assertEqual(many["trunk_matrix_calls"], one["trunk_matrix_calls"])
+                        self.assertEqual(many["trunk_bytes_read"], one["trunk_bytes_read"])
+                    # and a second forward is exactly a second pass
+                    two = self.run_cli(self.selective, ["--ids", "3,7,11",
+                                                        *common, "--gen", "2"])[0]
+                    self.assertEqual(two["trunk_matrix_calls"], 2 * one["trunk_matrix_calls"])
+                    self.assertEqual(two["trunk_bytes_read"], 2 * one["trunk_bytes_read"])
+
     def test_trunk_rows_invalid_mode_is_refused_before_loading(self):
         result = self.run_cli("absent", ["--ids", "1", "--trunk-rows"], ok=False)
         self.assertIn("--trunk-rows needs --trunk", result.stderr)
