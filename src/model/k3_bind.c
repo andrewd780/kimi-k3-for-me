@@ -654,21 +654,28 @@ int k3_model_stream_embed_row(K3ModelStream *m, float *dst, int64_t row)
     return 0;
 }
 
-int k3_model_stream_project(K3ModelStream *m, float *logits, const float *x)
+int k3_model_stream_project_batch(K3ModelStream *m, float *logits, const float *x, int n)
 {
     const int esz = k3_st_elemsize(m->lm_head->dtype);
     const int64_t row_bytes = (int64_t)m->hidden * esz;
     const int rows_per_chunk = (int)(K3_MODEL_STREAM_CHUNK / row_bytes);
-    if (rows_per_chunk < 1) return -1;
+    if (rows_per_chunk < 1 || n < 1) return -1;
 
     for (int first = 0; first < m->vocab; first += rows_per_chunk) {
-        const int n = (m->vocab - first < rows_per_chunk)
-                    ? m->vocab - first : rows_per_chunk;
+        const int nr = (m->vocab - first < rows_per_chunk)
+                     ? m->vocab - first : rows_per_chunk;
         const void *rows = NULL;
-        if (model_read_rows(m, m->lm_head, first, n, &rows,
+        if (model_read_rows(m, m->lm_head, first, nr, &rows,
                             &m->lm_head_bytes_read) != 0)
             return -1;
-        k3_mmw(logits + first, x, rows, m->lm_head_wdt, m->hidden, n);
+        /* n == 1 is k3_mmw itself; otherwise the chunk's rows serve all n positions */
+        k3_mmw_batch_ld(logits + first, m->vocab, x, m->hidden, rows, m->lm_head_wdt,
+                        m->hidden, nr, n);
     }
     return 0;
+}
+
+int k3_model_stream_project(K3ModelStream *m, float *logits, const float *x)
+{
+    return k3_model_stream_project_batch(m, logits, x, 1);
 }
