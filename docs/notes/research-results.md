@@ -156,6 +156,23 @@ was recomputed from the primitives and matched exactly before the files were
 written. The run's artifacts `dictionary-rate-ubuntu-latest` (ID 10601747318)
 and `dictionary-rate-macos-14` (ID 10600672892) hold the originals.
 
+**2026-09-22 follow-up** (details in the [fixed-width note](fixed-width-trunk.md)).
+The three open gates now have tooling. *Bit-width curve:* the gate tool scores
+3/4/5-bit tables, a sign-split variant, unconstrained Huffman and order-0 entropy
+bounds, per range and pooled, in CI. On the only committed real counts (four of
+the gate-1 `f_a_proj` ranges) 3 bits retains 0.704128 against 0.750153 for 4 bits
+(+4.60 points), 5 bits 0.8125, Huffman 0.672050, high-byte entropy 0.670303; the
+sample-matched FD4B premium over the four-stream Huffman payload is 7.80 points.
+*FD3B:* a 3-bit decoder with branch-free escape expansion (scalar, SSSE3, AVX2,
+NEON) passes byte-exact tests; here it runs about 5.9 (SSSE3) and 8.5 (AVX2) GB/s
+on 8 MiB against FD4B's 12.6, on a shared VM. *Row index:* FDRX makes any
+whole-row range decodable for 0.0340 points of matrix bytes per row, or 0.0148
+grouped, with zero padding at K3 widths. *Families:* gate 1 sampled two of 23
+matrix families (4.00% of trunk bytes); the `families` CI job samples all of
+them. *Contention:* a benchmark runs one decoder thread against
+`k3_matmul_bf16` on the other cores; results and the break-even are in the note.
+Hosted numbers for all of these await CI. No full-model speedup is claimed.
+
 ## 3. Predictive expert reads: closed
 
 Andrew's follow-up closes this route independently of any future generation

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent FD4B encoder; ordered correctness and kernel-rate gates in CI."""
+"""Independent FD4B/FD3B encoders; ordered correctness and kernel-rate gates in CI."""
 from __future__ import annotations
 
 import argparse
@@ -32,13 +32,43 @@ def encode(raw, dictionary):
             bytes(dictionary) + b"\0" + indexes + raw[::2] + escapes)
 
 
+FD3_SLACK = 32
+
+
+def encode3(raw, dictionary):
+    """FD3B: 3-bit codes as a little-endian bitstream (code i at bits 3i..3i+2), code 7
+    escapes; low bytes, escape bytes, then 32 zero bytes of decoder read slack."""
+    if (len(raw) > 16 << 20 or len(dictionary) != 7 or len(set(dictionary)) != 7
+            or any(type(v) is not int or not 0 <= v <= 255 for v in dictionary)):
+        raise ValueError("invalid raw length or dictionary")
+    lookup = {v: i for i, v in enumerate(dictionary)}
+    codes = [lookup.get(v, 7) for v in raw[1::2]]
+    indexes = bytearray((3 * len(codes) + 7) // 8)
+    for group in range(0, len(codes), 8):
+        chunk, word = codes[group:group + 8], 0
+        for j, code in enumerate(chunk):
+            word |= code << (3 * j)
+        width = (3 * len(chunk) + 7) // 8
+        indexes[3 * group // 8:3 * group // 8 + width] = word.to_bytes(3, "little")[:width]
+    escapes = bytes(v for v in raw[1::2] if v not in lookup)
+    return (b"FD3B" + struct.pack("<III", len(raw), len(escapes), 0) + bytes(dictionary) +
+            bytes(9) + indexes + raw[::2] + escapes + bytes(FD3_SLACK))
+
+
+# Index bits -> (encoder, dictionary entries). Entries are the pooled ranking's prefix.
+FORMATS = {4: (encode, 15), 3: (encode3, 7)}
+
+
+NATIVE = ("ssse3_pshufb", "neon_tbl", "avx2_vpshufb")
+
+
 def rate_gate(cases):
     if len(cases) != 9:
         return False
     for case in cases:
         arms = case.get("arms", [])
         if (case.get("byte_exact") is not True or len(arms) != 2
-                or case.get("native") not in ("ssse3_pshufb", "neon_tbl")
+                or case.get("native") not in NATIVE
                 or arms[1].get("name") != case["native"]):
             return False
         for arm in arms:
@@ -80,22 +110,32 @@ def invoke(binary, raw, encoded, mode):
     return result
 
 
-def correctness_controls(binary, dictionary):
-    # Independent golden byte layout: four high bytes and a final unpaired low byte.
-    golden_raw = bytes.fromhex("e100e201e3ffe40ee5")
-    golden = (b"FD4B" + struct.pack("<III", 9, 1, 0) + bytes(range(15)) +
-              b"\0\x10\xef" + bytes.fromhex("e1e2e3e4e5ff"))
-    if encode(golden_raw, list(range(15))) != golden:
+GOLDEN = {
+    # Four high bytes and a final unpaired low byte; nibble order low first.
+    4: (bytes.fromhex("e100e201e3ffe40ee5"), list(range(15)),
+        b"FD4B" + struct.pack("<III", 9, 1, 0) + bytes(range(15)) +
+        b"\0\x10\xef" + bytes.fromhex("e1e2e3e4e5ff")),
+    # Codes 1, 6, escape: bits 001 110 111 -> 0xF1 0x01; odd tail; 32 slack bytes.
+    3: (bytes.fromhex("e114e269e3aae4"), [3, 20, 37, 54, 71, 88, 105],
+        b"FD3B" + struct.pack("<III", 7, 1, 0) + bytes([3, 20, 37, 54, 71, 88, 105]) +
+        bytes(9) + bytes.fromhex("f101e1e2e3e4aa") + bytes(FD3_SLACK)),
+}
+
+
+def correctness_controls(binary, dictionary, bits=4):
+    encoder = FORMATS[bits][0]
+    golden_raw, golden_dictionary, golden = GOLDEN[bits]
+    if encoder(golden_raw, golden_dictionary) != golden:
         raise ValueError("independent golden layout failed")
     if invoke(binary, golden_raw, golden, "verify").returncode:
         raise ValueError("C golden decode failed")
     raw = bytes(range(256)) * 3 + b"\xff"
-    encoded = encode(raw, dictionary)
+    encoded = encoder(raw, dictionary)
     positive = invoke(binary, raw, encoded, "verify")
     if positive.returncode:
         raise ValueError("positive control failed: " + positive.stderr)
     corrupt_payload = bytearray(encoded)
-    corrupt_payload[32 + (len(raw)//2 + 1)//2] ^= 1
+    corrupt_payload[32 + (bits * (len(raw) // 2) + 7) // 8] ^= 1
     controls = {"truncated_header": (raw, encoded[:31]),
                 "truncated_payload": (raw, encoded[:-1]),
                 "excess_payload": (raw, encoded + b"\0"),
@@ -117,29 +157,38 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--histogram", type=Path, default=Path("trunk-dictionary-histogram.json"),
                         help="passing gate-1 artifact from this CI workflow")
+    parser.add_argument("--index-bits", type=int, choices=sorted(FORMATS), default=4,
+                        help="4: FD4B, 15 pooled entries; 3: FD3B, the first 7 of them")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") != "true":
         parser.error("experimental execution is restricted to hosted CI")
-    samples, dictionary = sample_inputs(args.histogram)
-    controls = correctness_controls(args.binary, dictionary) if args.mode == "correctness" else None
+    samples, ranked = sample_inputs(args.histogram)
+    encoder, entries = FORMATS[args.index_bits]
+    dictionary = ranked[:entries]
+    controls = (correctness_controls(args.binary, dictionary, args.index_bits)
+                if args.mode == "correctness" else None)
     pooled = b"".join(raw for _, raw in samples)
     cases = []
     for identity, raw in samples + [({"tensor": "pooled_eight_ranges"}, pooled)]:
-        packed = encode(raw, dictionary)
+        packed = encoder(raw, dictionary)
         result = invoke(args.binary, raw, packed, "verify" if args.mode == "correctness" else "time")
         if result.returncode:
             raise ValueError("native reconstruction failed: " + result.stderr)
         row = json.loads(result.stdout)
-        if row["native"] not in ("ssse3_pshufb", "neon_tbl"):
+        if row["native"] not in NATIVE:
             raise ValueError("hosted SIMD target absent")
+        if row.get("index_bits") != args.index_bits:
+            raise ValueError("decoder did not select the requested format")
         row.update({"sample": identity, "sha256": hashlib.sha256(raw).hexdigest(),
-                    "payload_ratio": (len(packed) - 32) / len(raw),
+                    # Header and FD3B read slack are framing, not payload.
+                    "payload_ratio": (len(packed) - 32 - (FD3_SLACK if args.index_bits == 3
+                                                          else 0)) / len(raw),
                     "framed_ratio": len(packed) / len(raw)})
         for arm in row["arms"]:
             runs = arm["decoded_BF16_GBps_runs"]
             arm.update(mean=statistics.mean(runs), median=statistics.median(runs), minimum=min(runs))
         cases.append(row)
-    report = {"schema": "fixed-dictionary-v1", "mode": args.mode, "index_bits": 4,
+    report = {"schema": "fixed-dictionary-v1", "mode": args.mode, "index_bits": args.index_bits,
               "dictionary": dictionary, "cases": cases, "controls": controls,
               "execution": {"machine": platform.machine(), "system": platform.platform(),
                             "cpu": platform.processor(), "cpu_count": os.cpu_count(),

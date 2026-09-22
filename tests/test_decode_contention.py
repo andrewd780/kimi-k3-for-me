@@ -1,0 +1,62 @@
+"""Break-even arithmetic of the decode-under-contention gate, on hand-checkable rates."""
+from pathlib import Path
+import sys
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import bench_decode_contention as gate
+
+
+class BreakEvenTest(unittest.TestCase):
+    def test_ssd_bound_decode_hidden(self):
+        # B=3, r=.75, D=12, M_rest=6, M_all=8: raw 1/3 s/GB, compressed .25 s/GB.
+        raw, fd, limit = gate.stage_times(0.75, 3, 12, 6, 8)
+        self.assertAlmostEqual(raw, 1 / 3)
+        self.assertAlmostEqual(fd, 0.25)
+        self.assertEqual(limit, "ssd")
+        row = gate.break_even(0.75, 12, 6, 8, ssd=(3,))["streamed"][0]
+        self.assertAlmostEqual(row["speedup"], 4 / 3)
+        self.assertTrue(row["decode_hidden"])
+        self.assertAlmostEqual(row["decode_needed_for_full_gain_GBps"], 4)
+
+    def test_matmul_on_fewer_cores_can_erase_the_gain(self):
+        # B=6: raw max(1/6, 1/8) = 1/6; compressed max(.125, 1/12, 1/6) = 1/6.
+        row = gate.break_even(0.75, 12, 6, 8, ssd=(6,))["streamed"][0]
+        self.assertAlmostEqual(row["speedup"], 1.0)
+        self.assertEqual(row["limiting_stage"], "matmul")
+
+    def test_slow_decode_is_named_as_the_limit(self):
+        row = gate.break_even(0.75, 2, 6, 8, ssd=(3,))["streamed"][0]
+        self.assertEqual(row["limiting_stage"], "decode")
+        self.assertFalse(row["decode_hidden"])
+        self.assertAlmostEqual(row["speedup"], (1 / 3) / (1 / 2))
+        # A tie between decode and another stage is reported as decode.
+        self.assertEqual(gate.stage_times(0.5, 2, 4, 4, 8)[2], "decode")
+
+    def test_resident_regime_and_cpu_cost(self):
+        result = gate.break_even(0.75, 12, 6, 8)
+        self.assertAlmostEqual(result["resident"]["slowdown"], 8 / 6)
+        self.assertTrue(result["resident"]["decode_hidden"])
+        self.assertAlmostEqual(result["resident"]["matmul_core_loss"], 8 / 6)
+        self.assertAlmostEqual(result["core_seconds_per_token"], 108.81 / 12)
+        self.assertAlmostEqual(result["compressed_GB_read_per_token"], 0.75 * 108.81)
+        self.assertFalse(gate.break_even(0.75, 5, 6, 8)["resident"]["decode_hidden"])
+        with self.assertRaises(ValueError):
+            gate.stage_times(0.75, 3, 0, 6, 8)
+
+    def test_summary_uses_contended_rates_for_the_pipeline(self):
+        arms = {name: {"median": value, "min": value / 2} for name, value in (
+            ("decode_alone", 16), ("decode_concurrent", 12), ("matmul_all_threads", 8),
+            ("matmul_rest_threads", 7), ("matmul_concurrent", 6))}
+        summary = gate.summarize({"arms": arms, "packed_bytes": 3, "raw_bytes": 4})
+        median = summary["derived"]["median"]
+        self.assertAlmostEqual(median["decode_slowdown_under_matmul"], 16 / 12)
+        self.assertAlmostEqual(median["matmul_slowdown_under_decode"], 7 / 6)
+        self.assertAlmostEqual(median["contended"]["resident"]["slowdown"], 8 / 6)
+        self.assertAlmostEqual(median["core_seconds_per_token_contended"], 108.81 / 12)
+        self.assertAlmostEqual(summary["derived"]["min"]["core_seconds_per_token_alone"],
+                               108.81 / 8)
+
+
+if __name__ == "__main__":
+    unittest.main()

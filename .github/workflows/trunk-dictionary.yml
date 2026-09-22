@@ -4,14 +4,24 @@ on:
     paths:
       - '.github/workflows/trunk-dictionary.yml'
       - 'tools/trunk_dictionary_gate.py'
+      - 'tools/trunk_family_gate.py'
       - 'tools/remote_model.py'
       - 'tests/test_trunk_dictionary_gate.py'
+      - 'tests/test_trunk_family_gate.py'
       - 'tests/test_fixed_dictionary_driver.py'
+      - 'tests/test_decode_contention.py'
       - 'tests/unit/test_fixed_dictionary.c'
       - 'tools/bench_fixed_dictionary.py'
+      - 'tools/bench_decode_contention.py'
       - 'benchmarks/fixed_dictionary.h'
       - 'benchmarks/bench_fixed_dictionary.c'
+      - 'benchmarks/bench_decode_contention.c'
+      - 'src/core/k3_ops.c'
+      - 'include/k3/k3.h'
       - 'docs/measurements/lossless-samples.json'
+      - 'docs/measurements/fixed-width-curve-four-ranges.json'
+      - 'docs/measurements/research-two-symbol.json'
+      - 'docs/measurements/fixed-dictionary-rate-x86_64.json'
   workflow_dispatch:
 
 permissions:
@@ -34,8 +44,10 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Prove the coverage and input-identity gates can fail
+      - name: Prove the coverage, identity and bit-width curve controls can fail
         run: python3 -m unittest discover -s tests -p test_trunk_dictionary_gate.py -v
+      # Also records the 3/4/5-bit and sign-split curve, the high-byte and whole-BF16
+      # order-0 entropy bounds and the unconstrained Huffman ratio for the same bytes.
       - name: Falsifier first (exactly eight hash-verified 1 MiB dense ranges)
         env:
           RESEARCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -96,8 +108,15 @@ jobs:
           ubsan_flags="${flags/-fsanitize=address,undefined/-fsanitize=undefined}"
           cc $asan_flags tests/unit/test_fixed_dictionary.c -o control-asan
           cc $ubsan_flags tests/unit/test_fixed_dictionary.c -o control-ubsan
+          # FD3B also has an AVX2 path; x86 builds it under the same sanitizers.
+          if [ "$(uname -m)" = x86_64 ]; then
+            cc ${flags/-mssse3/-mavx2} tests/unit/test_fixed_dictionary.c -o test-fixed-dictionary-avx2
+            cc ${flags/-mssse3/-mavx2} benchmarks/bench_fixed_dictionary.c -o bench-fixed-dictionary-avx2
+          fi
       - name: Tails, escape paths, bounds and corrupt-input controls
-        run: ./test-fixed-dictionary
+        run: |
+          ./test-fixed-dictionary
+          if [ -x test-fixed-dictionary-avx2 ]; then ./test-fixed-dictionary-avx2; fi
       - name: Demonstrate both sanitizer gates detect deliberate faults
         run: |
           if ./control-asan trip-asan > asan-control.txt 2>&1; then exit 1; fi
@@ -105,13 +124,19 @@ jobs:
           if ./control-ubsan trip-ubsan > ubsan-control.txt 2>&1; then exit 1; fi
           grep -q 'runtime error: signed integer overflow' ubsan-control.txt
       - name: Byte-exact scalar and SIMD round trips on all eight pinned ranges
-        run: python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode correctness --out dictionary-exactness.json
+        run: |
+          python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode correctness --out dictionary-exactness.json
+          python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode correctness --index-bits 3 --out dictionary-exactness-fd3b.json
+          if [ -x bench-fixed-dictionary-avx2 ]; then
+            python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary-avx2 --mode correctness --index-bits 3 --out dictionary-exactness-fd3b-avx2.json
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dictionary-exactness-${{ matrix.os }}
           path: |
             dictionary-exactness.json
+            dictionary-exactness-fd3b*.json
             asan-control.txt
             ubsan-control.txt
 
@@ -143,11 +168,99 @@ jobs:
           echo "CODEC_FLAGS=$flags" >> "$GITHUB_ENV"
           cc --version
           cc $flags benchmarks/bench_fixed_dictionary.c -o bench-fixed-dictionary
+          if [ "$(uname -m)" = x86_64 ]; then
+            cc ${flags/-mssse3/-mavx2} benchmarks/bench_fixed_dictionary.c -o bench-fixed-dictionary-avx2
+          fi
       - name: Three reconstructed-BF16 GB/s runs per arm and input
-        run: python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode rate --out dictionary-rate.json
+        run: |
+          python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode rate --out dictionary-rate.json
+          python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode rate --index-bits 3 --out dictionary-rate-fd3b.json
+          if [ -x bench-fixed-dictionary-avx2 ]; then
+            python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary-avx2 --mode rate --index-bits 3 --out dictionary-rate-fd3b-avx2.json
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dictionary-rate-${{ matrix.os }}
-          path: dictionary-rate.json
+          path: |
+            dictionary-rate.json
+            dictionary-rate-fd3b*.json
+          if-no-files-found: error
+
+  # Gate 1 sampled two families (KDA f_a_proj, MLA g_proj). This job reads every shard
+  # header for the exact per-family inventory, then 1 MiB systematic samples from every
+  # BF16 matrix family, and scores one byte-weighted pooled dictionary on each family.
+  families:
+    needs: histogram
+    name: Per-family coverage and bit-width curve
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RESEARCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: trunk-dictionary-histogram
+      - name: Inventory, sampling-plan and byte-weighting controls
+        run: python3 -m unittest discover -s tests -p test_trunk_family_gate.py -v
+      - name: Every shard header, then real samples from every BF16 matrix family
+        run: python3 tools/trunk_family_gate.py sample --gate1 trunk-dictionary-histogram.json --out trunk-family-gate.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trunk-family-gate
+          path: trunk-family-gate.json
+          if-no-files-found: error
+
+  # One decoder thread against the engine's k3_matmul_bf16 on the remaining cores, real
+  # 12288 x 7168 shape, FD4B and FD3B, each also alone. Synthetic weights only.
+  contention:
+    needs: exactness
+    name: Decode under matmul contention (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      RESEARCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Break-even arithmetic controls
+        run: python3 -m unittest discover -s tests -p test_decode_contention.py -v
+      - name: Build with the engine's flags and OpenMP
+        run: |
+          flags='-O3 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -pthread -ffp-contract=off'
+          if [ "$(uname -s)" = Darwin ]; then
+            brew install libomp
+            arch='-mcpu=native'
+            omp="-Xpreprocessor -fopenmp -I$(brew --prefix libomp)/include"
+            omplib="-L$(brew --prefix libomp)/lib -lomp"
+          else
+            arch='-march=native'; omp='-fopenmp'; omplib='-fopenmp'
+          fi
+          cc --version
+          includes='-Iinclude -Iinclude/k3 -Ithird_party -Isrc/core -Ibenchmarks'
+          cc $flags $arch $omp $includes -c src/core/k3_ops.c -o k3_ops.o
+          cc $flags -Werror $arch $omp $includes -c benchmarks/bench_decode_contention.c -o contention.o
+          cc contention.o k3_ops.o -o bench-decode-contention -lm -pthread $omplib
+      - name: Decode alone, matmul alone, both at once; five interleaved repeats
+        run: python3 tools/bench_decode_contention.py --binary ./bench-decode-contention --out decode-contention.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: decode-contention-${{ matrix.os }}
+          path: decode-contention.json
           if-no-files-found: error
