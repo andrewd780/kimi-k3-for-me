@@ -34,9 +34,12 @@ On a host already holding the packed checkpoint, add to an existing command:
 Use an explicit budget; auto selection and draft trunks are rejected for this mode.
 The existing whole-layer reader remains the default.
 
-**Tradeoff:** the current attention/MLP loops are token-major. Multi-token prefill
-can reread each matrix for every token, whereas whole-layer streaming keeps it
-during that batch. `--kv-latent` can reread `kv_b` for every cached position too.
+**Tradeoff:** every trunk matrix is applied to all positions of a forward in one
+pass (`k3_mmw_batch`, through `K3WeightStream.apply_batch`), so multi-token prefill
+and speculative verification read each matrix once per batch, as whole-layer
+streaming does; `test_offline_cli.py` checks that a 1-, 3- and 8-token forward read
+identical bytes. Before that change prefill reread each matrix for every token.
+`--kv-latent` still rereads `kv_b` for every cached position it rebuilds.
 Inspect `trunk_matrix_calls` and `trunk_bytes_read`; lower memory does not prove
 lower latency. Cross-matrix and cross-layer prefetch are not implemented.
 Compressed archives may decode a block repeatedly across small reads. The byte
