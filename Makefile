@@ -3,6 +3,7 @@
 #   make                build the engine (bin/k3)
 #   make test           run every test that needs no model weights
 #   make bench          kernel microbenchmarks
+#   make bench-mla      MLA KV-cache variants: timing at K3 geometry (quick form)
 #   make portable       build without -march/-mcpu=native (for distribution)
 #   make debug          -O0 -g with assertions
 #   make asan / ubsan   sanitizer builds
@@ -175,7 +176,7 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_kda_exact test_quality test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
+UNIT_TESTS := test_ops test_kda_exact test_quality test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk test_mla_variants
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -190,7 +191,7 @@ TOK_FILES  ?= $(HOME)/k3model
 # two concurrent `make test` runs cannot race on one filename and `make clean` removes it.
 
 # ---------------------------------------------------------------------------- targets --
-.PHONY: all test test-all bench portable debug asan ubsan format clean install help \
+.PHONY: all test test-all bench bench-mla portable debug asan ubsan format clean install help \
         tok cfg ops cache st oracle weights-test
 
 all: $(CLI_BIN)
@@ -255,6 +256,17 @@ $(BIN)/bench_kda: benchmarks/bench_kda.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+# The MLA cache variants live in a header under benchmarks/, not in the engine: the test
+# holds E+, L0 and L1 to k3_mla_cached bit for bit, and bench_mla times all of them and
+# measures the absorbed one. $< plus the object, because $^ would pass the header too.
+$(BIN)/test_mla_variants: tests/unit/test_mla_variants.c benchmarks/mla_variants.h \
+                          $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
+
+$(BIN)/bench_mla: benchmarks/bench_mla.c benchmarks/mla_variants.h \
+                  $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
+
 ## test: everything that needs no model weights
 test: $(CLI_BIN) $(TEST_BINS)
 	@echo "== ultra CLI contract =="; \
@@ -278,6 +290,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
 	@echo "== quality arithmetic =="; ./$(BIN)/test_quality
 	@echo "== KDA bitwise recurrence =="; ./$(BIN)/test_kda_exact
+	@echo "== MLA cache variants ==";  ./$(BIN)/test_mla_variants
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
@@ -337,6 +350,12 @@ cfg: $(BIN)/test_cfg
 ## bench: kernel microbenchmarks, no weights required
 bench: $(BIN)/bench_kernels
 	./$(BIN)/bench_kernels
+
+## bench-mla: MLA cache variants, one layer at K3 geometry (quick; see docs/notes/mla-variants.md)
+# The quick form stops at 4,096 cached positions and projects any run longer than 20 s
+# from the measured kv_b cost. benchmarks/mla-study.sh runs the full study.
+bench-mla: $(BIN)/bench_mla
+	./$(BIN)/bench_mla --C 256,1024,4096 --T 1,5 --max-run-s 20
 
 ## portable: drop the -march/-mcpu=native tuning, for a distributable binary
 # On x86-64 that means a generic AVX2 + FMA baseline. On arm64 there is no equivalent
