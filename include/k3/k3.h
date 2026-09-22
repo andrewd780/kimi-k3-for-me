@@ -278,9 +278,18 @@ enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2, K3_WSTREAM = 3 };
 /* A streamed matrix owns no weight bytes. apply completes every output row before
  * returning; its owner records I/O errors and the caller must check them before
  * consuming a layer's output. Keeping this callback here avoids an I/O dependency
- * in the arithmetic-only library and fixtures. */
+ * in the arithmetic-only library and fixtures.
+ *
+ * apply_batch is OPTIONAL and computes the same product for T positions in one pass:
+ * position t reads X + t*ldx and writes Y + t*ldy. A source that reads its matrix from
+ * disk implements it so the matrix is read ONCE per batch instead of once per position;
+ * each output must be bit-identical to apply on that position alone. NULL means
+ * k3_mmw_batch falls back to T calls of apply, which is always correct. ZERO THIS FIELD
+ * when building one of these on the stack: it is a function pointer. */
 typedef struct K3WeightStream {
     void (*apply)(const struct K3WeightStream *, float *, const float *, int, int);
+    void (*apply_batch)(const struct K3WeightStream *, float *Y, int ldy,
+                        const float *X, int ldx, int in, int out, int T);
 } K3WeightStream;
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
@@ -310,6 +319,58 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
         stream->apply(stream, y, x, in, out);
     }
     else                     k3_matmul(y, x, (const float *)W, in, out);
+}
+
+/* ---- the same product for T positions at once --------------------------------------
+ * Y[t*out + o] = W[o] . X[t*in], for t < T. Prefill, speculative verification and draft
+ * prefill apply every trunk matrix to T positions; one call here reads the matrix once
+ * and widens each weight once per block of positions, where T calls of k3_mmw read and
+ * widen it T times (and, under the row pipeline, reread it from disk T times).
+ *
+ * EXACT, not close: every Y[t*out + o] is BIT-IDENTICAL to what k3_mmw produces for that
+ * position alone -- same operands, same 16-accumulator partition, same fma order within
+ * each accumulator, same reduction tree, same tail -- in the scalar, AVX2 and NEON builds
+ * alike. The definitions in k3_ops.c carry the argument; test_ops checks it bitwise.
+ *
+ * T == 1 goes straight to the single-position kernel, so decode is unchanged. The _ld
+ * forms take row strides so a caller can write a sub-range of output rows or interleave
+ * two products (a [gate | up] layout). K3_WI8 (draft only, no exactness contract) is
+ * applied per position. Y must not overlap X. */
+void k3_matmul_batch(float *Y, const float *X, const float *W, int in, int out, int T);
+void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, int out,
+                          int T);
+void k3_matmul_batch_ld(float *Y, int ldy, const float *X, int ldx, const float *W,
+                        int in, int out, int T);
+void k3_matmul_bf16_batch_ld(float *Y, int ldy, const float *X, int ldx,
+                             const uint16_t *W, int in, int out, int T);
+
+static inline void k3_mmw_batch_ld(float *Y, int ldy, const float *X, int ldx,
+                                   const void *W, int wdt, int in, int out, int T)
+{
+    if (T <= 0) return;
+    if (T == 1) { k3_mmw(Y, X, W, wdt, in, out); return; }   /* decode: unchanged */
+    if (wdt == K3_WBF16) {
+        k3_matmul_bf16_batch_ld(Y, ldy, X, ldx, (const uint16_t *)W, in, out, T);
+    } else if (wdt == K3_WI8) {
+        for (int t = 0; t < T; t++)
+            k3_matmul_q8(Y + (size_t)t * ldy, X + (size_t)t * ldx, W, in, out);
+    } else if (wdt == K3_WSTREAM) {
+        const K3WeightStream *stream = (const K3WeightStream *)W;
+        if (stream->apply_batch) {
+            stream->apply_batch(stream, Y, ldy, X, ldx, in, out, T);
+        } else {
+            for (int t = 0; t < T; t++)
+                stream->apply(stream, Y + (size_t)t * ldy, X + (size_t)t * ldx, in, out);
+        }
+    } else {
+        k3_matmul_batch_ld(Y, ldy, X, ldx, (const float *)W, in, out, T);
+    }
+}
+
+static inline void k3_mmw_batch(float *Y, const float *X, const void *W, int wdt,
+                                int in, int out, int T)
+{
+    k3_mmw_batch_ld(Y, out, X, in, W, wdt, in, out, T);
 }
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.

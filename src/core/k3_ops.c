@@ -377,6 +377,309 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
     }
 }
 
+/* ------------------------------------------------------- batched matmul ---- */
+/* Y[t][o] = W[o] . X[t] for T positions in one call, every output BIT-IDENTICAL to
+ * k3_matmul or k3_matmul_bf16 applied to that position alone.
+ *
+ * WHY THIS EXISTS
+ *   Prefill, speculative verification and draft prefill apply every trunk matrix to T
+ *   positions. Called once per position, the matrix streams through the core T times and
+ *   the single-position kernel's real bottleneck, widening bf16 -> f32 -> f64, is redone
+ *   T times for the same weights; under the row pipeline each call also rereads the matrix
+ *   from disk. Here a row's weights are widened ONCE per register block of positions and
+ *   every position in the block consumes the same widened register, and a streamed matrix
+ *   is applied through K3WeightStream.apply_batch so it is read once per batch.
+ *
+ * WHY IT IS EXACT
+ *   A block of positions is several independent copies of the single-position
+ *   computation that happen to share the register holding the widened weight. For every
+ *   (position, output) pair nothing else differs:
+ *     - same operands. The weight goes through the same widening (bf16 -> f32 is a 16-bit
+ *       shift, f32 -> f64 is exact) and x through the same f32 -> f64 conversion. A
+ *       widened value is a value, whichever position it is shared with.
+ *     - same partition. Element i of the row lands in accumulator i % 16 of ITS position:
+ *       four __m256d per position on AVX2 (lane l of vector j is accumulator 4j+l), eight
+ *       float64x2_t per position on NEON (vector k holds accumulators 2k and 2k+1), a
+ *       [16] array per position in scalar C. Positions never share an accumulator.
+ *     - same order within an accumulator: i ascending, one fma per element, the product
+ *       first and the running sum last, exactly as the single-position kernels issue it.
+ *     - same reduction tree: (a[l] + a[4+l]) + (a[8+l] + a[12+l]) for each l, then
+ *       (b0 + b1) + (b2 + b3), per position.
+ *     - same tail: the elements past the last full 16 are fma'd into the reduced sum in
+ *       ascending order, and the final (float) rounding is the same.
+ *   OpenMP splits OUTPUT ROWS across threads, as the single-position kernels do, so each
+ *   output is still summed by one thread in the order above, at any thread count.
+ *   test_ops compares every output bitwise against the per-position kernels over many
+ *   shapes, tails and position counts, in whatever ISA the binary was built for.
+ *
+ * WHAT IS NOT DONE, AND WHY
+ *   AVX-512 is not used. Measured on an AVX-512 Xeon, a 512-bit form of this loop was no
+ *   faster than the 256-bit one: with the weight widened once per block, what remains is
+ *   the per-position f32 -> f64 conversion of x, and the wider form does not remove it.
+ *   Widening X to double once per call instead turns the loop into an L2 stream of
+ *   doubles, and that measured slower still, including with the tile packed for L1.
+ *   Position blocks of 4 were fastest on both 16- and 32-register x86 builds; NEON keeps
+ *   2, since each position needs eight of its 32 registers for accumulators. */
+
+/* Force inlining so that each call below, made with a literal block size, gets its own
+ * copy with the position loops unrolled and the accumulators held in registers. */
+#if defined(__GNUC__)
+#define K3_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define K3_ALWAYS_INLINE static inline
+#endif
+
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
+#define K3_MM_TB 2
+#else
+#define K3_MM_TB 4
+#endif
+
+/* Positions per pass over the matrix. Every row reads the X rows of all positions in the
+ * pass, so the pass is sized to keep them (about 512 KiB of floats) cache resident while
+ * the weights stream past; the matrix is then read once per pass rather than once per
+ * position. This chooses a loop order only. It cannot change an output. */
+static int k3_mm_pass(int in)
+{
+    long g = (512L * 1024L) / ((long)(in > 0 ? in : 1) * (long)sizeof(float));
+    g -= g % K3_MM_TB;
+    if (g < K3_MM_TB) g = K3_MM_TB;
+    if (g > 4096)     g = 4096;
+    return (int)g;
+}
+
+/* One output row for nb positions: y[t*ldy] for t < nb. fp32 weights, k3_matmul's
+ * arithmetic. */
+K3_ALWAYS_INLINE void k3_mm_f32_tile(float *y, int ldy, const float *X, int ldx,
+                                     const float *row, int in, const int nb)
+{
+    double a[K3_MM_TB][16];
+    double acc[K3_MM_TB];
+    for (int t = 0; t < nb; t++)
+        for (int l = 0; l < 16; l++) a[t][l] = 0.0;
+    int i = 0;
+    for (; i + 15 < in; i += 16)
+        for (int t = 0; t < nb; t++) {
+            const float *xt = X + (size_t)t * ldx + i;
+            for (int l = 0; l < 16; l++)
+                a[t][l] = fma((double)row[i + l], (double)xt[l], a[t][l]);
+        }
+    for (int t = 0; t < nb; t++) {
+        const double b0 = (a[t][0] + a[t][4]) + (a[t][8]  + a[t][12]);
+        const double b1 = (a[t][1] + a[t][5]) + (a[t][9]  + a[t][13]);
+        const double b2 = (a[t][2] + a[t][6]) + (a[t][10] + a[t][14]);
+        const double b3 = (a[t][3] + a[t][7]) + (a[t][11] + a[t][15]);
+        acc[t] = (b0 + b1) + (b2 + b3);
+    }
+    for (; i < in; i++) {
+        const double wi = (double)row[i];
+        for (int t = 0; t < nb; t++) acc[t] = fma(wi, (double)X[(size_t)t * ldx + i], acc[t]);
+    }
+    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = (float)acc[t];
+}
+
+/* One output row for nb positions, bf16 weights, k3_matmul_bf16's arithmetic in each of
+ * its three builds. */
+K3_ALWAYS_INLINE void k3_mm_bf16_tile(float *y, int ldy, const float *X, int ldx,
+                                      const uint16_t *row, int in, const int nb)
+{
+    double acc[K3_MM_TB];
+    int i = 0;
+#if defined(__AVX2__)
+    {
+        __m256d v[K3_MM_TB][4];
+        for (int t = 0; t < nb; t++)
+            for (int j = 0; j < 4; j++) v[t][j] = _mm256_setzero_pd();
+        for (; i + 15 < in; i += 16) {
+            /* Sixteen weights, widened once, by exactly k3_matmul_bf16's instructions:
+             * wv[j] holds elements i+4j .. i+4j+3, i.e. accumulators 4j .. 4j+3. */
+            __m256d wv[4];
+            for (int j = 0; j < 4; j++) {
+                const __m128i h = _mm_loadl_epi64((const __m128i *)(row + i + 4 * j));
+                wv[j] = _mm256_cvtps_pd(
+                    _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h), 16)));
+            }
+            for (int t = 0; t < nb; t++) {
+                const float *xt = X + (size_t)t * ldx + i;
+                for (int j = 0; j < 4; j++)
+                    v[t][j] = _mm256_fmadd_pd(wv[j], _mm256_cvtps_pd(_mm_loadu_ps(xt + 4 * j)),
+                                              v[t][j]);
+            }
+        }
+        /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing, per position */
+        for (int t = 0; t < nb; t++) {
+            const __m256d vt = _mm256_add_pd(_mm256_add_pd(v[t][0], v[t][1]),
+                                             _mm256_add_pd(v[t][2], v[t][3]));
+            double a[4];
+            _mm256_storeu_pd(a, vt);
+            acc[t] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    {
+        /* v[t][k] holds accumulators {2k, 2k+1} of position t, as w0..w7 do in
+         * k3_matmul_bf16's NEON path: quad q of the chunk feeds v[t][2q] with its low
+         * half and v[t][2q+1] with its high half, vfmaq_f64(acc, weight, x). */
+        float64x2_t v[K3_MM_TB][8];
+        for (int t = 0; t < nb; t++)
+            for (int k = 0; k < 8; k++) v[t][k] = vdupq_n_f64(0.0);
+        for (; i + 15 < in; i += 16) {
+            const uint16x8_t h0 = vld1q_u16(row + i);
+            const uint16x8_t h1 = vld1q_u16(row + i + 8);
+            const float32x4_t f[4] = {
+                vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16)),
+                vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16)),
+                vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16)),
+                vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16))
+            };
+            float64x2_t wv[8];
+            for (int q = 0; q < 4; q++) {
+                wv[2 * q]     = vcvt_f64_f32(vget_low_f32(f[q]));
+                wv[2 * q + 1] = vcvt_high_f64_f32(f[q]);
+            }
+            for (int t = 0; t < nb; t++) {
+                const float *xt = X + (size_t)t * ldx + i;
+                for (int q = 0; q < 4; q++) {
+                    const float32x4_t xq = vld1q_f32(xt + 4 * q);
+                    v[t][2 * q]     = vfmaq_f64(v[t][2 * q], wv[2 * q],
+                                                vcvt_f64_f32(vget_low_f32(xq)));
+                    v[t][2 * q + 1] = vfmaq_f64(v[t][2 * q + 1], wv[2 * q + 1],
+                                                vcvt_high_f64_f32(xq));
+                }
+            }
+        }
+        /* {b0,b1} = (v0+v2)+(v4+v6), {b2,b3} = (v1+v3)+(v5+v7), then (b0+b1)+(b2+b3):
+         * the scalar tree, as k3_matmul_bf16's NEON path reduces it. */
+        for (int t = 0; t < nb; t++) {
+            const float64x2_t s0 = vaddq_f64(vaddq_f64(v[t][0], v[t][2]),
+                                             vaddq_f64(v[t][4], v[t][6]));
+            const float64x2_t s1 = vaddq_f64(vaddq_f64(v[t][1], v[t][3]),
+                                             vaddq_f64(v[t][5], v[t][7]));
+            acc[t] = vaddvq_f64(s0) + vaddvq_f64(s1);
+        }
+    }
+#else
+    {
+        double a[K3_MM_TB][16];
+        for (int t = 0; t < nb; t++)
+            for (int l = 0; l < 16; l++) a[t][l] = 0.0;
+        for (; i + 15 < in; i += 16)
+            for (int l = 0; l < 16; l++) {
+                const double wl = (double)k3_bf16f(row[i + l]);
+                for (int t = 0; t < nb; t++)
+                    a[t][l] = fma(wl, (double)X[(size_t)t * ldx + i + l], a[t][l]);
+            }
+        for (int t = 0; t < nb; t++) {
+            const double b0 = (a[t][0] + a[t][4]) + (a[t][8]  + a[t][12]);
+            const double b1 = (a[t][1] + a[t][5]) + (a[t][9]  + a[t][13]);
+            const double b2 = (a[t][2] + a[t][6]) + (a[t][10] + a[t][14]);
+            const double b3 = (a[t][3] + a[t][7]) + (a[t][11] + a[t][15]);
+            acc[t] = (b0 + b1) + (b2 + b3);
+        }
+    }
+#endif
+    for (; i < in; i++) {
+        const double wi = (double)k3_bf16f(row[i]);
+        for (int t = 0; t < nb; t++) acc[t] = fma(wi, (double)X[(size_t)t * ldx + i], acc[t]);
+    }
+    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = (float)acc[t];
+}
+
+/* One pass: every row, positions in register blocks of K3_MM_TB, the remainder in one
+ * smaller block. Each literal block size below is its own inlined copy of the tile. */
+static void k3_mm_f32_pass(float *Y, int ldy, const float *X, int ldx,
+                           const float *W, int in, int out, int T)
+{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const float *row = W + (size_t)o * in;
+        int t = 0;
+        for (; t + K3_MM_TB <= T; t += K3_MM_TB)
+            k3_mm_f32_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                           row, in, K3_MM_TB);
+        float *yt = Y + (size_t)t * ldy + o;
+        const float *xt = X + (size_t)t * ldx;
+        switch (T - t) {
+#if K3_MM_TB > 3
+        case 3: k3_mm_f32_tile(yt, ldy, xt, ldx, row, in, 3); break;
+#endif
+#if K3_MM_TB > 2
+        case 2: k3_mm_f32_tile(yt, ldy, xt, ldx, row, in, 2); break;
+#endif
+        case 1: k3_mm_f32_tile(yt, ldy, xt, ldx, row, in, 1); break;
+        default: break;
+        }
+    }
+}
+
+static void k3_mm_bf16_pass(float *Y, int ldy, const float *X, int ldx,
+                            const uint16_t *W, int in, int out, int T)
+{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const uint16_t *row = W + (size_t)o * in;
+        int t = 0;
+        for (; t + K3_MM_TB <= T; t += K3_MM_TB)
+            k3_mm_bf16_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                            row, in, K3_MM_TB);
+        float *yt = Y + (size_t)t * ldy + o;
+        const float *xt = X + (size_t)t * ldx;
+        switch (T - t) {
+#if K3_MM_TB > 3
+        case 3: k3_mm_bf16_tile(yt, ldy, xt, ldx, row, in, 3); break;
+#endif
+#if K3_MM_TB > 2
+        case 2: k3_mm_bf16_tile(yt, ldy, xt, ldx, row, in, 2); break;
+#endif
+        case 1: k3_mm_bf16_tile(yt, ldy, xt, ldx, row, in, 1); break;
+        default: break;
+        }
+    }
+}
+
+void k3_matmul_batch_ld(float *Y, int ldy, const float *X, int ldx, const float *W,
+                        int in, int out, int T)
+{
+    if (T <= 0 || out <= 0) return;
+    const int g = k3_mm_pass(in);
+    for (int t0 = 0; t0 < T; t0 += g) {
+        const int n = T - t0 < g ? T - t0 : g;
+        float *Yp = Y + (size_t)t0 * ldy;
+        const float *Xp = X + (size_t)t0 * ldx;
+        if (n == 1) k3_matmul(Yp, Xp, W, in, out);         /* the decode kernel itself */
+        else        k3_mm_f32_pass(Yp, ldy, Xp, ldx, W, in, out, n);
+    }
+}
+
+void k3_matmul_bf16_batch_ld(float *Y, int ldy, const float *X, int ldx,
+                             const uint16_t *W, int in, int out, int T)
+{
+    if (T <= 0 || out <= 0) return;
+    const int g = k3_mm_pass(in);
+    for (int t0 = 0; t0 < T; t0 += g) {
+        const int n = T - t0 < g ? T - t0 : g;
+        float *Yp = Y + (size_t)t0 * ldy;
+        const float *Xp = X + (size_t)t0 * ldx;
+        if (n == 1) k3_matmul_bf16(Yp, Xp, W, in, out);    /* the decode kernel itself */
+        else        k3_mm_bf16_pass(Yp, ldy, Xp, ldx, W, in, out, n);
+    }
+}
+
+void k3_matmul_batch(float *Y, const float *X, const float *W, int in, int out, int T)
+{
+    k3_matmul_batch_ld(Y, out, X, in, W, in, out, T);
+}
+
+void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, int out,
+                          int T)
+{
+    k3_matmul_bf16_batch_ld(Y, out, X, in, W, in, out, T);
+}
+
 /* ------------------------------------------------------------- Gated MLA ---- */
 /* MLA with an optional KV cache, which is what makes incremental decode possible.
  *

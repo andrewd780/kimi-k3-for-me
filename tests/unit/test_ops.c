@@ -847,6 +847,266 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* The batched trunk matmul must equal the per-position kernels BIT FOR BIT.
+ *
+ * k3_matmul_bf16_batch and k3_matmul_batch exist so that prefill and speculative
+ * verification read and widen each trunk matrix once for T positions instead of T times.
+ * Their whole claim is that no output moves: the same operands, accumulator partition,
+ * fma order, reduction tree and tail as k3_matmul_bf16 / k3_matmul on one position. So the
+ * comparison is on bits, over shapes chosen to reach every branch -- in below, at and
+ * above one 16-element chunk and every in % 16 remainder that matters, out below and
+ * above the OpenMP threshold, position counts that fill 1, 2 and 3 register blocks with
+ * every remainder, and an `in` wide enough that the positions are split into several
+ * passes over the matrix, including a final pass of one. Weights are arbitrary finite
+ * bf16 bit patterns (denormals and huge exponents included); activations mix signs,
+ * zeros, denormals and wide magnitudes. The strided forms are checked to write exactly
+ * their rows and nothing between them, and k3_mmw_batch is checked through every weight
+ * tag, including a streamed matrix with and without an apply_batch callback. */
+static unsigned g_rng = 0x5EEDu;
+static unsigned rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5; return g_rng; }
+
+static float rnd_x(void)
+{
+    const unsigned r = rnd();
+    switch (r & 15u) {
+    case 0:  return 0.0f;
+    case 1:  return -0.0f;
+    case 2:  return (float)((int)(r >> 8) - 8388608) * 1e-44f;   /* denormal range */
+    case 3:  return (float)((int)(r >> 8) - 8388608) * 1e-3f;    /* up to ~8e3     */
+    default: return (float)(r >> 8) / 8388608.0f - 1.0f;
+    }
+}
+
+static uint16_t rnd_bf16(void)
+{
+    uint16_t h = (uint16_t)(rnd() >> 8);
+    if (((h >> 7) & 0xFF) == 0xFF) h &= 0x7F7Fu;   /* finite only; NaN proves nothing */
+    return h;
+}
+
+/* CANCELLING operands, the ones that make a wrong summation order VISIBLE.
+ *
+ * With ordinary values a reassociated double sum differs from the right one in its last
+ * bit or two, and the final rounding to float erases that almost every time: measured, a
+ * kernel with a deliberately wrong reduction tree passed thousands of random cases. Wide
+ * random magnitudes do not help either, because the largest terms dominate every order
+ * alike. What exposes the order is exact cancellation: each row carries one product of
+ * +2^60*v and one of -2^60*v (same activation v, opposite weights) on top of ordinary
+ * terms. The exact sum is just the ordinary terms, but in double every ordinary term that
+ * meets the 2^60 partial sum BEFORE the two cancel is absorbed and lost, and which terms
+ * those are is decided precisely by the accumulator partition, the order within each
+ * accumulator, the reduction tree and the tail. Get any of them wrong and the float result
+ * changes outright. The pair's slots are drawn per row from a few indices shared by the
+ * matrix, since v must be the same in both slots for every position. */
+static uint16_t bf16_of(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)(u >> 16); }
+
+static void fill_cancelling(uint16_t *Wb, float *Wf, float *X, int in, int out, int T, int ldx)
+{
+    int big[4], nbig = in < 4 ? in : 4;
+    for (int k = 0; k < nbig; k++) {
+        int dup;
+        do {
+            big[k] = (int)(rnd() % (unsigned)in);
+            dup = 0;
+            for (int m = 0; m < k; m++) if (big[m] == big[k]) dup = 1;
+        } while (dup);
+    }
+    for (int t = 0; t < T; t++) {
+        float *xt = X + (size_t)t * ldx;
+        for (int i = 0; i < ldx; i++) xt[i] = (float)(rnd() >> 8) / 8388608.0f - 1.0f;
+        const float v = ((rnd() & 1u) ? -1.0f : 1.0f) * (1.0f + (float)(rnd() & 0xFFu) / 256.0f);
+        for (int k = 0; k < nbig; k++) xt[big[k]] = v;
+    }
+    for (int o = 0; o < out; o++) {
+        uint16_t *wb = Wb + (size_t)o * in;
+        float    *wf = Wf + (size_t)o * in;
+        for (int i = 0; i < in; i++) {
+            const uint16_t h = bf16_of((float)(rnd() >> 8) / 8388608.0f - 1.0f);
+            wb[i] = h; wf[i] = k3_bf16f(h);
+        }
+        if (nbig < 2) continue;
+        for (int k = 0; k < nbig; k++) { wb[big[k]] = 0; wf[big[k]] = 0.0f; }
+        const int p = (int)(rnd() % (unsigned)nbig);
+        int q = (int)(rnd() % (unsigned)(nbig - 1));
+        if (q >= p) q++;
+        wb[big[p]] = 0x5D80u; wf[big[p]] = k3_bf16f(0x5D80u);    /* +2^60 */
+        wb[big[q]] = 0xDD80u; wf[big[q]] = k3_bf16f(0xDD80u);    /* -2^60 */
+    }
+}
+
+typedef struct { K3WeightStream s; const uint16_t *W; int calls, batch_calls; } MockStream;
+static void mock_apply(const K3WeightStream *s, float *y, const float *x, int in, int out)
+{
+    MockStream *m = (MockStream *)(void *)s;
+    m->calls++;
+    k3_matmul_bf16(y, x, m->W, in, out);
+}
+static void mock_apply_batch(const K3WeightStream *s, float *Y, int ldy, const float *X,
+                             int ldx, int in, int out, int T)
+{
+    MockStream *m = (MockStream *)(void *)s;
+    m->batch_calls++;
+    k3_matmul_bf16_batch_ld(Y, ldy, X, ldx, m->W, in, out, T);
+}
+
+static int same_bits(const float *a, const float *b, size_t n)
+{
+    return memcmp(a, b, n * sizeof(float)) == 0;
+}
+
+static void t_matmul_batch(void)
+{
+    static const int ins[]  = {1, 5, 15, 16, 17, 31, 32, 33, 47, 100, 257, 1000};
+    static const int outs[] = {1, 3, 64, 65, 129, 300};
+    static const int Ts[]   = {1, 2, 3, 4, 5, 8, 17};
+    const int nin = (int)(sizeof ins / sizeof *ins), nout = (int)(sizeof outs / sizeof *outs);
+    const int nT = (int)(sizeof Ts / sizeof *Ts);
+    long cases = 0, bad = 0;
+    char where[160] = "";
+
+    for (int a = 0; a <= nin; a++) {
+        /* the last "in" is wide enough that 17 positions take several passes */
+        const int in = a < nin ? ins[a] : 33000;
+        for (int b = 0; b < nout; b++) {
+            const int out = a < nin ? outs[b] : 70;
+            if (a == nin && b > 0) break;
+            for (int c = 0; c < nT; c++) {
+                const int T = Ts[c];
+                const int ldx = in + 5, ldy = out + 3;
+                const size_t nw = (size_t)in * out;
+                uint16_t *Wb = (uint16_t *)malloc(nw * sizeof(uint16_t));
+                float *Wf = (float *)malloc(nw * sizeof(float));
+                float *X  = (float *)malloc((size_t)T * ldx * sizeof(float));
+                float *Yr = (float *)malloc((size_t)T * ldy * sizeof(float));
+                float *Yb = (float *)malloc((size_t)T * ldy * sizeof(float));
+                if (!Wb || !Wf || !X || !Yr || !Yb) {
+                    printf("  FAIL  matmul_batch   allocation\n"); g_fail++;
+                    free(Wb); free(Wf); free(X); free(Yr); free(Yb); return;
+                }
+                /* odd cases draw arbitrary values, even cases cancelling ones */
+                if ((a + b + c) % 2 == 0) {
+                    fill_cancelling(Wb, Wf, X, in, out, T, ldx);
+                } else {
+                    for (size_t i = 0; i < nw; i++) { Wb[i] = rnd_bf16(); Wf[i] = rnd_x(); }
+                    for (size_t i = 0; i < (size_t)T * ldx; i++) X[i] = rnd_x();
+                }
+
+                for (int dt = 0; dt < 2; dt++) {
+                    /* reference: the single-position kernel, one position at a time */
+                    for (int t = 0; t < T; t++) {
+                        if (dt) k3_matmul_bf16(Yr + (size_t)t * out, X + (size_t)t * ldx,
+                                               Wb, in, out);
+                        else    k3_matmul(Yr + (size_t)t * out, X + (size_t)t * ldx,
+                                          Wf, in, out);
+                    }
+                    /* dense form, from a compact copy of X */
+                    float *Xc = (float *)malloc((size_t)T * in * sizeof(float));
+                    for (int t = 0; t < T; t++)
+                        memcpy(Xc + (size_t)t * in, X + (size_t)t * ldx, (size_t)in * sizeof(float));
+                    for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                    if (dt) k3_matmul_bf16_batch(Yb, Xc, Wb, in, out, T);
+                    else    k3_matmul_batch(Yb, Xc, Wf, in, out, T);
+                    cases++;
+                    if (!same_bits(Yr, Yb, (size_t)T * out)) {
+                        bad++;
+                        snprintf(where, sizeof where, "%s dense in=%d out=%d T=%d",
+                                 dt ? "bf16" : "fp32", in, out, T);
+                    }
+                    /* strided form: rows land at ldy, gaps untouched */
+                    for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                    if (dt) k3_matmul_bf16_batch_ld(Yb, ldy, X, ldx, Wb, in, out, T);
+                    else    k3_matmul_batch_ld(Yb, ldy, X, ldx, Wf, in, out, T);
+                    cases++;
+                    int ok = 1;
+                    for (int t = 0; t < T && ok; t++) {
+                        if (!same_bits(Yr + (size_t)t * out, Yb + (size_t)t * ldy, (size_t)out)) ok = 0;
+                        for (int g = out; g < ldy; g++)
+                            if (Yb[(size_t)t * ldy + g] != -12345.0f) ok = 0;
+                    }
+                    if (!ok) {
+                        bad++;
+                        snprintf(where, sizeof where, "%s strided in=%d out=%d T=%d",
+                                 dt ? "bf16" : "fp32", in, out, T);
+                    }
+                    /* the dispatcher, through the tag that selects this kernel */
+                    for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                    k3_mmw_batch(Yb, Xc, dt ? (const void *)Wb : (const void *)Wf,
+                                 dt ? K3_WBF16 : K3_WF32, in, out, T);
+                    cases++;
+                    if (!same_bits(Yr, Yb, (size_t)T * out)) {
+                        bad++;
+                        snprintf(where, sizeof where, "%s k3_mmw_batch in=%d out=%d T=%d",
+                                 dt ? "bf16" : "fp32", in, out, T);
+                    }
+                    free(Xc);
+                }
+
+                /* a streamed matrix: apply_batch when present, per-position apply when not */
+                if (in <= 257) {
+                    for (int with_batch = 0; with_batch < 2; with_batch++) {
+                        MockStream ms; memset(&ms, 0, sizeof ms);
+                        ms.s.apply = mock_apply;
+                        ms.s.apply_batch = with_batch ? mock_apply_batch : NULL;
+                        ms.W = Wb;
+                        for (int t = 0; t < T; t++)
+                            k3_matmul_bf16(Yr + (size_t)t * out, X + (size_t)t * ldx, Wb, in, out);
+                        for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                        k3_mmw_batch_ld(Yb, ldy, X, ldx, &ms, K3_WSTREAM, in, out, T);
+                        cases++;
+                        int ok = 1;
+                        for (int t = 0; t < T; t++)
+                            if (!same_bits(Yr + (size_t)t * out, Yb + (size_t)t * ldy, (size_t)out)) ok = 0;
+                        /* T == 1 must take the single-position path; otherwise one batch
+                         * call when the callback exists, T calls of apply when it does not */
+                        const int want_batch = (with_batch && T > 1) ? 1 : 0;
+                        const int want_calls = want_batch ? 0 : T;
+                        if (ms.batch_calls != want_batch || ms.calls != want_calls) ok = 0;
+                        if (!ok) {
+                            bad++;
+                            snprintf(where, sizeof where, "stream%s in=%d out=%d T=%d calls=%d/%d",
+                                     with_batch ? "+batch" : "", in, out, T, ms.calls, ms.batch_calls);
+                        }
+                    }
+                }
+                free(Wb); free(Wf); free(X); free(Yr); free(Yb);
+            }
+        }
+    }
+
+    /* K3_WI8 carries no exactness contract; the dispatcher must simply be the per-position
+     * draft kernel, so it is compared to exactly that. */
+    {
+        const int in = 100, out = 70, T = 5;
+        const size_t rowb = (size_t)4 + (size_t)in;
+        unsigned char *W8 = (unsigned char *)malloc(rowb * out);
+        float *X  = (float *)malloc((size_t)T * in * sizeof(float));
+        float *Yr = (float *)malloc((size_t)T * out * sizeof(float));
+        float *Yb = (float *)malloc((size_t)T * out * sizeof(float));
+        for (int o = 0; o < out; o++) {
+            const float sc = 0.01f * (float)(o + 1);
+            memcpy(W8 + (size_t)o * rowb, &sc, 4);
+            for (int i = 0; i < in; i++) W8[(size_t)o * rowb + 4 + i] = (unsigned char)rnd();
+        }
+        for (int i = 0; i < T * in; i++) X[i] = rnd_x();
+        for (int t = 0; t < T; t++)
+            k3_matmul_q8(Yr + (size_t)t * out, X + (size_t)t * in, W8, in, out);
+        k3_mmw_batch(Yb, X, W8, K3_WI8, in, out, T);
+        cases++;
+        if (!same_bits(Yr, Yb, (size_t)T * out)) { bad++; snprintf(where, sizeof where, "int8 draft"); }
+        free(W8); free(X); free(Yr); free(Yb);
+    }
+
+    if (bad) {
+        printf("  FAIL  matmul_batch   %ld/%ld cases differ from the per-position kernels, "
+               "e.g. %s\n", bad, cases, where);
+        g_fail++;
+    } else {
+        printf("  PASS  matmul_batch   %ld cases, T in {1,2,3,4,5,8,17}, bit-identical to "
+               "per-position k3_matmul_bf16 / k3_matmul\n", cases);
+        g_pass++;
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -884,6 +1144,7 @@ int main(int argc, char **argv)
     t_moe(dir);
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_batch();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");
