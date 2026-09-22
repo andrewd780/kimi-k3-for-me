@@ -613,16 +613,20 @@ static int mla_attend_A(float *acc, const float *q, int T, int C, const MlaCache
     }
 
     /* 4. u[t,h] = sum_s p_s c_s in float, s ascending: blocks ascending, positions
-     *    ascending within a block, and each head owned by one thread for the whole loop
-     *    (static schedule, identical bounds), so no term changes place. Blocks outer so
-     *    that one block of latent rows serves every head while it is in cache. */
+     *    ascending within a block, and each head owned by one thread for the whole loop,
+     *    so no term changes place. Blocks outer so that one block of latent rows serves
+     *    every head while it is in cache. No barrier per block (nowait): OpenMP assigns
+     *    iterations of static loops with the same trip count in the same parallel
+     *    region to the same threads, so a thread only ever touches its own heads and
+     *    has nothing to wait for. With a barrier, one descheduled thread stalls all the
+     *    others once per block, a thousand times per call at 16K positions. */
 #ifdef _OPENMP
 #pragma omp parallel
 #endif
     for (int s0 = 0; s0 < N; s0 += MLA_BLOCK) {
         const int s1 = s0 + MLA_BLOCK < N ? s0 + MLA_BLOCK : N;
 #ifdef _OPENMP
-#pragma omp for schedule(static)
+#pragma omp for schedule(static) nowait
 #endif
         for (int h = 0; h < H; h++) {
             for (int t = 0; t < T; t++) {
