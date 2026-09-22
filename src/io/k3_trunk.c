@@ -209,13 +209,24 @@ static int rows_wait(K3Rows *r)
     return result;
 }
 
-static void rows_apply(const K3WeightStream *stream, float *y, const float *x, int in, int out)
+/* One pass over a streamed matrix for T positions: position t reads X + t*ldx and writes
+ * Y + t*ldy. Each row tile is read from disk ONCE and applied to every position before the
+ * next tile replaces it, so a T-position batch costs one matrix of I/O rather than T. The
+ * product for a tile is k3_mmw_batch_ld over its rows, whose outputs are bit-identical to
+ * the per-position kernel's (see k3_ops.c), and tiling splits output ROWS only, so every
+ * output is the same float whether the matrix is tiled, resident, or batched. T == 1 takes
+ * the single-position kernel through k3_mmw_batch_ld, so decode runs exactly as before.
+ * matrix_calls counts passes, which is what the no-reread gate in test_offline_cli.py
+ * compares. */
+static void rows_run(const K3RowMatrix *m, float *Y, int ldy, const float *X, int ldx,
+                     int in, int out, int T)
 {
-    const K3RowMatrix *m = (const K3RowMatrix *)stream;
     K3Rows *r = m->owner;
     const size_t esz = m->dtype == K3_DT_BF16 ? 2u : 4u;
+    if (T <= 0) return;
     if (in <= 0 || out <= 0 || (uint64_t)in * (uint64_t)out > INT64_MAX / esz ||
-        (int64_t)((uint64_t)in * (uint64_t)out * esz) != m->nbytes) goto failed;
+        (int64_t)((uint64_t)in * (uint64_t)out * esz) != m->nbytes ||
+        (T > 1 && (ldy < out || ldx < in))) goto failed;
     const size_t row = (size_t)in * esz;
     if (r->tr->read_error || row > r->payload) goto failed;
     const size_t per = r->payload / row;
@@ -231,14 +242,26 @@ static void rows_apply(const K3WeightStream *stream, float *y, const float *x, i
         const int64_t off = m->off + (int64_t)first * (int64_t)row;
         const size_t prefix = r->tr->direct ? (size_t)(off % K3_TRUNK_ALIGN) : 0;
         const void *weight = r->buf[slot] + prefix;
-        k3_mmw(y + first, x, weight, m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32,
-               in, (int)count);
+        k3_mmw_batch_ld(Y + first, ldy, X, ldx, weight,
+                        m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32, in, (int)count, T);
         first = next; count = nnext; slot = 1 - slot;
     }
     return;
 failed:
     r->tr->read_error = 1;
-    if (out > 0) memset(y, 0, (size_t)out * sizeof(float));
+    if (out > 0)
+        for (int t = 0; t < T; t++) memset(Y + (size_t)t * ldy, 0, (size_t)out * sizeof(float));
+}
+
+static void rows_apply(const K3WeightStream *stream, float *y, const float *x, int in, int out)
+{
+    rows_run((const K3RowMatrix *)stream, y, out, x, in, in, out, 1);
+}
+
+static void rows_apply_batch(const K3WeightStream *stream, float *Y, int ldy,
+                             const float *X, int ldx, int in, int out, int T)
+{
+    rows_run((const K3RowMatrix *)stream, Y, ldy, X, ldx, in, out, T);
 }
 
 static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
@@ -249,7 +272,8 @@ static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
     if (narrow) {
         if (r->count == 64) return -1;
         K3RowMatrix *m = &r->matrix[r->count++];
-        m->stream.apply = rows_apply; m->owner = r;
+        m->stream.apply = rows_apply; m->stream.apply_batch = rows_apply_batch;
+        m->owner = r;
         m->off = off; m->nbytes = nb; m->dtype = dt;
         *dest = m;
         return 0;
