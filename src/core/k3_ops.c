@@ -746,15 +746,20 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * any two of them can appear to work, aliasing the gate buffer onto q, say, is
      * safe only while H*vh < H*qh holds, but that is an accident of the released
      * dimensions, not an invariant, and it breaks silently the moment v_head grows.
-     * Size the buffer with k3_mla_scratch_cached(); do not compute it by hand. */
+     * Size the buffer with k3_mla_scratch_cached(); do not compute it by hand.
+     *
+     * ct, ql, acc and gbuf hold one row PER POSITION so that every projection is applied
+     * to all T positions in one pass (k3_mmw_batch): the matrix is read and widened once
+     * per call rather than once per position. Nothing about a position's arithmetic
+     * changes; only where its intermediate rows live. */
     float *q    = scratch;                          /* [T][H][qh]     */
-    float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient, one token */
-    float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
-    float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
-    float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
+    float *ct   = q    + (size_t)T * H * qh;        /* [T][kvw] latent + rope slot */
+    float *ql   = ct   + (size_t)T * kvw;           /* [T][q_lora]    */
+    float *acc  = ql   + (size_t)T * c->q_lora;     /* [T][H][vh]     */
+    float *gbuf = acc  + (size_t)T * H * vh;        /* [T][H][vh] gate */
     /* Scores are per head in the latent layout, because the s loop moves outside the h
      * loop there and every head's row must survive until its own softmax runs. */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1], latent [H][last+1] */
+    float *sc   = gbuf + (size_t)T * H * vh;        /* [last+1], latent [H][last+1] */
     const size_t scn = lat ? (size_t)H * (size_t)(last + 1) : (size_t)(last + 1);
     float *kb   = sc   + scn;                       /* latent: [H][kvd] one position */
     /* Without a cache the keys/values live in scratch and cover only this call. */
@@ -765,28 +770,39 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
     #define K3_LAT_AT(p)  (kvc + (size_t)(p) * c->kv_lora)
 
-    /* ---- per-token projections ---- */
+    /* ---- projections, each matrix applied to every position in one pass ---- */
+    k3_mmw_batch(ql, x, w->q_a, w->wdt, E, c->q_lora, T);
     for (int t = 0; t < T; t++) {
-        const int p = cached + t;
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
-
-        /* ONE projection emits the compressed latent AND the shared rope slot */
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
-        /* The latent layout stores the kv_b INPUT and expands below; the expanded
-         * layout stores the kv_b OUTPUT. Same bytes into the same kernel either way. */
-        if (lat) memcpy(K3_LAT_AT(p), ct, (size_t)c->kv_lora * sizeof(float));
-        else     k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
+        float *qlt = ql + (size_t)t * c->q_lora;
+        k3_rmsnorm(qlt, qlt, w->q_a_norm, c->q_lora, c->rms_eps);
     }
+    k3_mmw_batch(q, ql, w->q_b, w->wdt, c->q_lora, H * qh, T);
 
-    /* ---- attention, per head, causal ---- */
+    /* ONE projection emits the compressed latent AND the shared rope slot */
+    k3_mmw_batch(ct, x, w->kv_a, w->wdt, E, kvw, T);
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+        float *ctt = ct + (size_t)t * kvw;
+        /* the norm covers the latent only, never the rope slot */
+        k3_rmsnorm(ctt, ctt, w->kv_a_norm, c->kv_lora, c->rms_eps);
+        memcpy(K3_ROPE_AT(p), ctt + c->kv_lora, (size_t)qr * sizeof(float));
+        /* The latent layout stores the kv_b INPUT and expands on use; the expanded
+         * layout stores the kv_b OUTPUT, below. Same bytes into the same kernel either
+         * way. */
+        if (lat) memcpy(K3_LAT_AT(p), ctt, (size_t)c->kv_lora * sizeof(float));
+    }
+    /* Positions cached .. cached+T-1 are consecutive rows of the expanded cache (or of
+     * kvs), so kv_b writes all of them in one pass, reading each position's normalised
+     * latent in place at stride kvw. */
+    if (!lat)
+        k3_mmw_batch_ld(K3_KV_AT(cached), H * kvd, ct, kvw, w->kv_b, w->wdt,
+                        c->kv_lora, H * kvd, T);
+
+    /* ---- attention, per head, causal. Position t leaves its heads' outputs in its own
+     * row of acc, so the gate and o_proj below can take every position in one pass. ---- */
+    for (int t = 0; t < T; t++) {
+        const int p = cached + t;
+        float *acct = acc + (size_t)t * H * vh;
         if (lat) {
             /* Pass one: rebuild each cached position ONCE and score it against every
              * head. Transposing the loops is what keeps the rebuild count at one per
@@ -813,7 +829,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 double z = 0.0;
                 for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
                 for (int s = 0; s <= p; s++) sh[s] = (float)(sh[s] / z);
-                float *o = acc + (size_t)h * vh;
+                float *o = acct + (size_t)h * vh;
                 for (int j = 0; j < vh; j++) o[j] = 0.0f;
             }
             /* Pass two: rebuild again and accumulate the values. Each o[j] still
@@ -822,7 +838,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 k3_mmw(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd);
                 for (int h = 0; h < H; h++) {
                     const float pr = sc[(size_t)h * (last + 1) + s];
-                    float *o = acc + (size_t)h * vh;
+                    float *o = acct + (size_t)h * vh;
                     const float *vs = kb + (size_t)h * kvd + qn;
                     for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
                 }
@@ -844,7 +860,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
 
-            float *o = acc + (size_t)h * vh;
+            float *o = acct + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
                 const float pr = (float)(sc[s] / z);
@@ -852,16 +868,16 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
         }
-
-        /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
-         * unlike KDA which norms first. :470-473 ---- */
-        if (w->g) {
-            k3_mmw(gbuf, x + (size_t)t * E, w->g, w->wdt, E, H * vh);
-            for (int i = 0; i < H * vh; i++)
-                acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
-        }
-        k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
     }
+
+    /* ---- output gate then projection, every position in one pass each. Gate BEFORE
+     * o_proj, and no norm on it, unlike KDA which norms first. :470-473 ---- */
+    if (w->g) {
+        k3_mmw_batch(gbuf, x, w->g, w->wdt, E, H * vh, T);
+        for (size_t i = 0; i < (size_t)T * H * vh; i++)
+            acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+    }
+    k3_mmw_batch(out, acc, w->o, w->wdt, H * vh, E, T);
     #undef K3_KV_AT
     #undef K3_ROPE_AT
     #undef K3_LAT_AT
@@ -983,10 +999,11 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
     /* The latent layout keeps one score row per head, and one rebuilt position. */
     size_t scores = (size_t)(cap > T ? cap : T);
     if (lat) scores *= (size_t)H;
+    /* ct, ql, acc and gbuf are per position so each projection is one batched pass */
     size_t n = (size_t)T * H * qh                      /* q            */
-             + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
-             + (size_t)c->q_lora
-             + (size_t)2 * H * vh                      /* acc, gbuf    */
+             + (size_t)T * (c->kv_lora + c->qk_rope)   /* ct           */
+             + (size_t)T * c->q_lora                   /* ql           */
+             + (size_t)2 * T * H * vh                  /* acc, gbuf    */
              + scores;
     if (lat) n += (size_t)H * kvd;                     /* rebuilt k/v  */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
@@ -1017,26 +1034,73 @@ size_t k3_mla_scratch(const K3Cfg *c, int T)
  * numbers rather than an invariant, and it is the same class of hazard documented at
  * the scratch layout in k3_mla_cached. Size with k3_moe_scratch().
  */
+/* The MoE scratch, laid out in ONE place so k3_moe, moe_prefill_chunk and
+ * k3_moe_scratch cannot disagree. The [T] regions hold one row per position, so each
+ * trunk matrix -- down, up and the shared expert's three -- is applied to every position
+ * in one pass (k3_mmw_batch) instead of once per position; the three per-expert buffers
+ * are reused for each routed expert in turn. */
+typedef struct {
+    float *z;      /* [T][L]     latent inputs, the down projection            */
+    float *accL;   /* [T][L]     weighted expert aggregates                    */
+    float *sgu;    /* [T][2*SI]  shared gate|up; SiTU overwrites the gate half */
+    float *sdn;    /* [T][E]     shared down projection                        */
+    float *gu;     /* [2*I]      gate|up, one routed expert                    */
+    float *act;    /* [I]        after SiTU                                    */
+    float *edn;    /* [L]        expert down projection                        */
+} K3MoeScratch;
+
+static K3MoeScratch moe_layout(float *scratch, const K3Cfg *c, int T)
+{
+    const size_t n = T > 0 ? (size_t)T : 1;
+    const size_t L = (size_t)c->latent, I = (size_t)c->moe_inter;
+    const size_t SI = I * (size_t)c->n_shared;
+    K3MoeScratch s;
+    s.z    = scratch;
+    s.accL = s.z    + n * L;
+    s.sgu  = s.accL + n * L;
+    s.sdn  = s.sgu  + n * 2 * SI;
+    s.gu   = s.sdn  + n * (size_t)c->hidden;
+    s.act  = s.gu   + 2 * I;
+    s.edn  = s.act  + I;
+    return s;
+}
+
+/* 6. The shared expert on the ORIGINAL full-width input, for every position, added
+ * UNWEIGHTED to out. sh1 and sh3 land interleaved per position as [gate | up]; SiTU
+ * writes its result over the gate half, which k3_situ_glu permits because element i of
+ * the output depends only on element i of each half; sh2 then reads that half at stride
+ * 2*SI. Per position this is exactly the sequence of k3_mmw calls it replaces. */
+static void moe_shared(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                       int T, const K3MoeScratch *s)
+{
+    const int E = c->hidden, SI = c->moe_inter * c->n_shared;
+    k3_mmw_batch_ld(s->sgu,      2 * SI, x, E, w->sh1, w->wdt, E, SI, T);
+    k3_mmw_batch_ld(s->sgu + SI, 2 * SI, x, E, w->sh3, w->wdt, E, SI, T);
+    for (int t = 0; t < T; t++) {
+        float *sg = s->sgu + (size_t)t * 2 * SI;
+        k3_situ_glu(sg, sg, SI, c->situ_b1, c->situ_b2);
+    }
+    k3_mmw_batch_ld(s->sdn, E, s->sgu, 2 * SI, w->sh2, w->wdt, SI, E, T);
+    for (size_t i = 0; i < (size_t)T * E; i++) out[i] += s->sdn[i];
+}
+
 void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             int T, int *idx, float *wt, float *scratch)
 {
     const int E = c->hidden, L = c->latent, I = c->moe_inter;
-    const int SI = I * c->n_shared;
+    const K3MoeScratch s = moe_layout(scratch, c, T);
+    float *gu = s.gu, *act = s.act, *edn = s.edn;
 
-    float *z    = scratch;              /* [L]    latent input              */
-    float *accL = z    + L;             /* [L]    weighted expert aggregate */
-    float *gu   = accL + L;             /* [2*I]  gate|up, one expert       */
-    float *act  = gu   + 2 * I;         /* [I]    after SiTU                */
-    float *edn  = act  + I;             /* [L]    expert down-projection    */
-    float *sgu  = edn  + L;             /* [2*SI] shared gate|up            */
-    float *sact = sgu  + 2 * SI;        /* [SI]   shared after SiTU         */
-    float *sdn  = sact + SI;            /* [E]    shared down-projection    */
+    /* 2. down-project every position into the latent space, one pass over `down`. It
+     * reads x, exactly as routing does, so hoisting it above step 1 changes nothing. */
+    k3_mmw_batch(s.z, x, w->down, w->wdt, E, L, T);
 
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
+        const float *z  = s.z + (size_t)t * L;
+        float *accL = s.accL + (size_t)t * L;
 
-        /* 1. route on the FULL width, before the down-projection */
+        /* 1. route on the FULL width x, never on the latent z */
         k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
                   c->moe_renorm, c->routed_scale);
 
@@ -1055,9 +1119,6 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             nk = m;
             if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
         }
-
-        /* 2. down-project into the latent space */
-        k3_mmw(z, xt, w->down, w->wdt, E, L);
 
         /* 3. the selected experts, in latent space, weighted and summed */
         for (int i = 0; i < L; i++) accL[i] = 0.0f;
@@ -1106,27 +1167,25 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             for (int i = 0; i < L; i++) accL[i] += wj * edn[i];
         }
 
-        /* 4. RMSNorm the AGGREGATE (not per expert), then 5. up-project */
+        /* 4. RMSNorm the AGGREGATE (not per expert) */
         if (c->latent_norm) k3_rmsnorm(accL, accL, w->latent_norm, L, c->rms_eps);
-        k3_mmw(ot, accL, w->up, w->wdt, L, E);
-
-        /* 6. shared expert on the ORIGINAL full-width input, added UNWEIGHTED */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
+
+    /* 5. up-project every position, one pass over `up`, then 6. the shared expert */
+    k3_mmw_batch(out, s.accL, w->up, w->wdt, L, E, T);
+    moe_shared(out, x, w, c, T, &s);
 }
 
-size_t k3_moe_scratch(const K3Cfg *c)
+/* Floats of scratch k3_moe and k3_moe_prefill need for T positions: see moe_layout. */
+size_t k3_moe_scratch(const K3Cfg *c, int T)
 {
-    const int SI = c->moe_inter * c->n_shared;
-    return (size_t)2 * c->latent          /* z, accL            */
-         + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
-         + (size_t)c->latent              /* edn                */
-         + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+    const size_t n  = T > 0 ? (size_t)T : 1;
+    const size_t SI = (size_t)c->moe_inter * c->n_shared;
+    return n * ((size_t)2 * c->latent     /* z, accL             */
+              + 2 * SI                    /* shared gate|up      */
+              + (size_t)c->hidden)        /* shared down         */
+         + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I)  */
+         + (size_t)c->latent;             /* edn                 */
 }
 
 /* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
@@ -1144,9 +1203,12 @@ size_t k3_moe_scratch(const K3Cfg *c)
  * the shared expert exactly as before. Only the ORDER in which experts are fetched from
  * disk changes, and that touches no floating-point result.
  *
- * out/x are [T][E], idx/wt scratch are topk-wide (reused per token), scratch is one
- * k3_moe_scratch. This path requires w->src (streamed); the resident path stays on
- * k3_moe, which is what the oracle gates exercise. */
+ * The trunk matrices go the same way the experts do: down, up and the shared expert are
+ * each applied to the whole chunk in one pass (k3_mmw_batch), per-position bit-identical.
+ *
+ * out/x are [T][E], idx/wt scratch are topk-wide (reused per token), scratch holds
+ * k3_moe_scratch(c, T) floats. This path requires w->src (streamed); the resident path
+ * stays on k3_moe, which is what the oracle gates exercise. */
 static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch);
 
@@ -1182,19 +1244,22 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
                               const K3Cfg *c, int T, float *scratch)
 {
     const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
-    const int SI = I * c->n_shared, K = c->topk;
+    const int K = c->topk;
+    const K3MoeScratch s = moe_layout(scratch, c, T);
 
-    /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
-     * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
-     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
+    /* Per-token routing decisions, plus a contribution buffer holding every routed
+     * expert's latent output for every token: [T][K][Ll]. At T=32, K=16, Ll=3584 that is
+     * ~7.3 MB, trivial beside the tens of GB already reserved. The latent inputs live in
+     * the scratch's z rows. */
     int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
     float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
-    float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
     float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
-    if (!ridx || !rwt || !zz || !contrib)
+    if (!ridx || !rwt || !contrib)
         k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
 
-    /* 1. route every token and down-project it, and collect the batch's unique experts. */
+    /* 1. down-project the whole chunk in one pass, then route every token and collect
+     * the batch's unique experts. */
+    k3_mmw_batch(s.z, x, w->down, w->wdt, E, Ll, T);
     int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
     char *seen = (char *)calloc((size_t)c->n_experts, 1);
     if (!uniq || !seen) k3_fatal_oom("MoE prefill index", (size_t)c->n_experts);
@@ -1205,7 +1270,6 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
-        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
             if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
@@ -1214,9 +1278,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
 
     /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
      * that selected it. gu/act/edn are reused per (expert, token). */
-    float *gu  = scratch;                 /* [2*I] */
-    float *act = gu + 2 * I;              /* [I]   */
-    float *edn = act + I;                 /* [Ll]  */
+    float *gu = s.gu, *act = s.act, *edn = s.edn;
     if (w->src->getmany) w->src->getmany(w->src, w->layer, uniq, nu);
     for (int u = 0; u < nu; u++) {
         const int e = uniq[u];
@@ -1229,7 +1291,7 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
         for (int t = 0; t < T; t++) {
             const int   *it = ridx + (size_t)t * K;
-            const float *zt = zz  + (size_t)t * Ll;
+            const float *zt = s.z + (size_t)t * Ll;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
                 k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
@@ -1241,14 +1303,12 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
     }
 
-    /* 3. per token, sum contributions in the ORIGINAL top-k order, then the tail of the
-     * MoE exactly as k3_moe does it, so every float matches the per-token path. */
+    /* 3. per token, sum contributions in the ORIGINAL top-k order and normalise, exactly
+     * as k3_moe does it, so every float matches the per-token path. Then the tail of the
+     * MoE for the whole chunk: up and the shared expert, one pass per matrix. */
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
         const float *wtt = rwt + (size_t)t * K;
-        /* Reuse this token's now-dead down-projection slot as the aggregate. */
-        float *acc = zz + (size_t)t * Ll;
+        float *acc = s.accL + (size_t)t * Ll;
         for (int i = 0; i < Ll; i++) acc[i] = 0.0f;
         for (int j = 0; j < K; j++) {
             const float wj = wtt[j];
@@ -1256,19 +1316,11 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             for (int i = 0; i < Ll; i++) acc[i] += wj * cb[i];
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
-        k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
-
-        float *sgu  = gu;                 /* [2*SI] */
-        float *sact = sgu + 2 * SI;       /* [SI]   */
-        float *sdn  = sact + SI;          /* [E]    */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
+    k3_mmw_batch(out, s.accL, w->up, w->wdt, Ll, E, T);
+    moe_shared(out, x, w, c, T, &s);
 
-    free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
+    free(ridx); free(rwt); free(contrib); free(uniq); free(seen);
 }
 
 /* --------------------------------------------------------- KDA full layer ---- */
@@ -1286,12 +1338,12 @@ static void l2norm_(float *v, int n, float eps)
 size_t k3_kda_scratch(const K3Cfg *c, int T)
 {
     const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
-    return 3 * (size_t)T * P        /* q, k, v after conv            */
-         + 2 * (size_t)T * P        /* z then alpha                  */
-         + (size_t)T * c->kda_heads /* beta                          */
-         + (size_t)T * P            /* recurrence output             */
-         + 2 * P                    /* gate buffer and one work row  */
-         + (size_t)c->kda_head_dim; /* f_a output                    */
+    return 3 * (size_t)T * P        /* q, k, v after conv                      */
+         + 2 * (size_t)T * P        /* z (then g, then the output gate), alpha */
+         + (size_t)T * c->kda_heads /* beta                                    */
+         + (size_t)T * P            /* recurrence output                       */
+         + P                        /* one work row, a slice per head          */
+         + (size_t)T * c->kda_head_dim; /* f_a output, per position            */
 }
 
 void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
@@ -1303,20 +1355,19 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *q  = scratch;                 float *k  = q + (size_t)T * P;
     float *v  = k + (size_t)T * P;       float *z  = v + (size_t)T * P;
     float *al = z + (size_t)T * P;       float *bt = al + (size_t)T * P;
-    float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
-    float *wr = gb + P;                  float *fa = wr + P;
+    float *o  = bt + (size_t)T * H;      float *wr = o + (size_t)T * P;
+    float *fa = wr + P;                  /* [T][D] */
 
-    /* 1. projections */
-    for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(q + (size_t)t * P, xt, w->q, w->wdt, E, P);
-        k3_mmw(k + (size_t)t * P, xt, w->k, w->wdt, E, P);
-        k3_mmw(v + (size_t)t * P, xt, w->v, w->wdt, E, P);
-        k3_mmw(bt + (size_t)t * H, xt, w->b, w->wdt, E, H);
-        /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
-        k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
-        k3_mmw(z + (size_t)t * P, fa, w->f_b, w->wdt, D, P);
-    }
+    /* 1. projections, each matrix applied to every position in one pass (k3_mmw_batch):
+     * read and widened once per call, not once per position, and per position
+     * bit-identical to k3_mmw. */
+    k3_mmw_batch(q,  x, w->q, w->wdt, E, P, T);
+    k3_mmw_batch(k,  x, w->k, w->wdt, E, P, T);
+    k3_mmw_batch(v,  x, w->v, w->wdt, E, P, T);
+    k3_mmw_batch(bt, x, w->b, w->wdt, E, H, T);
+    /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
+    k3_mmw_batch(fa, x,  w->f_a, w->wdt, E, D, T);
+    k3_mmw_batch(z,  fa, w->f_b, w->wdt, D, P, T);
 
     /* 2. ShortConv with fused SiLU, carrying state across calls */
     float *cs = state ? state + (size_t)H * D * D : NULL;
@@ -1370,33 +1421,62 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         }
     }
 
-    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
-    for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = o + (size_t)t * P;
-        for (int h = 0; h < H; h++)
-            k3_rmsnorm(ot + (size_t)h * D, ot + (size_t)h * D, w->o_norm, D, c->rms_eps);
-        k3_mmw(gb, xt, w->g, w->wdt, E, P);
-        for (int i = 0; i < P; i++) ot[i] *= sigmoidf_(gb[i]);
-        k3_mmw(out + (size_t)t * E, ot, w->o, w->wdt, P, E);
-    }
+    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection. Each stage
+     * covers every position before the next begins, so g_proj and o_proj are each one
+     * pass over their matrix. Positions share nothing here, so each position still sees
+     * exactly norm, then gate, then projection, on the same values.
+     *
+     * The gate rows reuse z. After step 5 z holds only the log-decay g, which nothing
+     * reads once alpha has been formed from it, and it is [T][P], exactly the gate's
+     * shape, so the batched gate costs no scratch beyond what the layer already had. */
+    for (int t = 0; t < T; t++)
+        for (int h = 0; h < H; h++) {
+            float *oh = o + (size_t)t * P + (size_t)h * D;
+            k3_rmsnorm(oh, oh, w->o_norm, D, c->rms_eps);
+        }
+    float *gt = z;
+    k3_mmw_batch(gt, x, w->g, w->wdt, E, P, T);
+    for (size_t i = 0; i < (size_t)T * P; i++) o[i] *= sigmoidf_(gt[i]);
+    k3_mmw_batch(out, o, w->o, w->wdt, P, E, T);
     free(Sown);
 }
 
 /* ----------------------------------------------------------- decoder layer ---- */
-size_t k3_layer_scratch(const K3Cfg *c, int T)
+/* The region after the layer's own buffers, which attention, then the MLP, take turns
+ * in: [2*dense_inter][sub-block]. Attention and the MoE use the sub-block; the dense MLP
+ * (layer 0) uses the whole region, since nothing else is live by then. */
+static size_t layer_region(const K3Cfg *c, int T)
 {
     size_t a = k3_mla_scratch(c, T);
     size_t b = k3_kda_scratch(c, T);
-    size_t m = k3_moe_scratch(c);
+    size_t m = k3_moe_scratch(c, T);
     size_t sub = a > b ? a : b;
     if (m > sub) sub = m;
-    /* prefix_sum, tmp, fold vectors, one attn_res source stack, plus the sub-block */
+    return (size_t)2 * c->dense_inter + sub;
+}
+
+/* Positions per block of the dense MLP. Each position needs one [gate | up] row of
+ * 2*dense_inter floats (SiTU then writes over the gate half in place), and a block is as
+ * many rows as the region holds, so the three dense matrices are applied to a whole
+ * block per pass without reserving anything beyond what attention already needs. For the
+ * released config and the fixture config alike that covers every position: the KDA
+ * sub-block alone is larger than 2*dense_inter per position. */
+static int dense_block(const K3Cfg *c, int T)
+{
+    const size_t row = (size_t)2 * (c->dense_inter > 0 ? c->dense_inter : 1);
+    size_t n = layer_region(c, T) / row;
+    if (n < 1) n = 1;
+    if (n > (size_t)T) n = (size_t)(T > 0 ? T : 1);
+    return (int)n;
+}
+
+size_t k3_layer_scratch(const K3Cfg *c, int T)
+{
+    /* prefix_sum, tmp, hin, fold vectors, one attn_res source stack, plus the region */
     return (size_t)3 * T * c->hidden
          + (size_t)2 * c->hidden
          + (size_t)(c->n_layers / c->attn_res_block + 2) * c->hidden
-         + (size_t)2 * c->dense_inter
-         + sub;
+         + layer_region(c, T);
 }
 
 /* The incremental form. Everything except MLA already carries its own state:
@@ -1422,8 +1502,8 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     float *foldA  = hin  + (size_t)T * E;       /* [E] attention aggregator      */
     float *foldM  = foldA + E;                  /* [E] mlp aggregator            */
     float *src    = foldM + E;                  /* [maxb+1][E] source stack      */
-    float *dgu    = src + (size_t)(maxb) * E;   /* [2*dense_inter]               */
-    float *sub    = dgu + (size_t)2 * c->dense_inter;
+    float *dgu    = src + (size_t)(maxb) * E;   /* the region: [2*dense_inter] ... */
+    float *sub    = dgu + (size_t)2 * c->dense_inter;   /* ... then the sub-block    */
 
     /* The norm gain and the scoring projection collapse to ONE vector. Folding them
      * here costs 2*hidden multiplies per layer; a real engine folds at load time. */
@@ -1488,12 +1568,23 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
          * to k3_moe inside, byte-identical. */
         k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
     } else {
-        for (int t = 0; t < T; t++) {
-            k3_mmw(dgu, hin + (size_t)t * E, w->dense_gate, w->wdt, E, c->dense_inter);
-            k3_mmw(dgu + c->dense_inter, hin + (size_t)t * E, w->dense_up, w->wdt,
-                      E, c->dense_inter);
-            k3_situ_glu(sub, dgu, c->dense_inter, c->situ_b1, c->situ_b2);
-            k3_mmw(tmp + (size_t)t * E, sub, w->dense_down, w->wdt, c->dense_inter, E);
+        /* Dense MLP (layer 0 only), in blocks of dense_block() positions: gate and up land
+         * interleaved per position as [gate | up], SiTU writes its result over the gate
+         * half (element i of the output depends only on element i of each half), and down
+         * reads that half at stride 2*dense_inter. Each matrix is one pass per block, and
+         * per position every value is what the per-position k3_mmw sequence produced. */
+        const int di = c->dense_inter, nb = dense_block(c, T);
+        for (int t0 = 0; t0 < T; t0 += nb) {
+            const int n = T - t0 < nb ? T - t0 : nb;
+            const float *ht = hin + (size_t)t0 * E;
+            k3_mmw_batch_ld(dgu,      2 * di, ht, E, w->dense_gate, w->wdt, E, di, n);
+            k3_mmw_batch_ld(dgu + di, 2 * di, ht, E, w->dense_up,   w->wdt, E, di, n);
+            for (int t = 0; t < n; t++) {
+                float *gu_t = dgu + (size_t)t * 2 * di;
+                k3_situ_glu(gu_t, gu_t, di, c->situ_b1, c->situ_b2);
+            }
+            k3_mmw_batch_ld(tmp + (size_t)t0 * E, E, dgu, 2 * di, w->dense_down, w->wdt,
+                            di, E, n);
         }
     }
 

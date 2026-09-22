@@ -133,7 +133,10 @@ void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps);
  *   a  = b1 * tanh(gate / b1) * sigmoid(gate)     sigmoid sees the UNCAPPED gate
  *   u  = b2 * tanh(up / b2)
  *   y  = a * u                                    |y| <= b1*b2
- * modeling_kimi_linear.py:75-82 */
+ * modeling_kimi_linear.py:75-82
+ * y may be x itself: y[i] depends only on x[i] and x[n+i], both read before y[i] is
+ * written, so the result lands over the gate half. The batched MoE shared expert and
+ * dense MLP rely on this to avoid a separate activation buffer per position. */
 void k3_situ_glu(float *y, const float *x, int n, float b1, float b2);
 
 /* Causal depthwise convolution with a fused SiLU.
@@ -193,11 +196,13 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  * scratch must hold at least
  *     T*H*(qk_nope+qk_rope)      q
  *   + T*H*(qk_nope+v_head)       kv
- *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
- *   + q_lora                     transient
- *   + 2*H*v_head                 attention accumulator and gate buffer
+ *   + T*qk_rope                  the shared rope slot
+ *   + T*(kv_lora+qk_rope)        kv_a output: compressed latent plus rope slot
+ *   + T*q_lora                   q_a output
+ *   + 2*T*H*v_head               attention accumulator and gate buffer
  *   + T                          scores
- * floats. Use k3_mla_scratch() rather than recomputing this.
+ * floats; the per-position rows let every projection take all T positions in one pass
+ * (k3_mmw_batch). Use k3_mla_scratch() rather than recomputing this.
  */
 typedef struct {
     /* Tagged by wdt: fp32 when zero (every fixture), bf16 for the real checkpoint. */
@@ -458,7 +463,10 @@ typedef struct {
     int          cache_only;
 } K3MoeW;
 
-size_t k3_moe_scratch(const K3Cfg *c);
+/* Floats of scratch k3_moe and k3_moe_prefill need for T positions. It grew a T when the
+ * trunk matrices of the MoE (down, up, the shared expert) started taking every position in
+ * one pass: the latent, aggregate and shared-expert rows are now held per position. */
+size_t k3_moe_scratch(const K3Cfg *c, int T);
 
 /* Number of routed experts that failed to load and were dropped from a MoE sum.
  * Non-zero means some token was computed with part of its routed contribution missing,
@@ -502,14 +510,14 @@ extern long k3_expert_drops;
  * k and v are rebuilt through kv_b on every use instead of being stored. */
 #define K3_KV_LATENT_BYTES_PER_POS 55296.0
 
-/* idx and wt must each hold topk entries. */
+/* idx and wt must each hold topk entries; scratch holds k3_moe_scratch(c, T) floats. */
 void   k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
               int T, int *idx, float *wt, float *scratch);
 
 /* Batched MoE for prefill over a chunk of T tokens: fetches each unique routed expert
  * from disk ONCE and reuses it across the chunk, cutting prefill expert I/O ~3-4x, with
  * per-token output bit-identical to k3_moe. Streamed source only (w->src != NULL); falls
- * back to k3_moe for the resident path or T <= 1. */
+ * back to k3_moe for the resident path or T <= 1. scratch holds k3_moe_scratch(c, T). */
 void   k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                       int T, int *idx, float *wt, float *scratch);
 

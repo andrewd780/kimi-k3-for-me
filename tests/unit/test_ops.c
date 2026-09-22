@@ -525,7 +525,7 @@ static void t_moe(const char *dir)
         const int T = din[1];
         int   *idx = (int   *)malloc((size_t)c.topk * sizeof(int));
         float *wt  = (float *)malloc((size_t)c.topk * sizeof(float));
-        float *sc  = (float *)malloc(k3_moe_scratch(&c) * sizeof(float));
+        float *sc  = (float *)malloc(k3_moe_scratch(&c, T) * sizeof(float));
         float *y   = (float *)malloc((size_t)T * c.hidden * sizeof(float));
         if (idx && wt && sc && y) {
             k3_moe(y, x, &w, &c, T, idx, wt, sc);
