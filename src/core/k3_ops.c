@@ -338,43 +338,150 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  *      by exactly one thread in exactly the order below. Results are therefore
  *      identical at any thread count, which the fixtures rely on.
  *
- *   2. FOUR ACCUMULATORS, PARTITIONED BY i%4, REDUCED AS (a0+a1)+(a2+a3). The split
- *      keeps the FMA pipeline full, a single accumulator serialises on the latency
- *      chain, but it is written out explicitly rather than left to the compiler
- *      because it fixes a summation ORDER. k3_matmul_bf16 and both AVX2 paths
- *      reproduce this exact partition and this exact tree, which is what makes the
- *      three implementations agree bit for bit.
+ *   2. SIXTEEN ACCUMULATORS, PARTITIONED BY i%16, REDUCED BY ONE FIXED TREE (see
+ *      k3_tree16). The split keeps the FMA pipeline full, a single accumulator
+ *      serialises on the latency chain, but it is written out explicitly rather than
+ *      left to the compiler because it fixes a summation ORDER. k3_matmul_bf16 and
+ *      every vector path (AVX2, AVX-512, NEON) reproduce this exact partition and this
+ *      exact tree, which is what makes the implementations agree bit for bit.
  *
- * Floating-point addition is not associative, so the four-way split is a real change
+ * Floating-point addition is not associative, so the sixteen-way split is a real change
  * to the arithmetic relative to a sequential sum. Keeping the accumulators in double
  * bounds the difference far below fp32 output precision; making them float would not.
  */
+
+/* THE PARTITION, WRITTEN DOWN ONCE. For every element i below n16 = in & ~15, the
+ * product row[i] * x[i] is fused (one fma() in double, one rounding) into accumulator
+ * a[i % 16], each accumulator in ascending i. The sixteen are then reduced by the tree
+ * below, and the last in % 16 elements are fused sequentially into the result. Every
+ * implementation of k3_matmul and k3_matmul_bf16 -- scalar, AVX2, AVX-512, NEON, one row
+ * at a time or two, x widened in place or read from a hoisted copy -- computes exactly
+ * this, which tests/unit/test_matmul_exact.c checks against a plain re-implementation
+ * on data built so that any other order changes the result. */
+static inline double k3_tree16(const double *a)
+{
+    const double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
+    const double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
+    const double b2 = (a[2] + a[6]) + (a[10] + a[14]);
+    const double b3 = (a[3] + a[7]) + (a[11] + a[15]);
+    return (b0 + b1) + (b2 + b3);
+}
+
+/* The vector paths read x from a double copy made once per call (see "WIDEN x ONCE" in
+ * k3_matmul_mxfp4); without a vector unit there is nothing to hoist. */
+#if defined(__AVX2__) || (defined(__ARM_NEON) && defined(__aarch64__))
+#define K3_MM_HOIST 1
+#else
+#define K3_MM_HOIST 0
+#endif
+
+/* The whole-chunk part of one fp32 row, the reference form: portable C, x widened per
+ * element. It is the scalar build's path and the vector builds' fallback when the
+ * hoisted copy of x could not be allocated, so that failure costs speed and nothing
+ * else: the partition and tree are the ones every vector path reproduces. */
+static inline double k3_f32_row_c(const float *row, const float *x, int n16)
+{
+    double a[16] = {0};
+    for (int i = 0; i < n16; i += 16)
+        for (int l = 0; l < 16; l++)
+            a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
+    return k3_tree16(a);
+}
+
+#if K3_MM_HOIST
+/* The same sum from the hoisted xd[i] == (double)x[i]. Float to double is exact, so the
+ * operands of every fma are the ones k3_f32_row_c forms in place.
+ *
+ *   AVX-512  two __m512d: z0 lane l is a[l], z1 lane l is a[8 + l].
+ *   AVX2     four __m256d: v0..v3 hold a[0..3], a[4..7], a[8..11], a[12..15]; the
+ *            lanewise (v0+v1)+(v2+v3) is b0..b3 of k3_tree16, then (b0+b1)+(b2+b3).
+ *   NEON     eight float64x2_t: wk holds {a[2k], a[2k+1]}; (w0+w2)+(w4+w6) is {b0,b1}
+ *            and (w1+w3)+(w5+w7) is {b2,b3}.
+ *
+ * _mm512_fmadd_pd, _mm256_fmadd_pd and vfmaq_f64 are the IEEE fused multiply-add per
+ * lane, the same single rounding as fma(). */
+static inline double k3_f32_row_v(const float *row, const double *xd, int n16)
+{
+#if defined(__AVX512F__)
+    __m512d z0 = _mm512_setzero_pd(), z1 = _mm512_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        z0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(row + i)),
+                             _mm512_loadu_pd(xd + i), z0);
+        z1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(row + i + 8)),
+                             _mm512_loadu_pd(xd + i + 8), z1);
+    }
+    double a[16];
+    _mm512_storeu_pd(a, z0);
+    _mm512_storeu_pd(a + 8, z1);
+    return k3_tree16(a);
+#elif defined(__AVX2__)
+    __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+    __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i)),
+                             _mm256_loadu_pd(xd + i), v0);
+        v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i + 4)),
+                             _mm256_loadu_pd(xd + i + 4), v1);
+        v2 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i + 8)),
+                             _mm256_loadu_pd(xd + i + 8), v2);
+        v3 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i + 12)),
+                             _mm256_loadu_pd(xd + i + 12), v3);
+    }
+    double b[4];
+    _mm256_storeu_pd(b, _mm256_add_pd(_mm256_add_pd(v0, v1), _mm256_add_pd(v2, v3)));
+    return (b[0] + b[1]) + (b[2] + b[3]);
+#else
+    float64x2_t w0 = vdupq_n_f64(0.0), w1 = vdupq_n_f64(0.0);
+    float64x2_t w2 = vdupq_n_f64(0.0), w3 = vdupq_n_f64(0.0);
+    float64x2_t w4 = vdupq_n_f64(0.0), w5 = vdupq_n_f64(0.0);
+    float64x2_t w6 = vdupq_n_f64(0.0), w7 = vdupq_n_f64(0.0);
+    for (int i = 0; i < n16; i += 16) {
+        const float32x4_t f0 = vld1q_f32(row + i),     f1 = vld1q_f32(row + i + 4);
+        const float32x4_t f2 = vld1q_f32(row + i + 8), f3 = vld1q_f32(row + i + 12);
+        w0 = vfmaq_f64(w0, vcvt_f64_f32(vget_low_f32(f0)), vld1q_f64(xd + i));
+        w1 = vfmaq_f64(w1, vcvt_high_f64_f32(f0),          vld1q_f64(xd + i + 2));
+        w2 = vfmaq_f64(w2, vcvt_f64_f32(vget_low_f32(f1)), vld1q_f64(xd + i + 4));
+        w3 = vfmaq_f64(w3, vcvt_high_f64_f32(f1),          vld1q_f64(xd + i + 6));
+        w4 = vfmaq_f64(w4, vcvt_f64_f32(vget_low_f32(f2)), vld1q_f64(xd + i + 8));
+        w5 = vfmaq_f64(w5, vcvt_high_f64_f32(f2),          vld1q_f64(xd + i + 10));
+        w6 = vfmaq_f64(w6, vcvt_f64_f32(vget_low_f32(f3)), vld1q_f64(xd + i + 12));
+        w7 = vfmaq_f64(w7, vcvt_high_f64_f32(f3),          vld1q_f64(xd + i + 14));
+    }
+    const float64x2_t t0 = vaddq_f64(vaddq_f64(w0, w2), vaddq_f64(w4, w6));
+    const float64x2_t t1 = vaddq_f64(vaddq_f64(w1, w3), vaddq_f64(w5, w7));
+    return vaddvq_f64(t0) + vaddvq_f64(t1);
+#endif
+}
+#endif /* K3_MM_HOIST */
+
 void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 {
+    const int n16 = in & ~15;
+
+    /* x widened once per call rather than once per row; see k3_matmul_mxfp4. A failed
+     * allocation selects k3_f32_row_c, the same sum without the copy. */
+#if K3_MM_HOIST
+    double *const xd = (double *)malloc((size_t)in * sizeof(double));
+    if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+#endif
+
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
     for (int o = 0; o < out; o++) {
         const float *row = W + (size_t)o * in;
-        /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
-         * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
-         * paths stay bit-identical while the dependent-add latency chain that made
-         * one accumulator ~10x slower than the machine's floor disappears. The
-         * reduction pairs lanes exactly the way the vector path's (v0+v1)+(v2+v3)
-         * then cross-lane tree does; change one and you must change the other. */
-        double a[16] = {0};
-        int i = 0;
-        for (; i + 15 < in; i += 16)
-            for (int l = 0; l < 16; l++)
-                a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
-        double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
-        double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
-        double b2 = (a[2] + a[6]) + (a[10] + a[14]);
-        double b3 = (a[3] + a[7]) + (a[11] + a[15]);
-        double acc = (b0 + b1) + (b2 + b3);
-        for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
+#if K3_MM_HOIST
+        double acc = xd ? k3_f32_row_v(row, xd, n16) : k3_f32_row_c(row, x, n16);
+#else
+        double acc = k3_f32_row_c(row, x, n16);
+#endif
+        for (int i = n16; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
         y[o] = (float)acc;
     }
+
+#if K3_MM_HOIST
+    free(xd);                                     /* free(NULL) is a no-op */
+#endif
 }
 
 /* ------------------------------------------------------------- Gated MLA ---- */
@@ -1227,127 +1334,274 @@ static const float K3_E2M1[16] = {
  *   exactly the values an fp32 copy would have supplied. The only difference from
  *   k3_matmul is WHERE the widening happens, not what is widened.
  *
- * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
- * reduced in the same order, so the two kernels agree to the bit on identical input.
+ * The accumulator layout mirrors k3_matmul deliberately: the same sixteen partial sums
+ * in double, reduced by the same k3_tree16, so the two kernels agree to the bit on
+ * identical input (test_ops asserts it).
  *
- * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
- * exactly four doubles, and loading four consecutive elements per iteration places
- * element i in lane i%4: the same partition as the scalar accumulators, with the same
- * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
- * scalar result exactly. Two details carry that guarantee:
+ * WHERE THE DECODE TIME WENT. On x86 every conversion below issues on the one shuffle
+ * port, and that port, not the multiply-adds, was the limit: per 16 weights the old AVX2
+ * loop ran four zero-extends and four float-to-double conversions for the weights, and
+ * four more conversions that re-widened x, which does not depend on the row at all.
  *
- *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
- *     scalar code rounds the product and the sum separately while an FMA rounds once.
- *     Here the product happens to be exact (a bf16 widens exactly, and float x float
- *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
- *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
- *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
+ *   1. x is widened to double ONCE PER CALL (xd), as k3_matmul_mxfp4 already did.
+ *
+ *   2. No zero-extend. A 32-bit lane of the raw row holds TWO bf16, the even-indexed
+ *      element in its low half and the odd-indexed one in its high half. Shifting the
+ *      lane left by 16 turns the even one into its float; masking off the low half
+ *      turns the odd one into its float. Both are plain ALU operations. The vector loop
+ *      therefore sees the eight even-indexed weights of a 16-element chunk in one
+ *      register and the eight odd-indexed ones in another, and xd is stored to match
+ *      (k3_widen_eo16): per chunk, the eight even-indexed x, then the eight odd ones.
+ *
+ *   3. Two rows per iteration, sharing every xd load. At the trunk's widths xd is 57 KB,
+ *      larger than L1, so this halves the L2 traffic the loop generates; the two rows are
+ *      still two independent sums.
+ *
+ * THE VECTOR PATHS ARE BIT-IDENTICAL TO THE SCALAR PATH, not merely close. The even/odd
+ * split decides only which register lane holds which of the sixteen accumulators, never
+ * which accumulator an element goes to:
+ *
+ *   AVX-512  e0 lane k is a[2k], o0 lane k is a[2k + 1];
+ *   AVX2     el lane k is a[2k], eh lane k is a[8 + 2k], ol and oh the odd ones;
+ *   NEON     natural order, as in k3_f32_row_v (wk holds {a[2k], a[2k + 1]}).
+ *
+ * Each accumulator still takes the elements i == its index (mod 16) in ascending i, one
+ * fused multiply-add each: fma(), _mm256_fmadd_pd, _mm512_fmadd_pd and vfmaq_f64 are the
+ * same IEEE operation with a single rounding, and the build's -ffp-contract=off keeps
+ * the compiler from fusing anything else. The lanes are stored back to a[16] in natural
+ * order and reduced by k3_tree16, and every path finishes the in % 16 tail with the same
+ * sequential fma() loop. (The products are exact in any case: a bf16 times a float needs
+ * 8 + 24 = 32 significand bits of double's 53, so the only rounding is the sum's.)
  */
+
+/* The whole-chunk part of one bf16 row, the reference form. See k3_f32_row_c: it is the
+ * scalar build's path and the vector builds' fallback when xd could not be allocated. */
+static inline double k3_bf16_row_c(const uint16_t *row, const float *x, int n16)
+{
+    double a[16] = {0};
+    for (int i = 0; i < n16; i += 16)
+        for (int l = 0; l < 16; l++)
+            a[l] = fma((double)k3_bf16f(row[i + l]), (double)x[i + l], a[l]);
+    return k3_tree16(a);
+}
+
+#if defined(__AVX2__)
+/* SOFTWARE PREFETCH, x86 only. A decode-time matmul streams its weights from DRAM once
+ * per token. On the Cascade Lake reference VM one core reads 10.8 GB/s in a plain
+ * streaming loop, but the vector loops below reached only ~7 GB/s on a 176 MB bf16
+ * matrix: with compute between loads, the hardware prefetcher does not run far enough
+ * ahead to keep enough misses in flight. One prefetcht0 per 64-byte line, 1 KB ahead
+ * of each row's read pointer, brought it to ~10 GB/s; 512 B ahead did the same for the
+ * MXFP4 path (whose 16-byte groups are consumed faster per byte). A prefetch is only a
+ * hint -- it reads nothing into a register, cannot fault, and changes no arithmetic --
+ * so the one thing it can do is change speed. Apple Silicon's prefetchers were not
+ * measured here and the NEON loops are left without one. */
+#define K3_PF_BF16  1024
+#define K3_PF_MXFP4 512
+
+/* x widened to double in the EVEN/ODD CHUNK LAYOUT the x86 vector loops read: within the
+ * chunk starting at c, xd[c + k] = x[c + 2k] and xd[c + 8 + k] = x[c + 2k + 1] for
+ * k = 0..7. The in % 16 tail stays in natural order. Float to double is exact, so every
+ * xd value is the one the scalar path forms in place; only the addresses move. Shared
+ * with the AVX-512 path of k3_matmul_mxfp4, which splits its nibbles the same way. */
+static void k3_widen_eo16(double *xd, const float *x, int in)
+{
+    const int n16 = in & ~15;
+    for (int c = 0; c < n16; c += 16)
+        for (int k = 0; k < 8; k++) {
+            xd[c + k]     = (double)x[c + 2 * k];
+            xd[c + 8 + k] = (double)x[c + 2 * k + 1];
+        }
+    for (int i = n16; i < in; i++) xd[i] = (double)x[i];
+}
+
+/* ev[k] is accumulator a[2k] and od[k] is a[2k + 1]: put them back in natural order and
+ * reduce with the one tree. */
+static inline double k3_tree16_eo(const double *ev, const double *od)
+{
+    double a[16];
+    for (int k = 0; k < 8; k++) { a[2 * k] = ev[k]; a[2 * k + 1] = od[k]; }
+    return k3_tree16(a);
+}
+#endif
+
+#if defined(__AVX512F__)
+/* Rows r0 and r1 over the first n16 elements, xd in the even/odd chunk layout. Per 16
+ * elements and row: one 32-byte load, a shift and a mask, two float-to-double
+ * conversions and two FMAs. r1 may equal r0 (an odd row count's last row). */
+static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                   const uint16_t *r1, const double *xd, int n16)
+{
+    const __m256i hi = _mm256_set1_epi32((int)0xFFFF0000u);
+    __m512d e0 = _mm512_setzero_pd(), o0 = _mm512_setzero_pd();
+    __m512d e1 = _mm512_setzero_pd(), o1 = _mm512_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        const __m512d xe = _mm512_loadu_pd(xd + i);       /* x[i + 2k]     */
+        const __m512d xo = _mm512_loadu_pd(xd + i + 8);   /* x[i + 2k + 1] */
+        const __m256i w0 = _mm256_loadu_si256((const __m256i *)(r0 + i));
+        const __m256i w1 = _mm256_loadu_si256((const __m256i *)(r1 + i));
+        if ((i & 31) == 0) {                      /* once per 64-byte line of each row */
+            _mm_prefetch((const char *)(r0 + i) + K3_PF_BF16, _MM_HINT_T0);
+            _mm_prefetch((const char *)(r1 + i) + K3_PF_BF16, _MM_HINT_T0);
+        }
+        e0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_slli_epi32(w0, 16))), xe, e0);
+        o0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_and_si256(w0, hi))), xo, o0);
+        e1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_slli_epi32(w1, 16))), xe, e1);
+        o1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_and_si256(w1, hi))), xo, o1);
+    }
+    double ev[8], od[8];
+    _mm512_storeu_pd(ev, e0); _mm512_storeu_pd(od, o0); *acc0 = k3_tree16_eo(ev, od);
+    _mm512_storeu_pd(ev, e1); _mm512_storeu_pd(od, o1); *acc1 = k3_tree16_eo(ev, od);
+}
+#elif defined(__AVX2__)
+/* The same with 256-bit registers: eight accumulators for the pair, each 16-element
+ * chunk loaded as two 16-byte halves so the conversions need no lane extract. */
+static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                   const uint16_t *r1, const double *xd, int n16)
+{
+    const __m128i hi = _mm_set1_epi32((int)0xFFFF0000u);
+    __m256d el0 = _mm256_setzero_pd(), eh0 = _mm256_setzero_pd();
+    __m256d ol0 = _mm256_setzero_pd(), oh0 = _mm256_setzero_pd();
+    __m256d el1 = _mm256_setzero_pd(), eh1 = _mm256_setzero_pd();
+    __m256d ol1 = _mm256_setzero_pd(), oh1 = _mm256_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        const __m256d xel = _mm256_loadu_pd(xd + i);       /* x[i + 0, 2, 4, 6]    */
+        const __m256d xeh = _mm256_loadu_pd(xd + i + 4);   /* x[i + 8, 10, 12, 14] */
+        const __m256d xol = _mm256_loadu_pd(xd + i + 8);   /* x[i + 1, 3, 5, 7]    */
+        const __m256d xoh = _mm256_loadu_pd(xd + i + 12);  /* x[i + 9, 11, 13, 15] */
+        const __m128i a0 = _mm_loadu_si128((const __m128i *)(r0 + i));
+        const __m128i b0 = _mm_loadu_si128((const __m128i *)(r0 + i + 8));
+        const __m128i a1 = _mm_loadu_si128((const __m128i *)(r1 + i));
+        const __m128i b1 = _mm_loadu_si128((const __m128i *)(r1 + i + 8));
+        if ((i & 31) == 0) {                      /* once per 64-byte line of each row */
+            _mm_prefetch((const char *)(r0 + i) + K3_PF_BF16, _MM_HINT_T0);
+            _mm_prefetch((const char *)(r1 + i) + K3_PF_BF16, _MM_HINT_T0);
+        }
+        el0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(a0, 16))),
+                              xel, el0);
+        ol0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(a0, hi))),
+                              xol, ol0);
+        eh0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(b0, 16))),
+                              xeh, eh0);
+        oh0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(b0, hi))),
+                              xoh, oh0);
+        el1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(a1, 16))),
+                              xel, el1);
+        ol1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(a1, hi))),
+                              xol, ol1);
+        eh1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(b1, 16))),
+                              xeh, eh1);
+        oh1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(b1, hi))),
+                              xoh, oh1);
+    }
+    double ev[8], od[8];
+    _mm256_storeu_pd(ev, el0); _mm256_storeu_pd(ev + 4, eh0);
+    _mm256_storeu_pd(od, ol0); _mm256_storeu_pd(od + 4, oh0);
+    *acc0 = k3_tree16_eo(ev, od);
+    _mm256_storeu_pd(ev, el1); _mm256_storeu_pd(ev + 4, eh1);
+    _mm256_storeu_pd(od, ol1); _mm256_storeu_pd(od + 4, oh1);
+    *acc1 = k3_tree16_eo(ev, od);
+}
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+/* One row, natural order: wk holds {a[2k], a[2k + 1]}, exactly as k3_f32_row_v. bf16 to
+ * f32 is the usual 16-bit left shift; vshll_n_u16 widens and shifts in one instruction.
+ * The x widening this loop used to repeat per row (eight vcvt per 16 elements) is gone:
+ * xd holds x already widened, in natural order. */
+static inline double k3_bf16_row_neon(const uint16_t *row, const double *xd, int n16)
+{
+    float64x2_t w0 = vdupq_n_f64(0.0), w1 = vdupq_n_f64(0.0);
+    float64x2_t w2 = vdupq_n_f64(0.0), w3 = vdupq_n_f64(0.0);
+    float64x2_t w4 = vdupq_n_f64(0.0), w5 = vdupq_n_f64(0.0);
+    float64x2_t w6 = vdupq_n_f64(0.0), w7 = vdupq_n_f64(0.0);
+    for (int i = 0; i < n16; i += 16) {
+        const uint16x8_t h0 = vld1q_u16(row + i);
+        const uint16x8_t h1 = vld1q_u16(row + i + 8);
+        const float32x4_t f0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16));
+        const float32x4_t f1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16));
+        const float32x4_t f2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
+        const float32x4_t f3 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
+        w0 = vfmaq_f64(w0, vcvt_f64_f32(vget_low_f32(f0)), vld1q_f64(xd + i));
+        w1 = vfmaq_f64(w1, vcvt_high_f64_f32(f0),          vld1q_f64(xd + i + 2));
+        w2 = vfmaq_f64(w2, vcvt_f64_f32(vget_low_f32(f1)), vld1q_f64(xd + i + 4));
+        w3 = vfmaq_f64(w3, vcvt_high_f64_f32(f1),          vld1q_f64(xd + i + 6));
+        w4 = vfmaq_f64(w4, vcvt_f64_f32(vget_low_f32(f2)), vld1q_f64(xd + i + 8));
+        w5 = vfmaq_f64(w5, vcvt_high_f64_f32(f2),          vld1q_f64(xd + i + 10));
+        w6 = vfmaq_f64(w6, vcvt_f64_f32(vget_low_f32(f3)), vld1q_f64(xd + i + 12));
+        w7 = vfmaq_f64(w7, vcvt_high_f64_f32(f3),          vld1q_f64(xd + i + 14));
+    }
+    /* (a[l]+a[4+l])+(a[8+l]+a[12+l]) lanewise -- t0 = {b0,b1}, t1 = {b2,b3} -- then
+     * (b0+b1)+(b2+b3): k3_tree16 exactly. */
+    const float64x2_t t0 = vaddq_f64(vaddq_f64(w0, w2), vaddq_f64(w4, w6));
+    const float64x2_t t1 = vaddq_f64(vaddq_f64(w1, w3), vaddq_f64(w5, w7));
+    return vaddvq_f64(t0) + vaddvq_f64(t1);
+}
+
+/* NEON keeps one row per pass: nothing here can measure a two-row form on Apple
+ * Silicon, and its three load ports make the shared-xd saving small there. */
+static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                   const uint16_t *r1, const double *xd, int n16)
+{
+    *acc0 = k3_bf16_row_neon(r0, xd, n16);
+    *acc1 = (r1 != r0) ? k3_bf16_row_neon(r1, xd, n16) : *acc0;
+}
+#endif
+
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
+    const int n16 = in & ~15;
+
+    /* WIDEN x ONCE, in the order the vector loop reads it (see the notes above and
+     * "WIDEN x ONCE" in k3_matmul_mxfp4). Read-only and shared by every thread. NULL is
+     * a valid state: the rows then take k3_bf16_row_c, the same sum without the copy,
+     * so an allocation failure costs speed and nothing else. */
+#if K3_MM_HOIST
+    double *const xd = (double *)malloc((size_t)in * sizeof(double));
+    if (xd) {
+#if defined(__AVX2__)
+        k3_widen_eo16(xd, x, in);
+#else
+        for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+#endif
+    }
+#endif
+
+    /* Row PAIRS are the unit of parallel work. Output rows stay independent -- each is
+     * summed by exactly one thread in exactly the order above -- so pairing them changes
+     * no arithmetic and results remain identical at any thread count. An odd last row
+     * is paired with itself and stored once. */
+    const int npair = (out + 1) / 2;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
-    for (int o = 0; o < out; o++) {
-        const uint16_t *row = W + (size_t)o * in;
-        int i = 0;
-        double acc;
-#if defined(__AVX2__)
-        {
-            /* Four vector accumulators, fused. _mm256_fmadd_pd per lane is the same
-             * IEEE operation as scalar fma() in double, and the reduction below is
-             * lane-for-lane the tree k3_matmul's sixteen scalar accumulators use, so
-             * the two kernels remain BITWISE identical (test_ops asserts it). The old
-             * one-accumulator mul+add form serialized on add latency at 4 elements
-             * per ~4 cycles; this runs the memory-bound side of the roof instead. */
-            __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
-            __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
-            for (; i + 15 < in; i += 16) {
-                const __m128i h0 = _mm_loadl_epi64((const __m128i *)(row + i));
-                const __m128i h1 = _mm_loadl_epi64((const __m128i *)(row + i + 4));
-                const __m128i h2 = _mm_loadl_epi64((const __m128i *)(row + i + 8));
-                const __m128i h3 = _mm_loadl_epi64((const __m128i *)(row + i + 12));
-                v0 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h0), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i)), v0);
-                v1 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h1), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 4)), v1);
-                v2 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h2), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 8)), v2);
-                v3 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h3), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 12)), v3);
-            }
-            /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing as scalar */
-            const __m256d vt = _mm256_add_pd(_mm256_add_pd(v0, v1),
-                                             _mm256_add_pd(v2, v3));
-            double a[4];
-            _mm256_storeu_pd(a, vt);
-            acc = (a[0] + a[1]) + (a[2] + a[3]);
-        }
-#elif defined(__ARM_NEON) && defined(__aarch64__)
-        {
-            /* Eight 2-lane double accumulators: wk holds the scalar path's
-             * {a[2k], a[2k+1]}, so element i lands in accumulator i%16 exactly as in
-             * the scalar and AVX2 forms, and vfmaq_f64 per lane is the same IEEE fma()
-             * in double. bf16 -> f32 is the usual 16-bit left shift; vshll_n_u16
-             * widens and shifts in one instruction. */
-            float64x2_t w0 = vdupq_n_f64(0.0), w1 = vdupq_n_f64(0.0);
-            float64x2_t w2 = vdupq_n_f64(0.0), w3 = vdupq_n_f64(0.0);
-            float64x2_t w4 = vdupq_n_f64(0.0), w5 = vdupq_n_f64(0.0);
-            float64x2_t w6 = vdupq_n_f64(0.0), w7 = vdupq_n_f64(0.0);
-            for (; i + 15 < in; i += 16) {
-                const uint16x8_t h0 = vld1q_u16(row + i);
-                const uint16x8_t h1 = vld1q_u16(row + i + 8);
-                const float32x4_t f0 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16));
-                const float32x4_t f1 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16));
-                const float32x4_t f2 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
-                const float32x4_t f3 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
-                const float32x4_t x0 = vld1q_f32(x + i);
-                const float32x4_t x1 = vld1q_f32(x + i + 4);
-                const float32x4_t x2 = vld1q_f32(x + i + 8);
-                const float32x4_t x3 = vld1q_f32(x + i + 12);
-                w0 = vfmaq_f64(w0, vcvt_f64_f32(vget_low_f32(f0)),
-                                   vcvt_f64_f32(vget_low_f32(x0)));
-                w1 = vfmaq_f64(w1, vcvt_high_f64_f32(f0), vcvt_high_f64_f32(x0));
-                w2 = vfmaq_f64(w2, vcvt_f64_f32(vget_low_f32(f1)),
-                                   vcvt_f64_f32(vget_low_f32(x1)));
-                w3 = vfmaq_f64(w3, vcvt_high_f64_f32(f1), vcvt_high_f64_f32(x1));
-                w4 = vfmaq_f64(w4, vcvt_f64_f32(vget_low_f32(f2)),
-                                   vcvt_f64_f32(vget_low_f32(x2)));
-                w5 = vfmaq_f64(w5, vcvt_high_f64_f32(f2), vcvt_high_f64_f32(x2));
-                w6 = vfmaq_f64(w6, vcvt_f64_f32(vget_low_f32(f3)),
-                                   vcvt_f64_f32(vget_low_f32(x3)));
-                w7 = vfmaq_f64(w7, vcvt_high_f64_f32(f3), vcvt_high_f64_f32(x3));
-            }
-            /* (a[l]+a[4+l])+(a[8+l]+a[12+l]) lanewise -- t0 = {b0,b1}, t1 = {b2,b3} --
-             * then (b0+b1)+(b2+b3): the scalar reduction tree exactly. */
-            const float64x2_t t0 = vaddq_f64(vaddq_f64(w0, w2), vaddq_f64(w4, w6));
-            const float64x2_t t1 = vaddq_f64(vaddq_f64(w1, w3), vaddq_f64(w5, w7));
-            acc = vaddvq_f64(t0) + vaddvq_f64(t1);
-        }
-#else
-        {
-            double a[16] = {0};
-            for (; i + 15 < in; i += 16)
-                for (int l = 0; l < 16; l++)
-                    a[l] = fma((double)k3_bf16f(row[i + l]), (double)x[i + l], a[l]);
-            double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
-            double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
-            double b2 = (a[2] + a[6]) + (a[10] + a[14]);
-            double b3 = (a[3] + a[7]) + (a[11] + a[15]);
-            acc = (b0 + b1) + (b2 + b3);
-        }
+    for (int p = 0; p < npair; p++) {
+        const int o0 = 2 * p;
+        const int o1 = (o0 + 1 < out) ? o0 + 1 : o0;
+        const uint16_t *r0 = W + (size_t)o0 * in;
+        const uint16_t *r1 = W + (size_t)o1 * in;
+        double acc0, acc1;
+#if K3_MM_HOIST
+        if (xd) k3_bf16_rows2_v(&acc0, &acc1, r0, r1, xd, n16);
+        else
 #endif
-        for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
-        y[o] = (float)acc;
+        {
+            acc0 = k3_bf16_row_c(r0, x, n16);
+            acc1 = (o1 != o0) ? k3_bf16_row_c(r1, x, n16) : acc0;
+        }
+        for (int i = n16; i < in; i++) {
+            acc0 = fma((double)k3_bf16f(r0[i]), (double)x[i], acc0);
+            acc1 = fma((double)k3_bf16f(r1[i]), (double)x[i], acc1);
+        }
+        y[o0] = (float)acc0;
+        if (o1 != o0) y[o1] = (float)acc1;
     }
+
+#if K3_MM_HOIST
+    free(xd);                                     /* free(NULL) is a no-op */
+#endif
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
@@ -1476,6 +1730,156 @@ static void k3_e8m0_init(void)
     k3_e8m0_ready = 1;
 }
 
+#if defined(__AVX512F__)
+/* AVX-512 FORM OF THE AVX2 FLAT ROW PATH, BIT-IDENTICAL TO IT. See the FLAT ROW PATH
+ * comment inside k3_matmul_mxfp4 for the arithmetic; this changes only how each
+ * operand reaches its lane.
+ *
+ * DECODE BY TABLE, IN DOUBLE. The AVX2 loop decodes a nibble to a float through a
+ * permute and a sign XOR, then widens it with _mm256_cvtps_pd; with the zero-extends,
+ * lane extracts and scale broadcast, that is thirteen shuffle-port operations per 16
+ * weights, and the shuffle port is what bounds it. Here the sixteen possible weights of
+ * a group -- every E2M1 code times that group's scale -- are built once per group as
+ * DOUBLES in two registers, and _mm512_permutex2var_pd, which indexes sixteen doubles by
+ * the low four bits of each 64-bit lane, turns a code straight into its widened weight.
+ * Per 16 weights: one 8-byte zero-extend, one shift, two lookups, two FMAs.
+ *
+ * WHY THE TABLE HOLDS EXACTLY THE AVX2 VALUES. AVX2 uses w = (double)(float)(E2M1[c] *
+ * K3_E8M0[sb]), the product rounded to float and then widened. For 2 <= sb <= 252 that
+ * float product is exact -- a 3-bit significand times a power of two, neither
+ * overflowing (6 * 2^125 < FLT_MAX) nor falling below the normal range (0.5 * 2^-125 is
+ * normal) -- so computing it in double from the exact double scale gives the same value.
+ * sb 0, 1, 253 and 254 are where the float product is subnormal or overflows to inf;
+ * for those the table is built the AVX2 way, a float multiply then a widen, so it
+ * reproduces the subnormal (and any flush-to-zero mode) and the inf exactly. Negative
+ * codes are the negated magnitudes times the scale: IEEE multiplication is symmetric in
+ * sign, so -(a*s) == (-a)*s bit for bit, the same value AVX2 gets by XORing the sign bit
+ * into a*s (including -0.0 for code 8). */
+static inline void k3_e2m1_table512(__m512d *lo, __m512d *hi, unsigned sb)
+{
+    if (sb >= 2 && sb <= 252) {
+        const __m512d s = _mm512_set1_pd((double)K3_E8M0[sb]);   /* exact: a power of two */
+        *lo = _mm512_mul_pd(_mm512_setr_pd(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), s);
+        *hi = _mm512_mul_pd(_mm512_setr_pd(-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0), s);
+    } else {
+        const __m256 s = _mm256_set1_ps(K3_E8M0[sb]);
+        *lo = _mm512_cvtps_pd(_mm256_mul_ps(
+            _mm256_setr_ps(0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f), s));
+        *hi = _mm512_cvtps_pd(_mm256_mul_ps(
+            _mm256_setr_ps(-0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f), s));
+    }
+}
+
+/* The AVX2 flat path's reduction, in accumulator terms. Its lanewise (v0+v2)+(v1+v3)
+ * is q[l] = (a[l] + a[l+8]) + (a[l+4] + a[l+12]); it then adds the two 128-bit halves,
+ * (q0+q2, q1+q3), and finally those two lanes. That pairing differs from k3_tree16's,
+ * and each must stay as it is: changing either tree changes bits. ev[k] is a[2k] and
+ * od[k] is a[2k+1], as in k3_tree16_eo. */
+static inline double k3_tree16_flat_eo(const double *ev, const double *od)
+{
+    double a[16], q[4];
+    for (int k = 0; k < 8; k++) { a[2 * k] = ev[k]; a[2 * k + 1] = od[k]; }
+    for (int l = 0; l < 4; l++) q[l] = (a[l] + a[l + 8]) + (a[l + 4] + a[l + 12]);
+    return (q[0] + q[2]) + (q[1] + q[3]);
+}
+
+/* Two rows of the flat path, xd in the even/odd chunk layout (k3_widen_eo16): per
+ * 16-element chunk, byte k of the 8 packed bytes holds element 2k in its low nibble and
+ * element 2k+1 in its high nibble, so the zero-extended bytes index the even weights
+ * directly (the lookup reads only bits 3..0) and the same bytes shifted right by 4
+ * index the odd ones. Lane k of e is accumulator a[2k] and lane k of o is a[2k+1]:
+ * every element still lands in a[i % 16], in ascending i, one FMA each.
+ *
+ * A NaN scale byte (255) SKIPS its chunks, exactly as the AVX2 loop's goto does: the
+ * FMAs run under a zero write-mask, which leaves the accumulators untouched, rather
+ * than adding a product of zero (0 * inf would be NaN, and a skipped chunk must not be
+ * able to produce one). The in % 16 tail is the AVX2 path's scalar loop verbatim,
+ * which does NOT skip a 255 group -- also reproduced. r1 may equal r0 (an odd row
+ * count's last row).
+ *
+ * e8d[b] is (double)K3_E8M0[b], widened once per call so a group's scale reaches a
+ * register as one broadcast load. The common case -- a whole 32-element group (K3's
+ * group size) whose two scale bytes both lie in 2..252 -- runs straight-line with no
+ * mask and a two-multiply table per row; everything else (other group sizes, the last
+ * partial group, 255 and the four float-table scale bytes) takes the general loop,
+ * which computes the same values the slower way. */
+static inline void k3_mxfp4_rows2_avx512(double *acc, const unsigned char *p0,
+                                         const unsigned char *s0, const unsigned char *p1,
+                                         const unsigned char *s1, const double *xd,
+                                         const double *e8d, int in, int group)
+{
+    const int n16 = in & ~15;
+    const __m512d LO = _mm512_setr_pd(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const __m512d HI = _mm512_setr_pd(-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+    __m512d e0 = _mm512_setzero_pd(), o0 = _mm512_setzero_pd();
+    __m512d e1 = _mm512_setzero_pd(), o1 = _mm512_setzero_pd();
+    int i = 0;
+    for (int g = 0; i < n16; g++) {               /* i == g * group at the top */
+        const int gend = (n16 - i > group) ? i + group : n16;
+        const unsigned b0 = s0[g], b1 = s1[g];
+        if (gend - i == 32 && b0 - 2u <= 250u && b1 - 2u <= 250u) {
+            const __m512d c0 = _mm512_set1_pd(e8d[b0]), c1 = _mm512_set1_pd(e8d[b1]);
+            const __m512d t0lo = _mm512_mul_pd(LO, c0), t0hi = _mm512_mul_pd(HI, c0);
+            const __m512d t1lo = _mm512_mul_pd(LO, c1), t1hi = _mm512_mul_pd(HI, c1);
+            const unsigned char *q0 = p0 + ((unsigned)i >> 1);
+            const unsigned char *q1 = p1 + ((unsigned)i >> 1);
+            const double *xg = xd + i;
+            if ((g & 3) == 0) {                   /* four 16-byte groups per line */
+                _mm_prefetch((const char *)q0 + K3_PF_MXFP4, _MM_HINT_T0);
+                _mm_prefetch((const char *)q1 + K3_PF_MXFP4, _MM_HINT_T0);
+            }
+            for (int h = 0; h < 2; h++) {         /* the group's two chunks, in order */
+                const __m512d xe = _mm512_loadu_pd(xg + 16 * h);
+                const __m512d xo = _mm512_loadu_pd(xg + 16 * h + 8);
+                const __m512i n0 = _mm512_cvtepu8_epi64(
+                    _mm_loadl_epi64((const __m128i *)(q0 + 8 * h)));
+                const __m512i n1 = _mm512_cvtepu8_epi64(
+                    _mm_loadl_epi64((const __m128i *)(q1 + 8 * h)));
+                e0 = _mm512_fmadd_pd(_mm512_permutex2var_pd(t0lo, n0, t0hi), xe, e0);
+                o0 = _mm512_fmadd_pd(
+                    _mm512_permutex2var_pd(t0lo, _mm512_srli_epi64(n0, 4), t0hi), xo, o0);
+                e1 = _mm512_fmadd_pd(_mm512_permutex2var_pd(t1lo, n1, t1hi), xe, e1);
+                o1 = _mm512_fmadd_pd(
+                    _mm512_permutex2var_pd(t1lo, _mm512_srli_epi64(n1, 4), t1hi), xo, o1);
+            }
+            i += 32;
+            continue;
+        }
+        const __mmask8 k0 = (b0 == 255) ? 0 : 0xFF;
+        const __mmask8 k1 = (b1 == 255) ? 0 : 0xFF;
+        __m512d t0lo, t0hi, t1lo, t1hi;
+        k3_e2m1_table512(&t0lo, &t0hi, b0);
+        k3_e2m1_table512(&t1lo, &t1hi, b1);
+        for (; i < gend; i += 16) {
+            const __m512d xe = _mm512_loadu_pd(xd + i);       /* x[i + 2k]     */
+            const __m512d xo = _mm512_loadu_pd(xd + i + 8);   /* x[i + 2k + 1] */
+            const __m512i n0 = _mm512_cvtepu8_epi64(
+                _mm_loadl_epi64((const __m128i *)(p0 + ((unsigned)i >> 1))));
+            const __m512i n1 = _mm512_cvtepu8_epi64(
+                _mm_loadl_epi64((const __m128i *)(p1 + ((unsigned)i >> 1))));
+            e0 = _mm512_mask3_fmadd_pd(_mm512_permutex2var_pd(t0lo, n0, t0hi),
+                                       xe, e0, k0);
+            o0 = _mm512_mask3_fmadd_pd(
+                _mm512_permutex2var_pd(t0lo, _mm512_srli_epi64(n0, 4), t0hi), xo, o0, k0);
+            e1 = _mm512_mask3_fmadd_pd(_mm512_permutex2var_pd(t1lo, n1, t1hi),
+                                       xe, e1, k1);
+            o1 = _mm512_mask3_fmadd_pd(
+                _mm512_permutex2var_pd(t1lo, _mm512_srli_epi64(n1, 4), t1hi), xo, o1, k1);
+        }
+    }
+    double ev[8], od[8];
+    _mm512_storeu_pd(ev, e0); _mm512_storeu_pd(od, o0); acc[0] = k3_tree16_flat_eo(ev, od);
+    _mm512_storeu_pd(ev, e1); _mm512_storeu_pd(od, o1); acc[1] = k3_tree16_flat_eo(ev, od);
+    /* Tail, at most 15 elements in one group; xd is in natural order here. */
+    for (; i < in; i++) {
+        const unsigned char n0 = (i & 1) ? (p0[i >> 1] >> 4) : (p0[i >> 1] & 0x0F);
+        const unsigned char n1 = (i & 1) ? (p1[i >> 1] >> 4) : (p1[i >> 1] & 0x0F);
+        acc[0] = fma((double)(K3_E2M1[n0] * K3_E8M0[s0[i / group]]), xd[i], acc[0]);
+        acc[1] = fma((double)(K3_E2M1[n1] * K3_E8M0[s1[i / group]]), xd[i], acc[1]);
+    }
+}
+#endif
+
 /* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
  * materialised as floats. This is not an optimisation; it is what makes streaming
  * experts possible at all.
@@ -1558,9 +1962,46 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
      * Read-only and shared by every thread, so one copy serves the whole parallel
      * region. At the K3 shapes it is 28 KB, which stays in L2 while the packed weights
      * stream past it. NULL is a valid state: the group loop then widens into a small
-     * stack buffer instead, so an allocation failure costs speed and nothing else. */
+     * stack buffer instead, so an allocation failure costs speed and nothing else.
+     *
+     * On AVX-512 the flat path reads x in the even/odd chunk layout its nibble split
+     * produces (k3_widen_eo16); every other path reads natural order. */
     double *const xd = (double *)malloc((size_t)in * sizeof(double));
+#if defined(__AVX512F__)
+    const int flat512 = xd && (group & 15) == 0;
+    if (flat512) k3_widen_eo16(xd, x, in);
+    else
+#endif
     if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+
+#if defined(__AVX512F__)
+    /* The AVX-512 flat path, two rows per iteration sharing each xd load. It runs under
+     * exactly the condition the AVX2 flat path does, so an AVX-512 build and an AVX2
+     * build of this file agree bit for bit on every input, including the xd == NULL
+     * and group % 16 != 0 cases, which fall through to the unchanged loop below.
+     * Rows stay independent: pairing them changes no arithmetic. */
+    if (flat512) {
+        double e8d[256];                          /* exact: float to double */
+        for (int b = 0; b < 256; b++) e8d[b] = (double)K3_E8M0[b];
+        const int npair = (rows + 1) / 2;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
+        for (int p = 0; p < npair; p++) {
+            const int r0 = 2 * p;
+            const int r1 = (r0 + 1 < rows) ? r0 + 1 : r0;
+            double acc[2];
+            k3_mxfp4_rows2_avx512(acc, packed + (size_t)r0 * pcols,
+                                  scales + (size_t)r0 * ngrp,
+                                  packed + (size_t)r1 * pcols,
+                                  scales + (size_t)r1 * ngrp, xd, e8d, in, group);
+            y[r0] = (float)acc[0];
+            if (r1 != r0) y[r1] = (float)acc[1];
+        }
+        free(xd);
+        return;
+    }
+#endif
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
@@ -1592,11 +2033,12 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
              * port (permutevar8x32, cvtepu8_epi32 and cvtps_pd all issue there), not
              * FMA-latency-bound, so the shorter chain depth is not what limits it.
              *
-             * Lane k of v0..v3 holds elements == k (mod 16), and the final tree is
-             * ((v0+v2)+(v1+v3)) lane-wise and then (a0+a1)+(a2+a3), the same shape as
-             * the scalar reduction, so every lane holds a sum of the same element
-             * classes in the same order as the dequantised reference and the error
-             * stays a few ulps of double, far inside the 1e-6 gate.
+             * Lane k of vj holds the elements == 4j + k (mod 16), and the final tree
+             * is ((v0+v2)+(v1+v3)) lane-wise, then the two 128-bit halves added, then
+             * the last two lanes, so every lane holds a sum of the same element classes
+             * in the same order as the dequantised reference and the error stays a few
+             * ulps of double, far inside the 1e-6 gate. These are the bits the engine
+             * emits on x86; the AVX-512 path (k3_mxfp4_rows2_avx512) reproduces them.
              *
              * Requires `group` to be a multiple of 16 so no 16-element chunk straddles
              * a scale boundary (K3 uses group 32). Anything else takes the grouped path
@@ -1649,8 +2091,10 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                 if (++c == cpg) { c = 0; g++; }
             }
             {
-                /* Horizontal reduction without touching memory, same tree as the
-                 * grouped path: (a0+a1)+(a2+a3). */
+                /* Horizontal reduction without touching memory. Lanewise
+                 * q = (v0+v2)+(v1+v3), then (q0+q2)+(q1+q3): the 128-bit halves are
+                 * added first. That is NOT the grouped path's (q0+q1)+(q2+q3), and the
+                 * AVX-512 path (k3_tree16_flat_eo) reproduces this one exactly. */
                 const __m256d q = _mm256_add_pd(
                     _mm256_add_pd(v0, v2), _mm256_add_pd(v1, v3));
                 const __m128d t = _mm_add_pd(
@@ -1723,22 +2167,19 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                         vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
                     const float32x4_t w3v =
                         vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
-                    const float32x4_t x0v = vld1q_f32(xg + 16 * k);
-                    const float32x4_t x1v = vld1q_f32(xg + 16 * k + 4);
-                    const float32x4_t x2v = vld1q_f32(xg + 16 * k + 8);
-                    const float32x4_t x3v = vld1q_f32(xg + 16 * k + 12);
-                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w0v)),
-                                       vcvt_f64_f32(vget_low_f32(x0v)));
-                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w0v), vcvt_high_f64_f32(x0v));
-                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w1v)),
-                                       vcvt_f64_f32(vget_low_f32(x1v)));
-                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w1v), vcvt_high_f64_f32(x1v));
-                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w2v)),
-                                       vcvt_f64_f32(vget_low_f32(x2v)));
-                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w2v), vcvt_high_f64_f32(x2v));
-                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w3v)),
-                                       vcvt_f64_f32(vget_low_f32(x3v)));
-                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w3v), vcvt_high_f64_f32(x3v));
+                    /* x comes from xdg, already widened: the eight vcvt per 16
+                     * elements that re-widened x for every row are gone. xdg[j] is
+                     * (double)xg[j] exactly, so every fma sees the operands it did
+                     * before, in the same order per accumulator. */
+                    const double *xk = xdg + 16 * k;
+                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w0v)), vld1q_f64(xk));
+                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w0v),          vld1q_f64(xk + 2));
+                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w1v)), vld1q_f64(xk + 4));
+                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w1v),          vld1q_f64(xk + 6));
+                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w2v)), vld1q_f64(xk + 8));
+                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w2v),          vld1q_f64(xk + 10));
+                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w3v)), vld1q_f64(xk + 12));
+                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w3v),          vld1q_f64(xk + 14));
                 }
                 const float64x2_t t0 = vaddq_f64(u0, u2);
                 const float64x2_t t1 = vaddq_f64(u1, u3);
@@ -1887,14 +2328,12 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                     for (; i + 7 < n; i += 8) {
                         const float32x4_t wv0 = vld1q_f32(wf + i);
                         const float32x4_t wv1 = vld1q_f32(wf + i + 4);
-                        const float32x4_t xv0 = vld1q_f32(xg + i);
-                        const float32x4_t xv1 = vld1q_f32(xg + i + 4);
                         u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(wv0)),
-                                           vcvt_f64_f32(vget_low_f32(xv0)));
-                        u1 = vfmaq_f64(u1, vcvt_high_f64_f32(wv0), vcvt_high_f64_f32(xv0));
+                                           vld1q_f64(xdg + i));
+                        u1 = vfmaq_f64(u1, vcvt_high_f64_f32(wv0), vld1q_f64(xdg + i + 2));
                         u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(wv1)),
-                                           vcvt_f64_f32(vget_low_f32(xv1)));
-                        u3 = vfmaq_f64(u3, vcvt_high_f64_f32(wv1), vcvt_high_f64_f32(xv1));
+                                           vld1q_f64(xdg + i + 4));
+                        u3 = vfmaq_f64(u3, vcvt_high_f64_f32(wv1), vld1q_f64(xdg + i + 6));
                     }
                     const float64x2_t t0 = vaddq_f64(u0, u2);
                     const float64x2_t t1 = vaddq_f64(u1, u3);
