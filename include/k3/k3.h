@@ -232,6 +232,40 @@ void   k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
 void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
               int T, float *scratch);
 
+/* A recording hook for tests: NULL, and ignored, everywhere else. Defined in k3_ops.c.
+ *
+ * WHY IT EXISTS
+ *   Some of k3_mla_cached's reduction trees cannot be seen in its output. The softmax
+ *   normaliser z is a double sum, and the probability quotient e/z a double, that
+ *   reach the output only rounded to float, where a different summation order or a
+ *   reciprocal multiply changes the float about once in 2^29 values. Once in 2^29 is
+ *   still a different logit somewhere in a long enough run, and the contract forbids
+ *   it, so a test that holds another loop (the other cache layout, or a replacement
+ *   for it) to the engine's arithmetic must see those doubles themselves. With this
+ *   set, the call copies them out as it forms them.
+ *
+ * WHAT IT RECORDS, per query token t of the call and head h; any pointer may be NULL
+ *   scores  [T][H][n]       the raw scaled scores of positions 0..cached+t, pre-softmax
+ *   z       [T][H]          the softmax normaliser of row (t, h)
+ *   quot    [T][H][n]       e_s / z for positions 0..cached+t, the double that is
+ *                           rounded to the float probability
+ *   acc     [T][H][v_head]  the attention output before the gate
+ *   n is the row stride of scores and quot and must be at least cached + T; the call
+ *   aborts rather than write past it.
+ *
+ * Recording is copies of values the call has already computed, into memory it never
+ * reads back, so it cannot change a bit of the output; with the hook NULL the cost is
+ * one test per (token, head) row and one per probability. Set it only around a call
+ * made from one thread: the pointer is global. */
+typedef struct {
+    int     n;
+    float  *scores;
+    double *z;
+    double *quot;
+    float  *acc;
+} K3MlaTrace;
+extern K3MlaTrace *k3_mla_trace;
+
 /* MoE routing, one token. modeling_kimi_linear.py:703-759.
  *
  *   logits = W x                      float32, no bias, W is [n_experts, hidden]

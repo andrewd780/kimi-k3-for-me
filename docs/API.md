@@ -138,7 +138,9 @@ if (k3_expert_drops) {
 ## Thread safety
 
 The kernels are reentrant and parallelise internally with OpenMP. They hold no global
-state except `k3_expert_drops`.
+state except `k3_expert_drops`. `k3_mla_cached` also reads one test hook,
+`k3_mla_trace`, which copies out intermediates its output rounds away; it is NULL unless
+a test sets it around a single-threaded call (see `k3.h`), and callers leave it NULL.
 
 The cache, the trunk reader, and the safetensors index are **not** thread-safe. One
 inference at a time per instance.

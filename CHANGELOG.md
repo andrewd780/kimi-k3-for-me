@@ -41,6 +41,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `logit_block_bytes`. `test_offline_cli.py` checks NLLs and `--tf-check`
   predictions on both sides of each block boundary against one-position runs, and
   that a streamed-head verify sweep reads the head exactly once.
+- **MLA cache variants study** (benchmark-only; the engine's arithmetic is unchanged):
+  one MLA layer's cached attention five ways in `benchmarks/mla_variants.h` -- expanded
+  (E), the same arithmetic threaded (E+), the engine's latent loop (L0), a latent loop
+  that rebuilds each position once per call (L1), and absorbed (A). E+, L0 and L1 are
+  held to `k3_mla_cached` bit for bit by `test_mla_variants`, now in `make test`, on
+  ordinary, cancelling and sharp layers, including the double softmax normalisers and
+  probability quotients the output rounds away, which the engine exposes through a new
+  test-only hook, `k3_mla_trace` (NULL outside tests); a mutation run shows the gate
+  catches reordered chains in the variants and in both engine layouts. `bench_mla counts` counts kv_b applications: at a 256-token prefill L0 makes
+  65,792 per layer and L1 256. A differs from E by ~1e-6 relative, as much as E differs
+  from a double reference, with no argmax change in 30,000 softmax rows; it is not
+  bitwise, so it cannot be a mode under the exactness contract. Timed on the idle
+  4-core VM (one layer, four threads): E+ is 3.9-5.9x faster than E for one new token
+  and 6.4-16x for five; L1 halves L0 at decode and takes a 256-token prefill from 60 s
+  to 0.54 s per layer, but rebuilding stays 49-72x slower than E+ at decode; A is the
+  fastest at long contexts. See [the note](docs/notes/mla-variants.md).
 - **Fixed-width trunk dictionary gates** (benchmark-only, not in inference): a
   4-bit high-byte index into one pooled 15-entry table with an escape code, the
   low byte raw, decoded by SSSE3 `pshufb` / NEON `tbl`. The eight-range histogram
