@@ -15,6 +15,7 @@ concurrency:
 jobs:
   submission:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Compare bounded raw-syscall submission with blocking reads
@@ -32,6 +33,7 @@ jobs:
   decoder:
     name: Compact decoder (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +64,7 @@ jobs:
 
   routing:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -72,10 +75,15 @@ jobs:
         run: |
           python3 -m unittest discover -s tests -p test_routing_probe.py -v
           python3 -m unittest discover -s tests -p test_lookahead_gate.py -v
+      # The drafting-policy study's port of spec_draft() and its cost model; synthetic
+      # sequences only, no corpora or tokenizer (docs/notes/spec-replay.md).
+      - name: Speculative drafting replay, policy port, cost model and calibration
+        run: python3 -m unittest discover -s tests -p test_spec_replay.py -v
 
   row-lifetimes:
     name: Row pipeline lifetimes (${{ matrix.sanitizer }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

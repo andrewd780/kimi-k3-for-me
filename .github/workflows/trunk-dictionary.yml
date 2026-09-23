@@ -127,8 +127,9 @@ jobs:
         run: |
           python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode correctness --out dictionary-exactness.json
           python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode correctness --index-bits 3 --out dictionary-exactness-fd3b.json
+          # The report records CODEC_FLAGS; give it the flags this binary was built with.
           if [ -x bench-fixed-dictionary-avx2 ]; then
-            python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary-avx2 --mode correctness --index-bits 3 --out dictionary-exactness-fd3b-avx2.json
+            CODEC_FLAGS="${CODEC_FLAGS/-mssse3/-mavx2}" python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary-avx2 --mode correctness --index-bits 3 --out dictionary-exactness-fd3b-avx2.json
           fi
       - uses: actions/upload-artifact@v4
         if: always()
@@ -175,8 +176,9 @@ jobs:
         run: |
           python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode rate --out dictionary-rate.json
           python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode rate --index-bits 3 --out dictionary-rate-fd3b.json
+          # The report records CODEC_FLAGS; give it the flags this binary was built with.
           if [ -x bench-fixed-dictionary-avx2 ]; then
-            python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary-avx2 --mode rate --index-bits 3 --out dictionary-rate-fd3b-avx2.json
+            CODEC_FLAGS="${CODEC_FLAGS/-mssse3/-mavx2}" python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary-avx2 --mode rate --index-bits 3 --out dictionary-rate-fd3b-avx2.json
           fi
       - uses: actions/upload-artifact@v4
         if: always()
