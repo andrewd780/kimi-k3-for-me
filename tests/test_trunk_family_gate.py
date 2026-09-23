@@ -1,6 +1,7 @@
 """Hand-checkable controls for the per-family gate; real sampling runs in hosted CI only."""
 from collections import Counter
 from fractions import Fraction
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -172,6 +173,80 @@ class WeightingTest(unittest.TestCase):
         families["b"]["full"] = None
         pooled = fam.analyze_families(families)["byte_weighted_pooled"]
         self.assertNotIn("full_bf16_entropy_ratio", pooled["per_family_code_bounds"])
+
+
+class FamilyPlanTest(unittest.TestCase):
+    # "base" carries the bytes and the pooled table: seven values of 100, eight of 1.
+    # "own" is fifteen values the pooled table lacks, so it fails the gate but its own
+    # table covers all of it. "wide" spreads over thirty values, so no 15-entry table
+    # reaches 99% of it.
+    BASE = hist({**dict.fromkeys(range(7), 100), **dict.fromkeys(range(7, 15), 1)})
+    OWN = hist(dict.fromkeys(range(100, 115), 10))
+    WIDE = hist(dict.fromkeys(range(200, 230), 10))
+
+    def test_failed_families_get_their_own_table_or_stay_raw(self):
+        report = fam.analyze_families({
+            "base": {"bytes": 100, "histogram": self.BASE, "full": None},
+            "own": {"bytes": 1, "histogram": self.OWN, "full": None},
+            "wide": {"bytes": 1, "histogram": self.WIDE, "full": None}})
+        self.assertEqual(report["gate"]["failed_families"], ["own", "wide"])
+        self.assertTrue(report["byte_weighted_pooled"]["decision"]["prototype"])
+        plan = fam.family_plan(report)
+        rows = plan["families"]
+        # base: 708 values, 8 escapes at 3 bits: 708*11 + 64 bits beat 708*12.
+        self.assertEqual(rows["base"], {"choice": "pooled_3bit",
+                                        "payload_ratio": float(Fraction(7852, 16 * 708))})
+        # own: its own seven of fifteen equal values escape 80 at 3 bits (2290 bits), so
+        # its own 15-entry table at 4 bits (1800 bits, no escape) wins.
+        self.assertEqual(rows["own"], {"choice": "own_4bit", "payload_ratio": 0.75})
+        self.assertEqual(rows["wide"], {"choice": "raw", "payload_ratio": 1.0})
+        expected = (100 * Fraction(7852, 16 * 708) + Fraction(3, 4) + 1) / 102
+        self.assertEqual(plan["payload_ratio"], float(expected))
+
+    def test_committed_family_report_recomputes_from_its_counts(self):
+        # The per-family CI run's report, committed from its stdout line: every field must
+        # follow from the histograms it carries, except the whole-BF16 entropy bounds,
+        # whose value histograms are only in the run's artifact.
+        root = Path(__file__).resolve().parents[1] / "docs/measurements"
+        record = json.loads((root / "trunk-family-gate.json").read_bytes())
+        report = record["report"]
+        gate1 = json.loads((root / "trunk-dictionary-gate1.json").read_bytes())[
+            "report"]["pooled"]["global_15"]["dictionary"]
+        again = fam.analyze_families({name: {"bytes": f["bytes"], "histogram": f["histogram"],
+                                             "full": None, "samples": f["samples"]}
+                                      for name, f in report["families"].items()}, gate1)
+        whole = ("full_bf16", "low_byte_entropy_bits", "low_given_high_entropy_bits",
+                 "gap_to_full_bf16_entropy_points")
+
+        def check(old, new, path):
+            if isinstance(old, dict):
+                for key, value in old.items():
+                    if not key.startswith(whole):
+                        self.assertIn(key, new, path + "/" + key)
+                        check(value, new[key], path + "/" + key)
+            elif isinstance(old, list):
+                self.assertEqual(len(old), len(new), path)
+                for i, (a, b) in enumerate(zip(old, new)):
+                    check(a, b, f"{path}/{i}")
+            elif isinstance(old, float):
+                self.assertAlmostEqual(old, new, places=12, msg=path)
+            else:
+                self.assertEqual(old, new, path)
+
+        for key in ("families", "byte_weighted_pooled", "dictionary_ranking", "gate",
+                    "limits", "schema"):
+            check(report[key], again[key], "/" + key)
+        self.assertEqual(report["gate"]["failed_families"], ["moe.router", "moe.shared_down"])
+        self.assertTrue(all(row["match"] for row in report["config_check"].values()))
+        self.assertEqual(report["execution"]["run_id"], str(record["workflow_run"]))
+        # The figure the note quotes: shared_down raw, the router on a table of its own.
+        plan = fam.family_plan(report)
+        self.assertEqual(plan["families"]["moe.shared_down"]["choice"], "raw")
+        self.assertEqual(plan["families"]["moe.router"]["choice"], "own_3bit")
+        self.assertEqual(round(plan["payload_ratio"], 6), 0.732863)
+        pins = json.loads((root / "trunk-family-pins.json").read_bytes())["samples"]
+        planned = [s for f in report["families"].values() for s in f["samples"]]
+        self.assertEqual(len(fam.verify_pins(planned, pins)), 92)
 
 
 if __name__ == "__main__":

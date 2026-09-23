@@ -291,6 +291,37 @@ def analyze_families(families, gate1_dictionary=None):
                       "the row index and alignment. No speed or full-model claim."}
 
 
+def family_plan(report):
+    """Steps 3 and 4 of the per-family plan in docs/notes/fixed-width-trunk.md, applied to
+    an analyze_families() report with exact payload-bit fractions.
+
+    Step 3: a family the pooled 15-entry table fails keeps FD only with a table of its
+    own, and only if that table covers at least 99% of it (best_local_15); otherwise the
+    family stays raw BF16 at r = 1. Step 4: when the byte-weighted curve carries FD3B (the
+    1.5-point rule), each coded family takes the smaller of its 3- and 4-bit payloads,
+    scored with its own table where step 3 gave it one; otherwise every coded family is
+    4-bit. The ratio is the byte-weighted mean over every sampled family, raw ones at 1,
+    never over the coded families alone."""
+    families = report["families"]
+    failed = set(report["gate"]["failed_families"])
+    fd3b = report["byte_weighted_pooled"]["decision"]["prototype"]
+    total = sum(f["bytes"] for f in families.values())
+    rows, ratio = {}, Fraction(0)
+    for name, f in sorted(families.items()):
+        if name in failed and not f["best_local_15"]["passes_99_percent"]:
+            choice, exact = "raw", Fraction(1)
+        else:
+            own = name in failed
+            curve = gate.bit_width_curve(f["histogram"]) if own else f["bit_width_curve"]
+            bits = {s["scheme"]: s["payload_bits"] for s in curve["schemes"]}
+            width = 3 if fd3b and bits["fixed_3bit"] < bits["fixed_4bit"] else 4
+            choice = ("own" if own else "pooled") + f"_{width}bit"
+            exact = Fraction(bits[f"fixed_{width}bit"], 16 * sum(f["histogram"]))
+        rows[name] = {"choice": choice, "payload_ratio": float(exact)}
+        ratio += Fraction(f["bytes"], total) * exact
+    return {"families": rows, "payload_ratio": float(ratio), "fd3b": fd3b}
+
+
 def verify_pins(plan, pins):
     """Every planned range must equal a pinned identity (same bytes again)."""
     pinned = {(p["shard"], p["offset"], p["bytes"]): p["sha256"] for p in pins}
