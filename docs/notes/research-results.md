@@ -64,94 +64,139 @@ shared error flag now uses an OpenMP reduction.
 The batched matmul is measured on its own with `bench_batch`: weights resident in
 RAM (176 MB and 2.35 GB, far beyond cache), no SSD reads, the same bf16 inputs
 through `k3_matmul_bf16_batch` and through a loop of one-position `k3_matmul_bf16`
-calls. What it shows is compute: the loop widens every weight once per position,
-the batch once per register block of positions.
+calls. The loop streams the matrix once per position; the batch streams it once per
+pass and widens each weight once per register block of positions.
 
-Conditions, 2026-09-23, commit 9ca67f5: a shared cloud development VM with 4 vCPUs
+Conditions, 2026-09-23, commit 6cd0668, which carries the exact decode kernels of
+[decode-kernels.md](decode-kernels.md): a shared cloud development VM with 4 vCPUs
 reported as "Intel(R) Xeon(R) Processor @ 2.80GHz" (AVX-512F/BW/DQ/VL/VNNI), 15 GB
 RAM, Linux 6.18, gcc 13.3.0, the Makefile's `-O3 -march=native -ffp-contract=off
 -fopenmp` unless stated, `OMP_NUM_THREADS=4 OMP_PROC_BIND=close`. Each run times one
-thread, then four. Three runs per arm, interleaved (trunk shape, trunk shape on the
-AVX2 baseline, lm_head shape, three times over); within a run, 15 calls per cell (7 at
-lm_head's shape) after one untimed call. Cells give the median of the three run
-medians and, in parentheses, the fastest call of all runs; speedup is loop median
-over batched median. Before every run the runner waited for the 1-minute load to
-fall below 1.0; it read 0.12 to 0.99, and `ps` showed no other process using CPU,
-so that load was the decay of the previous arm. **In all nine runs every batched
-output was bit-identical to the per-position loop, at every T and both thread
-counts.** Across the 56 cells, the largest of a cell's three run medians exceeded
-the smallest by 4.3% at the median and by 32% at worst, in one of the shortest cells
-(four threads, T = 2, AVX2 baseline: 8.8 to 11.6 ms); read differences under about
-10% as noise.
+thread, then four. Three runs per arm, interleaved (trunk shape; trunk shape with
+blocks forced to 4; trunk shape on the AVX2 baseline; AVX2 with blocks forced to 8;
+lm_head shape; three times over); within a run, 15 calls per cell (7 at lm_head's
+shape) after one untimed call. Cells give the median of the three run medians and, in
+parentheses, the fastest call of all runs; speedup is loop median over batched median.
+Before every run the runner waited for the 1-minute load to fall below 1.0; it read
+0.24 to 0.87, with no other job running. **In all fifteen runs every batched output
+was bit-identical to the per-position loop, at every T and both thread counts.**
+Across the 72 cells of the three tables below, the largest of a cell's three run
+medians exceeded the smallest by 5.7% at the median and by 42% at worst, in one of the
+shortest cells (four threads, T = 1, batched: 5.2 to 7.4 ms); read differences under
+about 10% as noise. Every run's cells are in
+[batched-matmul-x86_64.json](../measurements/batched-matmul-x86_64.json).
+
+An earlier version of these tables was taken at 9ca67f5, before the exact decode
+kernels were merged. Its per-position loop ran the older one-position kernel, 31.2 ms
+per call at one thread against 20.9 ms here, so its speedups (1.76x, 2.66x and 3.04x
+at T = 2, 4 and 8 on one thread; 3.14x at T = 8 on four; 2.78x and 3.09x for lm_head
+blocks of 9 and 16) measured batching against a kernel this branch no longer ships.
+The batched calls themselves take the same time as then (81.7 ms at T = 8 on one
+thread then, 82.6 now); what shrank is the alternative.
 
 Trunk shape, 12288 x 7168 (a KDA q/k/v/g projection), `-march=native`: AVX-512VL,
-so positions share a widened weight in register blocks of 8 (`bench_batch 15`).
+so positions share a widened weight in register blocks of 8 (`bench_batch 15 12288 16`).
 
 | Threads | T | Per-position loop, ms | Batched, ms | Batched ms/position | Speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 31.2 (29.3) | 30.7 (29.3) | 30.74 | 1.01x |
-| 1 | 2 | 61.9 (58.0) | 35.3 (34.1) | 17.64 | 1.76x |
-| 1 | 4 | 126.0 (117.0) | 47.4 (46.5) | 11.84 | 2.66x |
-| 1 | 8 | 248.3 (236.6) | 81.7 (80.5) | 10.21 | 3.04x |
-| 4 | 1 | 8.1 (7.6) | 8.1 (7.5) | 8.08 | 1.00x |
-| 4 | 2 | 16.3 (15.3) | 9.3 (8.7) | 4.66 | 1.75x |
-| 4 | 4 | 32.8 (31.0) | 12.4 (11.9) | 3.09 | 2.65x |
-| 4 | 8 | 64.9 (61.9) | 20.7 (20.2) | 2.58 | 3.14x |
+| 1 | 1 | 20.9 (20.1) | 20.9 (20.0) | 20.90 | 1.00x |
+| 1 | 2 | 40.9 (38.5) | 37.2 (36.1) | 18.59 | 1.10x |
+| 1 | 4 | 83.6 (77.7) | 49.2 (47.4) | 12.29 | 1.70x |
+| 1 | 8 | 160.3 (154.8) | 82.6 (80.3) | 10.32 | 1.94x |
+| 1 | 9 | 185.4 (176.6) | 103.6 (97.2) | 11.51 | 1.79x |
+| 1 | 16 | 332.1 (311.4) | 167.2 (159.3) | 10.45 | 1.99x |
+| 4 | 1 | 6.3 (5.2) | 5.8 (5.0) | 5.82 | 1.09x |
+| 4 | 2 | 10.2 (9.7) | 9.3 (9.1) | 4.65 | 1.09x |
+| 4 | 4 | 23.3 (20.4) | 14.4 (12.2) | 3.59 | 1.62x |
+| 4 | 8 | 45.1 (40.5) | 21.3 (20.3) | 2.66 | 2.12x |
+| 4 | 9 | 50.2 (45.7) | 25.8 (24.8) | 2.87 | 1.95x |
+| 4 | 16 | 94.5 (83.3) | 49.5 (41.3) | 3.10 | 1.91x |
 
 The same shape on the shipping AVX2 baseline, `ARCH='-mavx2 -mfma'`: blocks of 4.
 
 | Threads | T | Per-position loop, ms | Batched, ms | Batched ms/position | Speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 30.2 (28.9) | 30.1 (29.0) | 30.12 | 1.00x |
-| 1 | 2 | 61.4 (58.8) | 35.8 (34.2) | 17.88 | 1.72x |
-| 1 | 4 | 123.0 (117.2) | 49.6 (48.7) | 12.40 | 2.48x |
-| 1 | 8 | 244.4 (237.1) | 95.0 (92.8) | 11.87 | 2.57x |
-| 4 | 1 | 8.2 (7.6) | 8.0 (7.5) | 7.99 | 1.03x |
-| 4 | 2 | 15.8 (15.0) | 9.4 (8.6) | 4.71 | 1.68x |
-| 4 | 4 | 32.1 (29.8) | 12.7 (12.1) | 3.19 | 2.52x |
-| 4 | 8 | 65.7 (59.4) | 24.7 (23.5) | 3.08 | 2.67x |
+| 1 | 1 | 21.7 (20.9) | 21.5 (20.6) | 21.49 | 1.01x |
+| 1 | 2 | 43.5 (42.0) | 36.9 (35.6) | 18.46 | 1.18x |
+| 1 | 4 | 87.3 (83.3) | 50.5 (49.5) | 12.62 | 1.73x |
+| 1 | 8 | 174.5 (166.3) | 95.5 (93.1) | 11.93 | 1.83x |
+| 1 | 9 | 196.9 (187.1) | 114.9 (109.7) | 12.76 | 1.71x |
+| 1 | 16 | 352.6 (338.1) | 190.6 (182.9) | 11.91 | 1.85x |
+| 4 | 1 | 6.0 (5.3) | 5.5 (5.3) | 5.54 | 1.08x |
+| 4 | 2 | 12.5 (10.8) | 11.1 (9.0) | 5.53 | 1.13x |
+| 4 | 4 | 26.2 (21.3) | 13.5 (12.4) | 3.36 | 1.95x |
+| 4 | 8 | 47.0 (43.1) | 25.8 (24.0) | 3.23 | 1.82x |
+| 4 | 9 | 55.5 (49.1) | 30.5 (28.9) | 3.38 | 1.82x |
+| 4 | 16 | 93.4 (86.6) | 52.5 (47.1) | 3.28 | 1.78x |
 
 lm_head shape, 163840 x 7168, `-march=native` (`bench_batch 7 163840 16`). T = 9 is
 a `--spec 8` verify sweep, T = 16 one `--score-prompt` / `--tf-check` block.
 
 | Threads | T | Per-position loop, ms | Batched, ms | Batched ms/position | Speedup |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1 | 391 (375) | 384 (367) | 384.3 | 1.02x |
-| 1 | 2 | 808 (744) | 469 (447) | 234.7 | 1.72x |
-| 1 | 4 | 1,584 (1,494) | 646 (620) | 161.4 | 2.45x |
-| 1 | 8 | 3,172 (3,082) | 1,099 (1,075) | 137.4 | 2.89x |
-| 1 | 9 | 3,679 (3,356) | 1,359 (1,311) | 151.0 | 2.71x |
-| 1 | 16 | 6,450 (6,188) | 2,196 (2,133) | 137.3 | 2.94x |
-| 4 | 1 | 106 (99) | 105 (99) | 105.4 | 1.00x |
-| 4 | 2 | 206 (197) | 124 (116) | 62.0 | 1.66x |
-| 4 | 4 | 424 (400) | 167 (158) | 41.7 | 2.54x |
-| 4 | 8 | 852 (809) | 306 (273) | 38.2 | 2.78x |
-| 4 | 9 | 983 (951) | 354 (334) | 39.3 | 2.78x |
-| 4 | 16 | 1,747 (1,629) | 565 (543) | 35.3 | 3.09x |
+| 1 | 1 | 275 (247) | 269 (248) | 269.2 | 1.02x |
+| 1 | 2 | 551 (496) | 492 (430) | 246.0 | 1.12x |
+| 1 | 4 | 1,122 (1,036) | 657 (617) | 164.2 | 1.71x |
+| 1 | 8 | 2,212 (2,164) | 1,133 (1,069) | 141.6 | 1.95x |
+| 1 | 9 | 2,526 (2,343) | 1,406 (1,346) | 156.2 | 1.80x |
+| 1 | 16 | 4,491 (4,179) | 2,230 (2,133) | 139.4 | 2.01x |
+| 4 | 1 | 83 (69) | 79 (69) | 79.0 | 1.05x |
+| 4 | 2 | 165 (149) | 134 (116) | 67.1 | 1.23x |
+| 4 | 4 | 333 (279) | 169 (160) | 42.2 | 1.98x |
+| 4 | 8 | 649 (611) | 297 (283) | 37.1 | 2.19x |
+| 4 | 9 | 730 (619) | 383 (342) | 42.6 | 1.90x |
+| 4 | 16 | 1,319 (1,156) | 581 (556) | 36.3 | 2.27x |
 
 Reading them:
 
 - At T = 1 the batch hands the position to the existing kernel, so its 1.00x to
-  1.03x is the noise floor.
-- The kernel is compute-bound. The loop runs at 5.7 GFLOP/s on one thread and
-  about 21.7 on four (3.8x), and batched T = 8 scales 3.95x from one thread to four,
-  while its weight traffic falls to about 8.5 GB/s. The gain is widening each
-  weight once per block, not bandwidth.
-- At T = 8 on the trunk shape a position costs 2.58 ms instead of 8.1 ms on four
-  threads (3.14x). The `-march=native` build's batched call takes 14% less time
-  than the AVX2 baseline's on one thread (81.7 vs 95.0 ms) and 16% less on four
-  (20.7 vs 24.7 ms), 3% to 5% less at T = 4, the same at T = 1. The builds differ in instruction set as
-  well as block width, so this does not isolate the block width; the forced
-  `K3_MM_TB` comparison in the CHANGELOG does.
-- At lm_head's shape, a `--spec 8` sweep (T = 9) takes 354 ms on four threads instead
-  of 983 ms (2.78x). It costs 39.3 ms per position against 38.2 at T = 8 because
-  9 positions are a block of 8 plus a block of 1. A 16-position block takes 565 ms
-  instead of 1,747 (3.09x).
+  1.09x is the noise floor.
+- The per-position loop is now close to the memory roof: its weights stream at 8.4 to
+  8.8 GB/s on one thread and about 30 on four, against the plain read of about 9.8 and
+  36.5 GB/s measured in [decode-kernels.md](decode-kernels.md). The batch streams each
+  weight once per pass (2.1 GB/s at T = 8 on one thread, 8.3 on four) and is
+  compute-bound there: 17.1 GFLOP/s on one thread and 66.2 on four at T = 8, 1.9x and
+  2.1x the loop, scaling 3.9x from one thread to four. So batching saves the repeated
+  weight stream, and the widening and arithmetic it still does per position cap the
+  gain near 2x at these shapes.
+- At T = 8 on the trunk shape a position costs 2.66 ms instead of 5.63 ms on four
+  threads (2.12x), 10.32 ms instead of 20.04 on one (1.94x). The `-march=native`
+  build's batched call takes 13% less time than the AVX2 baseline's at T = 8 on one
+  thread (82.6 vs 95.5 ms) and 18% less on four (21.3 vs 25.8 ms); at T = 4 it is 3%
+  less on one thread and 7% more on four, and the same at T = 1. The builds differ in
+  instruction set as well as block width, so this does not isolate the block width;
+  the forced comparison below does.
+- At lm_head's shape, a `--spec 8` sweep (T = 9) takes 383 ms on four threads instead
+  of 730 ms (1.90x). It costs 42.6 ms per position against 37.1 at T = 8 because
+  9 positions are a block of 8 plus a block of 1. A 16-position block takes 581 ms
+  instead of 1,319 (2.27x).
 - Arithmetic from these cells, not a model measurement: with the head resident,
-  the projection of a 512-position `--score-prompt` would be 32 blocks x 0.565 s,
-  about 18 s, instead of 512 x 0.106 s, about 54 s, on four threads. Under
+  the projection of a 512-position `--score-prompt` would be 32 blocks x 0.581 s,
+  about 19 s, instead of 512 x 0.083 s, about 42 s, on four threads. Under
   `--stream-lm-head` the block also reads the 2.35 GB head once instead of 16 times;
   that I/O is not timed here.
+
+**Register block size.** The same runs time each ISA with its default block and with
+the other one forced (`-DK3_MM_TB`), trunk shape, batched median in ms; the loop does
+not depend on the block. With AVX-512VL a block of 8 takes 7% to 13% less time than 4
+at T = 8, 9 and 16 on one thread and at T = 8 and 9 on four, and ties at T = 16 on
+four; on the AVX2 baseline a block of 8 takes 2% to 9% more time than 4. That is what
+the default of 8 with AVX-512VL and 4 without rests on.
+
+| Build | Threads | T | Block 8 | Block 4 | 8 against 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `-march=native` | 1 | 8 | 82.6 | 92.8 | -11.0% |
+| `-march=native` | 1 | 9 | 103.6 | 111.7 | -7.3% |
+| `-march=native` | 1 | 16 | 167.2 | 185.0 | -9.6% |
+| `-march=native` | 4 | 8 | 21.3 | 24.4 | -12.5% |
+| `-march=native` | 4 | 9 | 25.8 | 29.7 | -13.2% |
+| `-march=native` | 4 | 16 | 49.5 | 49.5 | 0.0% |
+| `-mavx2 -mfma` | 1 | 8 | 104.2 | 95.5 | +9.1% |
+| `-mavx2 -mfma` | 1 | 9 | 120.6 | 114.9 | +5.0% |
+| `-mavx2 -mfma` | 1 | 16 | 202.3 | 190.6 | +6.2% |
+| `-mavx2 -mfma` | 4 | 8 | 26.4 | 25.8 | +2.2% |
+| `-mavx2 -mfma` | 4 | 9 | 32.6 | 30.5 | +6.9% |
+| `-mavx2 -mfma` | 4 | 16 | 55.9 | 52.5 | +6.5% |
 
 The header line prints `built AVX2` for both x86 builds; it names the vector
 kernel, not the register block, which comes from `__AVX512VL__`.

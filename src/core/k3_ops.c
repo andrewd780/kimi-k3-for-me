@@ -572,9 +572,11 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   Each position in a block holds four __m256d accumulators on AVX2, so the block size
  *   is set by the vector register file. With 16 ymm registers (plain AVX2) a block of 4
  *   fills them, and 8 spills: bench_batch at 12288 x 7168, one thread, -march=haswell on
- *   the reference VM, measured blocks of 8 about 8% SLOWER than 4 at T = 8 and 16. With
+ *   the reference VM, measured blocks of 8 about 8% SLOWER than 4 at T = 8 and 16 (and
+ *   2% to 9% slower with -mavx2 -mfma at T = 8, 9 and 16, one thread and four). With
  *   AVX-512VL the compiler may use ymm16-31 for the same 256-bit code, and there a block
- *   of 8 measured about 10% faster than 4 at T = 8, 9 and 16, at one thread and at four.
+ *   of 8 measured 7% to 13% faster than 4 at T = 8, 9 and 16 on one thread and at T = 8
+ *   and 9 on four, tying at 16 on four (runs in docs/notes/research-results.md).
  *   So 8 when __AVX512VL__ is defined, else 4; NEON keeps 2, since each position needs
  *   eight of its 32 registers for accumulators. The block size is a loop shape only:
  *   each position keeps its own accumulators whatever the block, so no output can

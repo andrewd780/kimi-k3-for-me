@@ -15,8 +15,8 @@ logits are bit-identical to projecting it alone. Those are geometry and mechanis
 calculations, not measured full-model memory or throughput results. The batched
 projection's compute alone, with the head resident and no reads, is timed at the
 head's shape in [the batched kernel timing](research-results.md#batched-kernel-timing):
-on four threads a `--spec 8` sweep takes 354 ms instead of 983 ms and a 16-position
-block 565 ms instead of 1,747 ms.
+on four threads a `--spec 8` sweep takes 383 ms instead of 730 ms and a 16-position
+block 581 ms instead of 1,319 ms, against the one-position kernel this branch ships.
 
 Fixed presets and explicit `--trunk-gb` values stay explicit. The flag alone frees
 memory; to fund the second trunk slot, give that memory to the trunk budget. For

@@ -26,11 +26,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instead of top-k order, is held by `test_ops`'s `moe_prefill` gate instead: top-16
   of 40 experts over 130 positions, bitwise against `k3_moe`, with an in-test check
   that a reversed or fetch-order sum would change most positions, and one expert read
-  per unique expert per sub-chunk. Positions share a widened weight in register blocks of 4 on
-  AVX2, 8 when AVX-512VL gives the compiler 32 vector registers, and 2 on NEON. On the
-  reference VM a block of 8 is about 10% faster than 4 with AVX-512VL and about 8%
-  slower on plain AVX2 (`bench_batch`, 8 to 16 positions); the block is a loop shape
-  only and cannot move an output.
+  per unique expert per sub-chunk. Positions share a widened weight in register blocks
+  of 4 on AVX2, 8 when AVX-512VL gives the compiler 32 vector registers, and 2 on NEON.
+  On the reference VM a block of 8 takes 7% to 13% less time than 4 with AVX-512VL (a
+  tie at 16 positions on four threads) and 2% to 9% more on plain AVX2 (`bench_batch`,
+  8 to 16 positions); the block is a loop shape only and cannot move an output. Against
+  the exact one-position decode kernel, batching takes a 12288 x 7168 projection of 8
+  positions from 160 to 83 ms on one thread and from 45 to 21 ms on four, and a
+  16-position lm_head block from 1,319 to 581 ms on four: about 2x, not the 3x an
+  earlier timing against the older kernel showed. Every run is in
+  [docs/notes/research-results.md](docs/notes/research-results.md#batched-kernel-timing).
   **Public API:** `K3WeightStream` (include/k3/k3.h), the streamed-matrix descriptor
   that `--trunk-rows` introduces, carries an optional `apply_batch` callback besides
   `apply`. `k3_mmw_batch` calls it for a `K3_WSTREAM` matrix, so every layer op reaches
