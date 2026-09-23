@@ -108,7 +108,13 @@ time and reach `B/r = 4.35 GB/s` to feed a saturated compressed stream. Sharing
 cores with matmuls changes this again. The format/reader, bounded workspace,
 parallel decode and concurrent-compute gates remain before engine integration.
 
-## 3. Predictive expert reads: paused at the generation/lead-time gate
+## 3. Predictive expert reads: closed
+
+Andrew's follow-up closes this route independently of any future generation
+capture. The assumed 70% recall adds about 5.76% whole-token traffic while
+experts account for only 19.2% of baseline bytes. The audit remains the stopping
+record. No further capture or predictor work is planned; the next item is the
+[fixed-width trunk dictionary falsifier](fixed-width-trunk.md).
 
 The [ordered review audit](predictive-prefetch-gates.md) supersedes the earlier
 "calibration ready" description. **Only synthetic tests were run.** There is no
@@ -126,7 +132,7 @@ scoring mechanics only.
 The recall-derived read multiplier and 70% gate flag have been removed. The
 tool explicitly marks the equal-slot global static-pin null, bytes per decode
 token, time available and gain over known-route pipelining as **unmeasured**.
-No predictor reader is being built before the ordered gates pass. Uncancelled
+No predictor reader is being built. Uncancelled
 wrong predictions can add traffic; true routing remains authoritative. The primary
 [Pre-gated MoE paper](https://arxiv.org/html/2308.12066v3) is prior art for earlier
 routing, not evidence for a training-free K3 predictor or a CPU speedup.
@@ -175,7 +181,7 @@ defines the shared queues and out-of-order completion contract used here.
 
 ## What remains blocked
 
-Three-run full-model comparisons of row streaming, thread/core count, prediction
+Three-run full-model comparisons of row streaming, thread/core count
 and speculation require the checkpoint on local NVMe. No such host exists here.
 None of this changes precision, restores the invalidated static-hot-set claim,
 or makes the roughly 1.5 TB checkpoint fit Andrew's disks. The quality harness

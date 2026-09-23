@@ -1,0 +1,153 @@
+name: Trunk dictionary gates
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/trunk-dictionary.yml'
+      - 'tools/trunk_dictionary_gate.py'
+      - 'tools/remote_model.py'
+      - 'tests/test_trunk_dictionary_gate.py'
+      - 'tests/test_fixed_dictionary_driver.py'
+      - 'tests/unit/test_fixed_dictionary.c'
+      - 'tools/bench_fixed_dictionary.py'
+      - 'benchmarks/fixed_dictionary.h'
+      - 'benchmarks/bench_fixed_dictionary.c'
+      - 'docs/measurements/lossless-samples.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  histogram:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      codec: ${{ steps.decision.outputs.codec }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Prove the coverage and input-identity gates can fail
+        run: python3 -m unittest discover -s tests -p test_trunk_dictionary_gate.py -v
+      - name: Falsifier first (exactly eight hash-verified 1 MiB dense ranges)
+        env:
+          RESEARCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/trunk_dictionary_gate.py --out trunk-dictionary-histogram.json
+      - name: Enforce the scientific gate for dependent jobs
+        id: decision
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          report = json.load(open('trunk-dictionary-histogram.json'))
+          print('codec=' + str(report['gate']['continue_to_codec']).lower())
+          PY
+      - name: Preserve counts and decision, including a scientific STOP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trunk-dictionary-histogram
+          path: trunk-dictionary-histogram.json
+          if-no-files-found: error
+
+  exactness:
+    needs: histogram
+    if: needs.histogram.outputs.codec == 'true'
+    name: Dictionary exactness (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      ASAN_OPTIONS: 'exitcode=86'
+      UBSAN_OPTIONS: 'halt_on_error=1:exitcode=87'
+      RESEARCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: trunk-dictionary-histogram
+      - name: Independent format and rate-gate failure controls
+        run: python3 -m unittest discover -s tests -p test_fixed_dictionary_driver.py -v
+      - name: Build sanitizer binaries for the actual hosted ISA
+        run: |
+          flags='-O1 -g -std=c99 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer'
+          if [ "$(uname -m)" = x86_64 ]; then flags="$flags -mssse3"; fi
+          echo "CODEC_FLAGS=$flags" >> "$GITHUB_ENV"
+          cc --version
+          cc $flags tests/unit/test_fixed_dictionary.c -o test-fixed-dictionary
+          cc $flags benchmarks/bench_fixed_dictionary.c -o bench-fixed-dictionary
+          # Isolate deliberate faults so one sanitizer cannot intercept the
+          # other's control. The actual codec tests keep BOTH sanitizers.
+          asan_flags="${flags/-fsanitize=address,undefined/-fsanitize=address}"
+          ubsan_flags="${flags/-fsanitize=address,undefined/-fsanitize=undefined}"
+          cc $asan_flags tests/unit/test_fixed_dictionary.c -o control-asan
+          cc $ubsan_flags tests/unit/test_fixed_dictionary.c -o control-ubsan
+      - name: Tails, escape paths, bounds and corrupt-input controls
+        run: ./test-fixed-dictionary
+      - name: Demonstrate both sanitizer gates detect deliberate faults
+        run: |
+          if ./control-asan trip-asan > asan-control.txt 2>&1; then exit 1; fi
+          grep -q 'ERROR: AddressSanitizer: heap-buffer-overflow' asan-control.txt
+          if ./control-ubsan trip-ubsan > ubsan-control.txt 2>&1; then exit 1; fi
+          grep -q 'runtime error: signed integer overflow' ubsan-control.txt
+      - name: Byte-exact scalar and SIMD round trips on all eight pinned ranges
+        run: python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode correctness --out dictionary-exactness.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dictionary-exactness-${{ matrix.os }}
+          path: |
+            dictionary-exactness.json
+            asan-control.txt
+            ubsan-control.txt
+
+  rate:
+    needs: exactness
+    name: Dictionary rate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      RESEARCH_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: trunk-dictionary-histogram
+      - name: Build optimized decoder only after both ISA exactness gates
+        run: |
+          flags='-O3 -std=c99 -Wall -Wextra -Werror'
+          if [ "$(uname -m)" = x86_64 ]; then flags="$flags -mssse3"; fi
+          echo "CODEC_FLAGS=$flags" >> "$GITHUB_ENV"
+          cc --version
+          cc $flags benchmarks/bench_fixed_dictionary.c -o bench-fixed-dictionary
+      - name: Three reconstructed-BF16 GB/s runs per arm and input
+        run: python3 tools/bench_fixed_dictionary.py --binary ./bench-fixed-dictionary --mode rate --out dictionary-rate.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dictionary-rate-${{ matrix.os }}
+          path: dictionary-rate.json
+          if-no-files-found: error

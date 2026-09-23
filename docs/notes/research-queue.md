@@ -9,7 +9,8 @@ scope, measurements, usage and remaining work.
 |---|---|---|
 | Smaller trunk ring | Opt-in `--trunk-rows`: two row buffers, unchanged matrix arithmetic, current-layer vector arena; no cross-layer read in flight | Real-model latency, queue depth and prefill cost |
 | Compact Huffman decoder | Four streams, bounded word refill and two-symbol lookup; independent encoder, corruption checks, x86/ARM CI timings on synthetic and pinned K3 ranges | Results in the results note; production container, concurrent reader and resource-cost gate remain separate |
-| Predictive expert prefetch | Lead-labelled centroid/ridge diagnostic, synthetic tests only; [ordered gate audit](predictive-prefetch-gates.md) | Paused: real generation trajectory and k=1/2/4 recall, then equal-slot static null and bytes/decode token |
+| Predictive expert prefetch | Lead-labelled centroid/ridge diagnostic, synthetic tests only; [ordered gate audit](predictive-prefetch-gates.md) | Closed; do not reopen on a generation capture |
+| Fixed-width trunk dictionary | [Eight-range high-byte histogram falsifier](fixed-width-trunk.md), one pooled 15-entry dictionary | Run coverage gate first; stop if it fails before writing a codec |
 | Bounded lookahead | Bounded Jacobi reference, exhaustive toy exactness checks and rational break-even calculator | Useful early acceptance on K3, engine snapshot/replay integration, measured total work |
 | Linux async submission | Raw-syscall `io_uring` versus blocking-pool experiment, queue depths 1/2/4/8/16, three runs per arm | A repeatable benefit under concurrent real compute before adding an engine backend |
 
@@ -55,11 +56,11 @@ All native execution is in CI, including hosted ARM. Nothing runs on Andrew's
 Macs. The decoder fetches only four SHA-verified 1 MiB BF16 ranges from the
 existing immutable sample manifest; it does not download a checkpoint.
 
-No standing checkpoint host exists. Full-model timing, core/thread sweeps,
-predictor calibration and quality evaluation remain blocked on one. This work
+No standing checkpoint host exists. Full-model timing, core/thread sweeps
+and quality evaluation remain blocked on one. Predictive prefetch is closed. This work
 does not rent a machine, change precision, prune experts, reduce top-k, or claim
 a sub-200-GB model. The negative static-pinning result remains closed.
 
 Use results to choose what comes next: measure row streaming on an already
-provisioned checkpoint host; keep codec, predictor, lookahead and async-backend
+provisioned checkpoint host; keep codec, lookahead and async-backend
 deployment gates explicit. No result here establishes a world-first technique.

@@ -3,7 +3,13 @@
 2026-09-20, following Andrew's research memo and review of PR #12. This records
 what the repository establishes, not a new K3 experiment. No checkpoint host,
 hidden-state generation capture or predictive reader exists here. Work on the
-predictive reader is paused at gate 1. Nothing runs on Andrew's machines.
+predictive reader is **closed**, independently of any future generation capture.
+Nothing runs on Andrew's machines. At assumed 70% recall, uncancelled misses add
+about 5.76% to the stated whole-token traffic baseline; experts are only 19.2%
+of that baseline. Andrew's follow-up closes this research route and directs the
+next experiment to the [fixed-width trunk falsifier](fixed-width-trunk.md).
+The audit below is retained as the historical gate/accounting record, not a
+request to collect a generation trajectory or reopen predictive prefetch.
 
 ## 1. Oracle and generation-trajectory gate: blocked
 
@@ -38,7 +44,7 @@ The 68 position evaluations contain 12 distinct positions. Its final-pass
 transpose is a derived replay, not an observed incremental generation trace.
 See [the trace audit](../EXPERT_PROFILES.md#what-the-existing-trace-actually-records).
 
-Before re-opening this gate, capture an actual autoregressive generation run
+The former gate would have required an actual autoregressive generation run
 after prompt prefill, with the immutable checkpoint/engine revisions, flags,
 tokenizer, original prompt identity, emitted token sequence, seed/sampling
 settings, absolute positions, execution phase and feature hook in a manifest.
@@ -178,4 +184,5 @@ mechanisms and stop predictor deployment work here.
 The memo's latent-space findings motivate careful controls, not a transfer
 result for K3 routing. Identity-regularized hidden-to-hidden maps are square;
 an identity penalty cannot simply be copied onto a 7,168-to-896 classifier.
-No new probe family or complexity is justified before positive-lead evidence.
+No new probe family, generation capture or predictive reader is planned. The
+route remains closed; the next research item attacks trunk decode rate.
