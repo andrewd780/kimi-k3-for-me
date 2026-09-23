@@ -89,6 +89,20 @@ class DictionaryGateTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gate.dense_ranges(broken)
 
+    def test_repeated_range_is_refused_even_among_exactly_eight(self):
+        # Appending a copy of a range trips the count check first, so it cannot show that
+        # the identity check works. Here the second dense range is re-pointed at the
+        # first one's shard and offset: still eight rows, each well formed on its own,
+        # and only the (shard, offset) identity check stands between the gate and
+        # scoring the same bytes twice.
+        manifest = json.loads(gate.MANIFEST.read_bytes())
+        broken = copy.deepcopy(manifest)
+        dense = [r for r in broken["samples"] if r["kind"] == "dense"]
+        dense[1].update(shard=dense[0]["shard"], offset=dense[0]["offset"])
+        self.assertEqual(len(dense), 8)
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            gate.dense_ranges(broken)
+
     def test_corrupt_or_truncated_range_cannot_be_scored(self):
         raw = b"\x80\xbf\x00\x3f"
         row = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
@@ -206,21 +220,56 @@ class BitWidthCurveTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gate.analyze(entries(ranges), fulls[:7])
 
-    def test_committed_four_range_curve_recomputes_from_its_source(self):
-        record = json.loads((gate.ROOT / "docs/measurements/fixed-width-curve-four-ranges.json")
-                            .read_bytes())
-        again = gate.committed_curve(gate.ROOT / record["source"]["file"],
-                                     record["source"]["pointer"])
-        self.assertEqual(again["source"], record["source"])
-        self.assertEqual(again["histogram"], record["histogram"])
-        for old, new in zip(record["bit_width_curve"]["schemes"],
-                            again["bit_width_curve"]["schemes"]):
+    def test_committed_curves_recompute_from_their_sources(self):
+        # The four f_a_proj ranges of the Huffman job, and all eight gate-1 ranges.
+        for name in ("fixed-width-curve-four-ranges.json", "fixed-width-curve-eight-ranges.json"):
+            with self.subTest(name=name):
+                record = json.loads((gate.ROOT / "docs/measurements" / name).read_bytes())
+                again = gate.committed_curve(gate.ROOT / record["source"]["file"],
+                                             record["source"]["pointer"])
+                self.assertEqual(again["source"], record["source"])
+                self.assertEqual(again["histogram"], record["histogram"])
+                for old, new in zip(record["bit_width_curve"]["schemes"],
+                                    again["bit_width_curve"]["schemes"]):
+                    for key, value in old.items():
+                        if isinstance(value, float):
+                            self.assertAlmostEqual(new[key], value, places=12)
+                        else:
+                            self.assertEqual(new[key], value)
+                self.assertEqual(record["bit_width_curve"]["decision"]["best_scheme"],
+                                 "fixed_3bit")
+
+    def assert_derived(self, old, new, path=""):
+        """Every field of the recorded report equals the one recomputed now."""
+        if isinstance(old, dict):
             for key, value in old.items():
-                if isinstance(value, float):
-                    self.assertAlmostEqual(new[key], value, places=12)
-                else:
-                    self.assertEqual(new[key], value)
-        self.assertEqual(record["bit_width_curve"]["decision"]["best_scheme"], "fixed_3bit")
+                self.assertIn(key, new, path + "/" + key)
+                self.assert_derived(value, new[key], path + "/" + key)
+        elif isinstance(old, list):
+            self.assertEqual(len(old), len(new), path)
+            for i, (a, b) in enumerate(zip(old, new)):
+                self.assert_derived(a, b, f"{path}/{i}")
+        elif isinstance(old, float):
+            self.assertAlmostEqual(old, new, places=12, msg=path)
+        else:
+            self.assertEqual(old, new, path)
+
+    def test_committed_gate1_report_recomputes_from_its_counts(self):
+        # Gate 1's record is the CI job's stdout report, committed because the run's
+        # artifact expires. Coverage, support, dictionaries, escapes, ratios and the
+        # decision must all follow from the histograms it carries.
+        record = json.loads((gate.ROOT / "docs/measurements/trunk-dictionary-gate1.json")
+                            .read_bytes())
+        report = record["report"]
+        again = gate.analyze([(r["sample"], r["histogram"]) for r in report["ranges"]])
+        for old, new in zip(report["ranges"], again["ranges"]):
+            self.assert_derived(old, new, "/ranges")
+        for key in ("pooled", "gate", "plane", "ratio_scope", "limits", "schema"):
+            self.assert_derived(report[key], again[key], "/" + key)
+        self.assertEqual(report["gate"]["status"], "PASS")
+        self.assertEqual(report["pooled"]["global_15"]["escape_values"], 1902)
+        self.assertEqual(record["job_id"], 106042549106)
+        self.assertEqual(report["execution"]["run_id"], str(record["workflow_run"]))
 
     def test_committed_histogram_agrees_with_independent_fd4b_escape_counts(self):
         # Two committed records from different CI runs describe the same four ranges:
