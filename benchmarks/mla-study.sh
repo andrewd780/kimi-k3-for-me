@@ -25,7 +25,7 @@
 #
 # Output: <out_dir>/mla-study.jsonl (one JSON object per line) and a .log per step.
 # Runtime on the 4-core VM of the note: the exact phase about ten minutes, the timing
-# phase about an hour and a half when the machine is quiet.
+# phase about an hour when the machine is quiet (52 minutes for the note's tables).
 set -euo pipefail
 OUT="${1:?usage: mla-study.sh <out_dir> [threads] [exact|timing|all]}"
 THREADS="${2:-$(getconf _NPROCESSORS_ONLN)}"

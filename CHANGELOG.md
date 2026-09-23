@@ -60,14 +60,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ordinary, cancelling and sharp layers, including the double softmax normalisers and
   probability quotients the output rounds away, which the engine exposes through a new
   test-only hook, `k3_mla_trace` (NULL outside tests); a mutation run shows the gate
-  catches reordered chains in the variants and in both engine layouts. `bench_mla counts` counts kv_b applications: at a 256-token prefill L0 makes
-  65,792 per layer and L1 256. A differs from E by ~1e-6 relative, as much as E differs
-  from a double reference, with no argmax change in 30,000 softmax rows; it is not
-  bitwise, so it cannot be a mode under the exactness contract. Timed on the idle
-  4-core VM (one layer, four threads): E+ is 3.9-5.9x faster than E for one new token
-  and 6.4-16x for five; L1 halves L0 at decode and takes a 256-token prefill from 60 s
-  to 0.54 s per layer, but rebuilding stays 49-72x slower than E+ at decode; A is the
-  fastest at long contexts. See [the note](docs/notes/mla-variants.md).
+  catches reordered chains in the variants and in both engine layouts. `bench_mla
+  counts` counts kv_b applications: at a 256-token prefill L0 makes 65,792 per layer and
+  L1 256. A differs from E by ~1e-6 relative, as much as E differs from a double
+  reference, with no argmax change in 30,000 softmax rows; it is not bitwise, so it
+  cannot be a mode under the exactness contract. Timed on the idle 4-core VM with the
+  shipped kernels (one layer, four threads): E+ is 4.8-5.5x faster than E for one new
+  token and 6.6-15x for five; L1 halves L0 at decode and takes a 256-token prefill from
+  43 s to 0.53 s per layer, but rebuilding stays 34-51x slower than E+ at decode; A is
+  the fastest at long contexts. The hosted macOS arm64 and Ubuntu runs pass the same
+  gates and counts. See [the note](docs/notes/mla-variants.md).
 - **Fixed-width trunk dictionary gates** (benchmark-only, not in inference): a
   4-bit high-byte index into one pooled 15-entry table with an escape code, the
   low byte raw, decoded by SSSE3 `pshufb` / NEON `tbl`. The eight-range histogram
