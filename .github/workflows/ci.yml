@@ -125,7 +125,10 @@ jobs:
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc make
+          # libgomp is listed separately: MSYS2's GCC 16 packages split OpenMP out of
+          # mingw-w64-x86_64-gcc into an optional dependency, and without it the
+          # Makefile's -fopenmp -static link fails with "cannot find -lgomp".
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make
 
       - name: Build (default flags, platform detection)
         run: make

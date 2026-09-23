@@ -337,6 +337,130 @@ static int incremental_decode(const Model *m, const K3Cfg *c, int T, int np,
     return steps;
 }
 
+/* ---------------------------------------------------- speculative decode ----
+ * GATE 4. Like incremental_decode, but each step after the prefill is a speculative
+ * VERIFY: the pending id plus nd drafted ids go through the model in one batch, as a
+ * TENTATIVE sweep (every KDA layer runs on a work copy and records its recurrence inputs;
+ * the MLA layers write their KV rows as usual), then only the positions behind the ids
+ * that are emitted are committed with k3_kda_advance. Nothing is ever replayed.
+ *
+ * The drafts come from `truth`, the reference continuation, with ONE deliberately wrong
+ * id, so every acceptance count can be forced: round r targets r % (spec + 1) accepted
+ * ids, which covers a rejection of the very first draft, every partial count, and full
+ * acceptance. spec = 0 degenerates into plain one-id-per-step decode, the reference this
+ * is compared against: every logit behind every emitted id, and the carried state at the
+ * end, must be the same bits.
+ *
+ * gi[] holds the prompt on entry and receives the generated ids; lgs[] receives one logit
+ * vector per generated id; ks/kvc/rpc are the carried state, caller-owned so it can be
+ * compared afterwards. hist[m] counts sweeps that accepted m ids. Returns the number of
+ * verify sweeps, or -1 if a buffer could not be allocated. */
+#define GATE4_SPEC 4
+static int spec_decode(const Model *m, const K3Cfg *c, int T, int np, int latent,
+                       int spec, const int *truth, int *gi, float *lgs,
+                       float *ks, float *kvc, float *rpc, int *hist)
+{
+    const int E = c->hidden, V = c->vocab, H = c->n_heads, kvd = c->qk_nope + c->v_head;
+    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const size_t kper = k3_kda_state_floats(c), lrow = k3_kda_log_row(c);
+    const size_t kvper = (size_t)T * (latent ? (size_t)c->kv_lora : (size_t)H * kvd);
+    const size_t rpper = (size_t)T * (size_t)c->qk_rope;
+    const int cap = spec + 1;
+
+    size_t need = k3_mla_scratch_cached(c, T, T, 1, latent);
+    size_t li = k3_layer_scratch(c, T);
+    size_t alt = (size_t)(maxb + 2) * (size_t)E + (size_t)V;
+    if (li > need) need = li;
+    if (alt > need) need = alt;
+    float *sc   = (float *)malloc(need * sizeof(float));
+    float *h    = (float *)malloc((size_t)T * E * sizeof(float));
+    float *br   = (float *)malloc((size_t)T * maxb * E * sizeof(float));
+    float *rows = (float *)malloc((size_t)c->n_layers * cap * lrow * sizeof(float));
+    float *work = (float *)malloc(kper * sizeof(float));
+    float *lgp  = (float *)malloc((size_t)(np > cap ? np : cap) * V * sizeof(float));
+    int   *tok  = (int *)malloc((size_t)(np > cap ? np : cap) * sizeof(int));
+    int sweeps = -1;
+    if (!sc || !h || !br || !rows || !work || !lgp || !tok) goto done;
+
+    memset(ks, 0, kper * (size_t)c->n_layers * sizeof(float));
+    memset(kvc, 0, kvper * (size_t)c->n_layers * sizeof(float));
+    memset(rpc, 0, rpper * (size_t)c->n_layers * sizeof(float));
+    for (int i = 0; i <= spec; i++) hist[i] = 0;
+    sweeps = 0;
+    int cached = 0;
+    for (int round = -1; cached + 1 < T; round++) {
+        const int base = cached;
+        int nT, nd = 0, target = 0;
+        if (round < 0) {                       /* the prefill, never tentative */
+            nT = np;
+            memcpy(tok, gi, (size_t)np * sizeof(int));
+        } else {
+            nd = spec < T - 2 - base ? spec : T - 2 - base;
+            if (nd < 0) nd = 0;
+            target = round % (spec + 1);
+            if (target > nd) target = nd;
+            tok[0] = gi[base];
+            for (int i = 0; i < nd; i++)
+                tok[1 + i] = i == target ? (truth[base + 1 + i] + 1) % V
+                                         : truth[base + 1 + i];
+            nT = nd + 1;
+        }
+        for (int t = 0; t < nT; t++)
+            memcpy(h + (size_t)t * E, m->embed + (size_t)tok[t] * E, (size_t)E * sizeof(float));
+        memset(br, 0, (size_t)nT * maxb * E * sizeof(float));
+        int nb = 0;
+        for (int L = 0; L < c->n_layers; L++) {
+            K3KdaLog lg = { rows + (size_t)L * cap * lrow, work, cap, 0 };
+            k3_decoder_layer_inc_log(h, br, &nb, &m->lay[L], c, L, nT,
+                                     ks + kper * (size_t)L, sc,
+                                     kvc + kvper * (size_t)L, rpc + rpper * (size_t)L,
+                                     base, T, latent, nd > 0 ? &lg : NULL);
+        }
+        /* model-level aggregator and head on EVERY position of the batch */
+        float *fold = sc, *src = fold + E, *nrm = sc;
+        for (int t = 0; t < nT; t++) {
+            if (m->out_res_norm && m->out_res_proj) {
+                for (int i = 0; i < E; i++) fold[i] = m->out_res_norm[i] * m->out_res_proj[i];
+                for (int b = 0; b < nb; b++)
+                    memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E,
+                           (size_t)E * sizeof(float));
+                memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
+                k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+            }
+            k3_rmsnorm(nrm, h + (size_t)t * E, m->final_norm, E, c->rms_eps);
+            k3_matmul(lgp + (size_t)t * V, nrm, m->lm_head, E, V);
+        }
+        if (round < 0) {
+            memcpy(lgs, lgp + (size_t)(np - 1) * V, (size_t)V * sizeof(float));
+            cached = np;
+            gi[np] = argmax_(lgp + (size_t)(np - 1) * V, V);
+            continue;
+        }
+        int acc = 0;
+        while (acc < nd && argmax_(lgp + (size_t)acc * V, V) == tok[1 + acc]) acc++;
+        if (acc != target) { sweeps = -1; goto done; }   /* the drafts were not as built */
+        const int keep = acc + 1;
+        if (nd > 0) {
+            for (int L = 0; L < c->n_layers; L++) {
+                if (!k3_is_kda(c, L)) continue;
+                K3KdaLog lg = { rows + (size_t)L * cap * lrow, NULL, cap, 0 };
+                k3_kda_advance(ks + kper * (size_t)L, &lg, keep, c);
+            }
+            hist[acc]++;
+            sweeps++;
+        }
+        for (int i = 0; i < keep; i++) {
+            gi[base + 1 + i] = i < acc ? tok[1 + i] : argmax_(lgp + (size_t)acc * V, V);
+            memcpy(lgs + (size_t)(base + 1 + i - np) * V, lgp + (size_t)i * V,
+                   (size_t)V * sizeof(float));
+        }
+        cached = base + keep;
+    }
+done:
+    free(sc); free(h); free(br); free(rows); free(work); free(lgp); free(tok);
+    return sweeps;
+}
+
 /* Config is read through k3_cfg.h, which never substitutes a default for a missing
  * field: it collects every absent key and refuses the load. Do not reintroduce a
  * defaulting reader here. A default turns "this program cannot understand this config"
@@ -506,6 +630,65 @@ int main(int argc, char **argv)
                " expanded cache\n", latent_ok ? "PASS" : "FAIL", se > 0 ? se : 0);
         gok = (iok == T - np) ? gok : -1;   /* fail the verdict if incremental diverged */
         if (!latent_ok) gok = -1;
+
+        /* ---- GATE 4: SPECULATIVE decode, without replay ------------------------------
+         * Verify sweeps run tentatively and commit only the positions behind the ids
+         * they emit (see spec_decode). Every acceptance count 0..GATE4_SPEC is forced, in
+         * both KV layouts, and three things must hold to the bit: the ids are full_ids,
+         * the logits behind every id are GATE 3's, and the carried state at the end --
+         * every KDA matrix and ShortConv history, every occupied KV row -- is what plain
+         * one-id-per-step decode leaves. Positions a sweep rejected leave KV rows past
+         * the kept prefix; they must be overwritten before anything reads them, and the
+         * logits of the ids after each rejection are what prove it. */
+        const size_t kper4 = k3_kda_state_floats(&c);
+        int spec_ok = se > 0, sweeps4 = 0, hist[GATE4_SPEC + 1];
+        for (int lat = 0; lat < 2 && spec_ok; lat++) {
+            const size_t kvper4 = (size_t)T * (lat ? (size_t)c.kv_lora
+                                  : (size_t)c.n_heads * (c.qk_nope + c.v_head));
+            const size_t rpper4 = (size_t)T * (size_t)c.qk_rope;
+            const size_t nkv = kvper4 * (size_t)c.n_layers, nrp = rpper4 * (size_t)c.n_layers;
+            float *kst[2], *kv[2], *rp[2], *lgs[2];
+            int *g4[2], sw[2];
+            for (int r = 0; r < 2; r++) {
+                kst[r] = (float *)malloc(kper4 * (size_t)c.n_layers * sizeof(float));
+                kv[r]  = (float *)malloc(nkv * sizeof(float));
+                rp[r]  = (float *)malloc(nrp * sizeof(float));
+                lgs[r] = (float *)malloc((size_t)(T - np) * c.vocab * sizeof(float));
+                g4[r]  = (int *)malloc((size_t)T * sizeof(int));
+                sw[r]  = -1;
+                if (kst[r] && kv[r] && rp[r] && lgs[r] && g4[r]) {
+                    memcpy(g4[r], full, (size_t)np * sizeof(int));
+                    sw[r] = spec_decode(m, &c, T, np, lat, r ? GATE4_SPEC : 0, full, g4[r],
+                                        lgs[r], kst[r], kv[r], rp[r], hist);
+                }
+            }
+            /* Occupied rows only: the rows a rejection left past the end differ by
+             * design, and nothing ever reads them. */
+            const size_t occ = (size_t)(T - 1);
+            int same_kv = sw[0] == 0 && sw[1] > 0;
+            for (int L = 0; same_kv && L < c.n_layers; L++)
+                same_kv = memcmp(kv[0] + kvper4 * L, kv[1] + kvper4 * L,
+                                 kvper4 / T * occ * sizeof(float)) == 0
+                       && memcmp(rp[0] + rpper4 * L, rp[1] + rpper4 * L,
+                                 rpper4 / T * occ * sizeof(float)) == 0;
+            spec_ok = same_kv
+                && memcmp(g4[1], full, (size_t)T * sizeof(int)) == 0
+                && memcmp(g4[0], full, (size_t)T * sizeof(int)) == 0
+                && memcmp(lgs[1], lgs[0], (size_t)(T - np) * c.vocab * sizeof(float)) == 0
+                && memcmp(lgs[0], lat ? lg_lat : lg_exp,
+                          (size_t)(T - np) * c.vocab * sizeof(float)) == 0
+                && memcmp(kst[1], kst[0], kper4 * (size_t)c.n_layers * sizeof(float)) == 0;
+            for (int a = 0; spec_ok && a <= GATE4_SPEC; a++) spec_ok = hist[a] > 0;
+            sweeps4 += sw[1] > 0 ? sw[1] : 0;
+            for (int r = 0; r < 2; r++) {
+                free(kst[r]); free(kv[r]); free(rp[r]); free(lgs[r]); free(g4[r]);
+            }
+        }
+        printf("GATE 4  speculative    : %s  <- %d verify sweeps accepting every count "
+               "0..%d, both KV layouts: ids, every logit and the final state bit-identical "
+               "to serial decode, no replay\n", spec_ok ? "PASS" : "FAIL", sweeps4,
+               GATE4_SPEC);
+        if (!spec_ok) gok = -1;
         free(lg_exp); free(lg_lat); free(gi); free(gil);
     }
 

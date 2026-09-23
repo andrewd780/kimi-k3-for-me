@@ -13,11 +13,13 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import struct
 import sys
 import tempfile
+from typing import ClassVar
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -522,6 +524,208 @@ class OfflineCliTests(unittest.TestCase):
                 self.assertIn("profile", result.stderr)
                 self.assertNotIn("config:", result.stdout)
                 self.assertNotIn("indexed", result.stdout)
+
+    # ---- speculative decode: tentative sweeps, never a replay sweep -------------------
+    # --spec verifies drafted ids in ONE batched sweep. A rejected draft used to cost a
+    # second forward that replayed the accepted prefix, re-reading the whole trunk. Now
+    # the sweep is tentative: each KDA layer records its recurrence inputs, and only the
+    # positions whose ids are emitted are committed to the carried state. Every test here
+    # demands that each generated id AND the logits behind each one are bit-identical to
+    # plain serial --incremental decode, and reads the counters that show which paths ran:
+    # partial and full acceptance, a stop id cutting a sweep, and one exact forward sweep
+    # per decode step, which is what "no replay" means.
+
+    SPEC = 4
+    _crafted: ClassVar[dict] = {}
+
+    def run_logits(self, model, args):
+        """run_cli plus --dump-all-logits: (report, first-step logits, every token's)."""
+        path = self.path / ("all%d.f32" % (self.counter + 1))
+        report, first = self.run_cli(model, [*args, "--dump-all-logits", path])
+        raw = path.read_bytes()
+        self.assertEqual(len(raw), 256 * 4 * len(report["generated_ids"]))
+        return report, first, raw
+
+    def assert_same_run(self, a, b):
+        self.assertEqual(a[0]["generated_ids"], b[0]["generated_ids"])
+        self.assertEqual(a[0]["full_ids"], b[0]["full_ids"])
+        self.assertEqual(a[1], b[1], "first-step logits must be bit-identical")
+        self.assertEqual(a[2], b[2], "the logits behind every token must be bit-identical")
+
+    def assert_no_replay(self, report):
+        # Every decode step, a verify sweep included, runs exactly one exact forward.
+        self.assertEqual(report["forward_sweeps"], report["decode_steps"])
+        self.assertEqual(len(report["spec_trace"]), report["spec_sweeps"])
+        self.assertEqual(report["spec_sweeps"],
+                         report["spec_full_accepts"] + report["spec_partial_accepts"])
+        self.assertEqual(report["spec_accepted"], sum(s[1] for s in report["spec_trace"]))
+        self.assertEqual(report["spec_dropped_positions"],
+                         sum(s[0] + 1 - s[2] for s in report["spec_trace"]))
+        # A decode step emits one id, a sweep emits its kept ids: nothing else runs.
+        emitted = report["decode_steps"] + sum(s[2] - 1 for s in report["spec_trace"])
+        self.assertEqual(emitted, len(report["generated_ids"]))
+
+    def crafted(self, accept, second=False):
+        """A prompt whose FIRST verify sweep drafts SPEC ids and the model accepts exactly
+        `accept` of them. The prompt opens with a 4-gram `a` and ends with it, and after the
+        opening copy come the model's own continuation up to the rejection point and then a
+        wrong id, so the n-gram drafter proposes exactly that. second=True also embeds the
+        continuation that follows the sweep's bonus id, behind the sweep's last four ids,
+        so a SECOND sweep drafts SPEC ids that are all accepted. Since the continuation
+        depends on the prompt, the prompt is iterated to a fixed point; this random tiny
+        model's greedy continuation barely moves with distant context, so a few serial runs
+        suffice. Cached per class: every memory mode must agree on the continuation anyway."""
+        key = (accept, second)
+        if key in self._crafted:
+            return self._crafted[key]
+        spec, rnd = self.SPEC, random.Random(7919 * accept + 104729 * second + 1)
+        need = accept + (spec + 2 if second else 1)
+        for _ in range(12):
+            a = [rnd.randrange(256) for _ in range(4)]
+            r = [rnd.randrange(256) for _ in range(6)]
+            y = [rnd.randrange(256) for _ in range(accept + spec + 3)]
+            for _ in range(6):
+                junk = (y[accept + 1] + 1) % 256
+                b = y[:spec + 1] if accept == spec else \
+                    (y[:accept + 1] + [junk] + y[accept + 2:])[:spec + 1]
+                prompt = a + b + r
+                if second:
+                    prompt += y[accept - 2:accept + spec + 2] + r[::-1]
+                prompt += a
+                report, _ = self.run_cli(self.plain, ["--ids", ",".join(map(str, prompt)),
+                                                      "--incremental",
+                                                      "--gen", str(accept + spec + 3)])
+                got = report["generated_ids"]
+                if got[:need] == y[:need] and (accept == spec or got[accept + 1] != junk):
+                    self._crafted[key] = (prompt, got)
+                    return prompt, got
+                y = got
+        self.fail("no stable crafted prompt for accept=%d second=%s" % (accept, second))
+
+    def test_spec_partial_and_full_acceptance_match_serial_decode(self):
+        seen = set()
+        for accept, second in ((0, False), (1, False), (3, False), (2, True)):
+            with self.subTest(accept=accept, second=second):
+                prompt, _ = self.crafted(accept, second)
+                args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", "12"]
+                serial = self.run_logits(self.plain, args)
+                spec = self.run_logits(self.plain, [*args, "--spec", str(self.SPEC)])
+                self.assert_same_run(serial, spec)
+                report = spec[0]
+                self.assert_no_replay(report)
+                self.assertEqual(report["spec_trace"][0], [self.SPEC, accept, accept + 1])
+                if second:
+                    self.assertEqual(report["spec_trace"][1], [self.SPEC, self.SPEC,
+                                                               self.SPEC + 1])
+                self.assertEqual(serial[0]["decode_steps"], 12)
+                self.assertEqual(serial[0]["spec_log_bytes"], 0)
+                # The plan counts exactly what --spec allocates, and nothing more.
+                self.assertGreater(report["spec_log_bytes"], 0)
+                self.assertEqual(report["memory_plan_bytes"] - serial[0]["memory_plan_bytes"],
+                                 report["spec_log_bytes"])
+                seen.update("full" if s[1] == s[0] else "partial%d" % s[1]
+                            for s in report["spec_trace"])
+        self.assertTrue({"partial0", "partial1", "partial2", "partial3", "full"} <= seen, seen)
+
+    def test_spec_rollback_matches_serial_in_every_memory_mode(self):
+        # The contract is the same logits at every budget and in every mode, so each mode's
+        # speculative run is held to the PLAIN serial run, not to its own mode's.
+        modes = ((self.plain, ["--kv-latent"]),
+                 (self.packed, ["--trunk", self.ztrunk, "--trunk-gb", "0.001"]),
+                 (self.selective, ["--trunk", self.ztrunk, "--trunk-gb", "0.00005",
+                                   "--trunk-rows", "--expert-pipeline"]),
+                 (self.selective, ["--trunk", self.trunk, "--trunk-gb", "0.00005",
+                                   "--trunk-rows", "--kv-latent"]),
+                 (self.packed, ["--trunk", self.ztrunk, "--trunk-gb", "0.001",
+                                "--stream-lm-head"]))
+        for accept, second in ((0, False), (2, True)):
+            prompt, _ = self.crafted(accept, second)
+            args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", "12"]
+            serial = self.run_logits(self.plain, args)
+            for model, mode in modes:
+                with self.subTest(accept=accept, mode=mode):
+                    spec = self.run_logits(model, [*args, *mode, "--spec", str(self.SPEC)])
+                    self.assert_same_run(serial, spec)
+                    self.assert_no_replay(spec[0])
+                    self.assertEqual(spec[0]["spec_trace"][0],
+                                     [self.SPEC, accept, accept + 1])
+
+    def test_spec_saved_state_is_the_serial_state(self):
+        # --save-state after a sweep must write what serial decode writes at the same
+        # point, byte for byte, including when a --stop-id cuts a sweep short, fully or
+        # partially accepted: the state then has to end at the stop, not at the sweep's
+        # last accepted position. The saved sessions must also resume identically.
+        spec = self.SPEC
+        two, got2 = self.crafted(2, True)
+        three, got3 = self.crafted(3)
+
+        def first_new(got, i):
+            # a stop fires at the FIRST occurrence of its id, so it must be new at i
+            return next(j for j in range(len(got)) if got[j] == got[i]) == i
+
+        # Generated ids: [0] from the prefill, then each sweep's kept ids. For `two` the
+        # first sweep keeps 1..3 and the fully accepted second one 4..8; for `three` the
+        # one sweep keeps 1..4.
+        cases = [("end of a full sweep", two, 2 + spec + 3, None, None)]
+        for i in (2 + 3, 2 + 4, 2 + 5):
+            if first_new(got2, i):
+                cases.append(("stop inside a full sweep", two, 16, got2[i], [spec, spec, i - 3]))
+                break
+        for i in (2, 1, 3):
+            if first_new(got3, i):
+                cases.append(("stop inside a partial sweep", three, 16, got3[i], [spec, 3, i]))
+                break
+        self.assertEqual(len(cases), 3, "the crafted continuations repeat too much")
+        for name, prompt, gen, stop, cut in cases:
+            with self.subTest(case=name):
+                args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", str(gen)]
+                if stop is not None:
+                    args += ["--stop-id", str(stop)]
+                states = [self.path / (name.replace(" ", "_") + s) for s in (".serial", ".spec")]
+                serial = self.run_logits(self.plain, [*args, "--save-state", states[0]])
+                specr = self.run_logits(self.plain, [*args, "--spec", str(spec),
+                                                     "--save-state", states[1]])
+                self.assert_same_run(serial, specr)
+                self.assert_no_replay(specr[0])
+                self.assertEqual(states[0].read_bytes(), states[1].read_bytes(),
+                                 "the saved state must be the serial state, byte for byte")
+                if cut is None:
+                    self.assertEqual(len(specr[0]["generated_ids"]), gen)
+                    self.assertEqual(specr[0]["spec_trace"][-1], [spec, spec, spec + 1])
+                else:
+                    self.assertEqual(specr[0]["stopped_at"], stop)
+                    self.assertEqual(specr[0]["spec_trace"][-1], cut)
+                    self.assertEqual(specr[0]["spec_cut_by_stop"], 1)
+                resume = ["--incremental", "--ids", ",".join(map(str, prompt[:4])),
+                          "--gen", "10"]
+                a = self.run_logits(self.plain, [*resume, "--load-state", states[0]])
+                b = self.run_logits(self.plain, [*resume, "--load-state", states[1],
+                                                 "--spec", str(spec)])
+                self.assert_same_run(a, b)
+                self.assert_no_replay(b[0])
+
+    def test_draft_trunk_rollback_matches_serial_decode(self):
+        # The hybrid draft proposes through tentative calls of its own and commits what the
+        # exact model keeps, so it needs no replay either, and after a fully accepted round
+        # its next round's first call absorbs the last draft instead of a catch-up sweep.
+        # A draft on the same trunk differs from the exact model through its cache-only
+        # expert routing, which on this tiny cache gives both kinds of round.
+        args = ["--ids", "3,7,11,5,9", "--incremental", "--gen", "24"]
+        serial = self.run_logits(self.plain, args)
+        for mode in ([], ["--kv-latent"]):
+            with self.subTest(mode=mode):
+                hybrid = self.run_logits(self.plain, [*args, *mode, "--trunk", self.trunk,
+                                                      "--trunk-gb", "0.01",
+                                                      "--draft-trunk", self.trunk])
+                self.assert_same_run(serial, hybrid)
+                report = hybrid[0]
+                self.assert_no_replay(report)
+                self.assertGreater(report["spec_partial_accepts"], 0)
+                self.assertGreater(report["spec_full_accepts"], 0)
+                # the draft's prefill plus SPEC calls per round: no catch-up, no replay
+                self.assertEqual(report["draft_forward_sweeps"],
+                                 1 + self.SPEC * report["spec_sweeps"])
+                self.assertEqual(report["draft_accepted"], report["spec_accepted"])
 
 
 if __name__ == "__main__":
