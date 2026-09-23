@@ -59,6 +59,14 @@ and 0.03; at 128 GB they are 0.44, 0.45 and 0.11. The replay R(m) runs only toda
 after a partial acceptance. Speedup is emitted ids divided by summed step cost; a
 plain step costs 1.
 
+"Today" in the tables means the engine as it was before the replay-free rollback
+(commit 1804f7e on this branch), which restored a snapshot and replayed the accepted
+prefix through a second forward after every partial acceptance. The engine on this
+branch no longer does that, so the "replay-free" column is the one that describes it; the
+"today" column is kept to show what the rollback changed. The coefficients are estimates
+of a plain decode token's cost shares (trunk bytes, expert bytes, compute) at each memory
+tier, not measurements.
+
 ## 8 GB (trunk streamed)
 
 | corpus | policy | fires | accepted / drafted | tokens / step | replay-free | today |
@@ -156,7 +164,7 @@ plain step costs 1.
 - **The workload.** The edit corpus assumes whole-file rewrites, which is the best case.
   Diffs or search-and-replace output copy less. Real chat quotes user code and earlier
   answers, which the synthetic chat corpus cannot do.
-- **Costs.** These are the council coefficients with eps = 0. Any per-step cost of the
+- **Costs.** These are the estimated cost-share coefficients above, with eps = 0. Any per-step cost of the
   replay-free rollback (snapshots per verified position) enters as eps. The JSON gives
   the headline at eps = 0.02 and says how to recompute for others.
 - **Calibration and intervals.** P3's table and P2's defaults come from held-out

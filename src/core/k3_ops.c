@@ -27,15 +27,16 @@
  * Matmul accumulators are double; the KDA recurrence retains float sums. Hidden size is 7168 and expert rows are 2048
  * wide; a float32 accumulator loses precision the reference comparisons can see.
  *
- * Bit-identity covers every result that is not a NaN. When two NaNs meet in one
- * operation, which payload and sign survive is left open by C and IEEE 754 and is
- * decided by the compiler's instruction selection (vfmadd132/213/231, the operand order
- * of a commutative add): measured, the same fma(w, x, acc) tail keeps the weight's NaN
- * in the scalar build and the activation's in the AVX2 build, and the batched tile can
- * differ from the single-position kernel the same way. So a NaN is reproduced as a NaN,
- * not as a particular NaN. A NaN logit means the weights or the state are already
- * corrupt, and greedy selection (v[i] > v[best]) reads no payload bits. test_ops draws
- * finite weights for that reason.
+ * NaN outputs are canonical. When two NaNs meet in one operation, which payload and
+ * sign survive is left open by C and IEEE 754 and decided by the compiler's instruction
+ * selection (vfmadd132/213/231, the operand order of a commutative add): measured, the
+ * same fma(w, x, acc) tail keeps the weight's NaN in the scalar build and the
+ * activation's in the AVX2 build. So k3_matmul, k3_matmul_bf16 and both batched tiles
+ * store every NaN result through k3_out_f32 as the one quiet NaN 0x7FC00000, which makes
+ * a NaN output the same bits on every path, and test_ops injects NaNs of random sign and
+ * payload into the batched gate to hold it. k3_matmul_mxfp4 is outside that rule (it
+ * never runs on a row range that another path also computes). A NaN logit still means
+ * the weights or the state are already corrupt; greedy selection reads no payload bits.
  */
 #include "k3.h"
 

@@ -173,12 +173,15 @@ differs only in its output format (load 0.72 to 0.94), with the same hash in all
 
 ```sh
 D=/path/to/kern-timing; rm -rf $D; mkdir -p $D/base && git archive 49f5ccb | tar -x -C $D/base
+# The harness as it was when these runs were taken: later bench_kernels.c also calls
+# k3_matmul_bf16_batch, which the base object does not define.
+git show 3612040:benchmarks/bench_kernels.c > $D/bench_kernels.c
 for v in "native:-march=native" "avx2:-mavx2 -mfma"; do n=${v%%:*}; a=${v#*:}
   make -C $D/base -j2 ARCH="$a" BUILD=build/$n BIN=bin/$n build/$n/src/core/k3_ops.o
   make -j2 ARCH="$a" BUILD=build/t-$n BIN=bin/t-$n build/t-$n/src/core/k3_ops.o
   for k in old:$D/base/build/$n new:build/t-$n; do
     cc -O3 -std=gnu99 $a -fopenmp -pthread -ffp-contract=off -Iinclude -Iinclude/k3 \
-       -Ithird_party -Isrc/core benchmarks/bench_kernels.c ${k#*:}/src/core/k3_ops.o \
+       -Ithird_party -Isrc/core $D/bench_kernels.c ${k#*:}/src/core/k3_ops.o \
        -o $D/bench_${k%%:*}_$n -lm
   done
 done
