@@ -560,6 +560,13 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   the per-position f32 -> f64 conversion of x, and the wider form does not remove it.
  *   Widening X to double once per call instead turns the loop into an L2 stream of
  *   doubles, and that measured slower still, including with the tile packed for L1.
+ *   So an AVX-512 build runs the 256-bit tiles below beside the single-position
+ *   kernels' 512-bit rows. That is not a second arithmetic: the tiles and every
+ *   k3_matmul / k3_matmul_bf16 path hold the same sixteen accumulators, each fed its
+ *   own elements in ascending order and reduced by the one tree (k3_tree16); the lane
+ *   layouts differ only in which register lane holds which accumulator.
+ *   test_matmul_exact holds the single-position kernels to that partition and tree,
+ *   and test_ops holds these tiles to the single-position kernels, on every ISA.
  *
  * POSITIONS PER REGISTER BLOCK (K3_MM_TB)
  *   Each position in a block holds four __m256d accumulators on AVX2, so the block size
@@ -638,8 +645,9 @@ K3_ALWAYS_INLINE void k3_mm_f32_tile(float *y, int ldy, const float *X, int ldx,
     for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = k3_out_f32(acc[t]);
 }
 
-/* One output row for nb positions, bf16 weights, k3_matmul_bf16's arithmetic in each of
- * its three builds. */
+/* One output row for nb positions, bf16 weights, k3_matmul_bf16's arithmetic: its
+ * partition, fma order, tree and tail, in a lane layout of the tile's own (AVX2 and
+ * scalar forms below; NEON the same layout as k3_matmul_bf16's NEON rows). */
 K3_ALWAYS_INLINE void k3_mm_bf16_tile(float *y, int ldy, const float *X, int ldx,
                                       const uint16_t *row, int in, const int nb)
 {
@@ -651,8 +659,11 @@ K3_ALWAYS_INLINE void k3_mm_bf16_tile(float *y, int ldy, const float *X, int ldx
         for (int t = 0; t < nb; t++)
             for (int j = 0; j < 4; j++) v[t][j] = _mm256_setzero_pd();
         for (; i + 15 < in; i += 16) {
-            /* Sixteen weights, widened once, by exactly k3_matmul_bf16's instructions:
-             * wv[j] holds elements i+4j .. i+4j+3, i.e. accumulators 4j .. 4j+3. */
+            /* Sixteen weights, widened once: bf16 -> f32 is the 16-bit shift and
+             * f32 -> f64 exact, so each is the value k3_matmul_bf16 multiplies (its x86
+             * rows split even and odd elements with a shift and a mask instead, which
+             * yields the same floats). wv[j] holds elements i+4j .. i+4j+3, i.e.
+             * accumulators 4j .. 4j+3, in natural order. */
             __m256d wv[4];
             for (int j = 0; j < 4; j++) {
                 const __m128i h = _mm_loadl_epi64((const __m128i *)(row + i + 4 * j));
@@ -666,7 +677,8 @@ K3_ALWAYS_INLINE void k3_mm_bf16_tile(float *y, int ldy, const float *X, int ldx
                                               v[t][j]);
             }
         }
-        /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing, per position */
+        /* (v0+v1)+(v2+v3) lanewise is b0..b3 of k3_tree16, then (b0+b1)+(b2+b3): the one
+         * tree, per position */
         for (int t = 0; t < nb; t++) {
             const __m256d vt = _mm256_add_pd(_mm256_add_pd(v[t][0], v[t][1]),
                                              _mm256_add_pd(v[t][2], v[t][3]));
