@@ -14,7 +14,7 @@
 # PLATFORMS. Linux/x86-64 is the reference. macOS/arm64 builds with plain `make` too,
 # but needs Homebrew's libomp for OpenMP (`brew install libomp`) because Apple Clang
 # ships no OpenMP runtime; the platform block below detects and wires it up. Windows
-# builds under MSYS2's MinGW64 environment (`pacman -S mingw-w64-x86_64-gcc`) -- open
+# builds under MSYS2's MinGW64 environment (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp`) -- open
 # the "MSYS2 MinGW x64" shell specifically, not the plain MSYS2 shell, so `cc`/`make`
 # resolve to the native-Windows-target toolchain rather than the POSIX-emulation one;
 # then plain `make` works, no flags to remember. See src/io/k3_portable_io.h for what
