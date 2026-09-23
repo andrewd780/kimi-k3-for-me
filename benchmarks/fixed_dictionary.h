@@ -221,7 +221,10 @@ static inline int fwd3_decode_scalar(const FwdView *v, uint8_t *out, size_t capa
  * bits), pack. Escapes, frequent at 3 bits: an exclusive prefix count of the
  * escape lanes indexes a shuffle of the next 16 escape bytes, blended in with
  * no branch. The escape stream's slack makes the 16-byte load safe; a surplus
- * of escape codes is detected after every step. */
+ * of escape codes is detected after every step. That check also bounds the
+ * scalar tail, which stops only at e == escapes: a step may end up to 32 past
+ * the count, and without the check the tail would read on from there, past the
+ * slack, whenever codes outnumber the count by more than FWD3_SLACK. */
 static inline const char *fwd3_native_name(void)
 {
 #if defined(__AVX2__)
@@ -438,7 +441,9 @@ static inline int fwd_rows_parse(FwdRows *x, const uint8_t *data, size_t length,
     const size_t rows = fwd_u32(data + 4), cols = fwd_u32(data + 8), group = fwd_u32(data + 12);
     if (!cols || !group || rows > whole->values / cols || rows * cols != whole->values ||
         (cols * whole->bits) % 8) return -1;
-    const size_t entries = (rows + group - 1) / group;
+    /* Not (rows + group - 1) / group: with a 32-bit size_t and group near 2^32 that
+     * sum wraps, a zero-entry index would parse and its checkpoint be read past it. */
+    const size_t entries = rows / group + (rows % group != 0);
     if (length != 16 + 4 * entries) return -1;
     size_t previous = 0;
     for (size_t j = 0; j < entries; j++) {

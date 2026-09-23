@@ -11,6 +11,17 @@ static void put32(uint8_t *p, size_t n)
     for (size_t j = 0; j < 4; j++) p[j] = (uint8_t)(n >> (8*j));
 }
 
+/* Streams and row indexes are built in oversized scratch buffers. Round trips,
+ * refusals, truncations and row ranges parse and decode exact-size heap copies,
+ * so ASan reports any read past the end. */
+static uint8_t *heap_copy(const uint8_t *p, size_t length)
+{
+    uint8_t *copy = (uint8_t *)malloc(length ? length : 1);
+    CHECK(copy);
+    memcpy(copy, p, length);
+    return copy;
+}
+
 static size_t encode(uint8_t *p, const uint8_t *raw, size_t n)
 {
     memset(p, 0, 32 + 2*n);
@@ -28,15 +39,15 @@ static size_t encode(uint8_t *p, const uint8_t *raw, size_t n)
     return 32 + indexes + low + escapes;
 }
 
-static int exact(const uint8_t *packed, size_t length, const uint8_t *raw, size_t n)
+static int exact(const uint8_t *scratch, size_t length, const uint8_t *raw, size_t n)
 {
     FwdView v;
-    uint8_t *out = (uint8_t *)malloc(n + 1);
+    uint8_t *out = (uint8_t *)malloc(n + 1), *packed = heap_copy(scratch, length);
     CHECK(out);
     int ok = !fwd_parse(&v, packed, length) && v.raw_bytes == n;
     if (ok) ok = !fwd_decode_scalar(&v, out, n) && !memcmp(out, raw, n);
     if (ok) ok = !fwd_decode_native(&v, out, n) && !memcmp(out, raw, n);
-    free(out);
+    free(out); free(packed);
     return ok;
 }
 
@@ -67,10 +78,10 @@ static size_t encode3(uint8_t *p, const uint8_t *raw, size_t n)
     return 32 + indexes + low + escapes + FWD3_SLACK;
 }
 
-static int exact3(const uint8_t *packed, size_t length, const uint8_t *raw, size_t n)
+static int exact3(const uint8_t *scratch, size_t length, const uint8_t *raw, size_t n)
 {
     FwdView v;
-    uint8_t *out = (uint8_t *)malloc(n + 1);
+    uint8_t *out = (uint8_t *)malloc(n + 1), *packed = heap_copy(scratch, length);
     CHECK(out);
     int ok = !fwd3_parse(&v, packed, length) && v.raw_bytes == n;
     if (ok) ok = !fwd3_decode_scalar(&v, out, n) && !memcmp(out, raw, n);
@@ -78,8 +89,21 @@ static int exact3(const uint8_t *packed, size_t length, const uint8_t *raw, size
     if (ok) ok = !fwd_decode_any_native(&v, out, n) && !memcmp(out, raw, n);
     /* The widths never mix: an FD3B view is not an FD4B stream. */
     if (ok) ok = fwd_decode_native(&v, out, n) && fwd_decode_scalar(&v, out, n);
-    free(out);
+    free(out); free(packed);
     return ok;
+}
+
+/* A stream that parses but whose escape codes disagree with its escape count: both
+ * decoders (and the dispatcher) must refuse it, reading only inside the copy. */
+static void refused(const uint8_t *scratch, size_t length, size_t n)
+{
+    FwdView v;
+    uint8_t *packed = heap_copy(scratch, length), *out = (uint8_t *)malloc(n + 1);
+    CHECK(out);
+    CHECK(!fwd_parse_any(&v, packed, length) && v.raw_bytes == n);
+    CHECK(fwd_decode_any_scalar(&v, out, n));
+    CHECK(fwd_decode_any_native(&v, out, n));
+    free(packed); free(out);
 }
 
 static uint32_t rng = 2463534242u;
@@ -129,15 +153,18 @@ static int rows_exact(const FwdView *whole, const uint8_t *index, size_t length,
 {
     FwdRows x;
     FwdView v;
-    if (fwd_rows_parse(&x, index, length, whole) || fwd_rows_view(&x, whole, first, last, &v))
+    uint8_t *copy = heap_copy(index, length);
+    if (fwd_rows_parse(&x, copy, length, whole) || fwd_rows_view(&x, whole, first, last, &v)) {
+        free(copy);
         return 0;
+    }
     const size_t n = 2 * (last - first) * x.cols;
     uint8_t *out = (uint8_t *)malloc(n + 1);
     CHECK(out);
     const uint8_t *want = raw + 2 * first * x.cols;
     int ok = v.raw_bytes == n && !fwd_decode_any_scalar(&v, out, n) && !memcmp(out, want, n);
     if (ok) ok = !fwd_decode_any_native(&v, out, n) && !memcmp(out, want, n);
-    free(out);
+    free(out); free(copy);
     return ok;
 }
 
@@ -150,8 +177,9 @@ static void row_ranges(unsigned bits, size_t rows, size_t cols, unsigned escape_
     skewed(raw, n, escape_per_mille);
     if (bits == 4) for (size_t j = 1; j < n; j += 2) if (raw[j] < 200) raw[j] = (uint8_t)(17*(raw[j] % 15) + 3);
     const size_t length = bits == 3 ? encode3(packed, raw, n) : encode(packed, raw, n);
+    uint8_t *stream = heap_copy(packed, length);
     FwdView whole;
-    CHECK(!fwd_parse_any(&whole, packed, length) && whole.bits == bits);
+    CHECK(!fwd_parse_any(&whole, stream, length) && whole.bits == bits);
     const size_t groups[] = {1, 2, 3, 7, rows, rows + 5};
     for (size_t g = 0; g < sizeof groups / sizeof *groups; g++) {
         const size_t ilen = build_rows(index, raw, bits, rows, cols, groups[g]);
@@ -191,7 +219,51 @@ static void row_ranges(unsigned bits, size_t rows, size_t cols, unsigned escape_
     CHECK(!fwd_rows_parse(&x, index, ilen, &whole));
     CHECK(fwd_rows_view(&x, &whole, 2, 1, &v));
     CHECK(fwd_rows_view(&x, &whole, 0, rows + 1, &v));
-    free(raw); free(packed); free(index);
+    /* However large the group, a nonempty matrix has one checkpoint per group. With a
+     * 32-bit size_t, (rows + G - 1) / G wrapped at G = 2^32 - 1 and accepted an index
+     * with none, whose checkpoint was then read from past its end. */
+    put32(index + 12, 0xffffffffu);
+    CHECK(fwd_rows_parse(&x, index, 16, &whole));
+    CHECK(!fwd_rows_parse(&x, index, 20, &whole) && x.entries == 1);
+    CHECK(rows_exact(&whole, index, 20, raw, 0, rows));
+    CHECK(rows_exact(&whole, index, 20, raw, rows / 2, rows));
+    free(raw); free(packed); free(index); free(stream);
+}
+
+/* Escape codes outnumbering the header's count, by one up to far more than
+ * FWD3_SLACK. An FD3B vector step loads escapes only below count + slack but may
+ * consume up to 32 of them, so it can end past the count; the decoder must refuse
+ * there rather than let the scalar tail read on past the stream. Every value an
+ * escape, or escapes only in the last 300 values, at lengths that end the vector
+ * loops at different points; both widths, exact-size heap streams. */
+static void escape_undercount(void)
+{
+    static uint8_t raw[2 * 2100], scratch[32 + 4 * 2100];
+    const size_t counts[] = {64, 2048, 2048 + 5, 2100};
+    const size_t deficits[] = {1, FWD3_SLACK - 1, FWD3_SLACK, FWD3_SLACK + 1, 40, 64, 200};
+    for (unsigned bits = 3; bits <= 4; bits++)
+        for (size_t c = 0; c < sizeof counts / sizeof *counts; c++)
+            for (int late = 0; late <= 1; late++) {
+                const size_t values = counts[c], n = 2 * values;
+                const size_t slack = bits == 3 ? FWD3_SLACK : 0;
+                for (size_t j = 0; j < values; j++) {
+                    raw[2*j] = (uint8_t)(j * 29);
+                    raw[2*j+1] = !late || j + 300 >= values ? (uint8_t)(250 + j % 5) : TABLE3[j % 7];
+                }
+                const size_t length = bits == 3 ? encode3(scratch, raw, n) : encode(scratch, raw, n);
+                const size_t escapes = fwd_u32(scratch + 8);
+                CHECK(escapes == (late && values > 300 ? 300 : values));
+                for (size_t k = 0; k < sizeof deficits / sizeof *deficits; k++) {
+                    const size_t d = deficits[k];
+                    if (d > escapes) continue;
+                    /* Count lowered by d, the last d escape bytes dropped, slack kept. */
+                    uint8_t stream[sizeof scratch];
+                    memcpy(stream, scratch, length - slack - d);
+                    memset(stream + length - slack - d, 0, slack);
+                    put32(stream + 8, escapes - d);
+                    refused(stream, length - d, n);
+                }
+            }
 }
 
 static void fd3_suite(void)
@@ -239,7 +311,9 @@ static void fd3_suite(void)
     length = encode3(packed, raw, sizeof raw);
     for (size_t n = 0; n < length; n++) {
         FwdView v;
-        CHECK(fwd3_parse(&v, packed, n));
+        uint8_t *cut = heap_copy(packed, n);
+        CHECK(fwd3_parse(&v, cut, n));
+        free(cut);
     }
     memcpy(copy, packed, length); copy[length] = 0;
     CHECK(!exact3(copy, length + 1, raw, sizeof raw));
@@ -264,25 +338,22 @@ static void fd3_suite(void)
     /* Escape underflow and surplus fail inside both decoders. */
     skewed(raw, sizeof raw, 33);
     length = encode3(packed, raw, sizeof raw);
-    FwdView v;
     for (size_t j = 0; j < 4096; j++) {
         if (fwd3_code(packed + 32, j) == 7) continue;
         memcpy(copy, packed, length);
         for (unsigned b = 0; b < 3; b++) copy[32 + (3*j + b) / 8] |= (uint8_t)(1u << ((3*j + b) % 8));
-        CHECK(!fwd3_parse(&v, copy, length));
-        CHECK(fwd3_decode_scalar(&v, raw, sizeof raw));
-        CHECK(fwd3_decode_native(&v, raw, sizeof raw));
+        refused(copy, length, sizeof raw);
         break;
     }
     memcpy(copy, packed, length); put32(copy + 8, fwd_u32(packed + 8) + 1);
     memmove(copy + length - FWD3_SLACK + 1, copy + length - FWD3_SLACK, FWD3_SLACK);
     copy[length - FWD3_SLACK] = 255;
-    CHECK(!fwd3_parse(&v, copy, length + 1));
-    CHECK(fwd3_decode_scalar(&v, raw, sizeof raw));
-    CHECK(fwd3_decode_native(&v, raw, sizeof raw));
+    refused(copy, length + 1, sizeof raw);
+    escape_undercount();
     /* Corrupt but well-formed payload fails the independent byte comparison. */
     skewed(raw, sizeof raw, 33);
     length = encode3(packed, raw, sizeof raw);
+    FwdView v;
     CHECK(!fwd3_parse(&v, packed, length));
     memcpy(copy, packed, length); copy[v.low - packed + 100] ^= 1;
     CHECK(!exact3(copy, length, raw, sizeof raw));
@@ -326,7 +397,9 @@ int main(int argc, char **argv)
     CHECK(exact(packed, length, raw, sizeof raw));
     for (size_t n = 0; n < length; n++) {
         FwdView v;
-        CHECK(fwd_parse(&v, packed, n));
+        uint8_t *cut = heap_copy(packed, n);
+        CHECK(fwd_parse(&v, cut, n));
+        free(cut);
     }
     memcpy(copy, packed, length); copy[length] = 0;
     CHECK(!exact(copy, length+1, raw, sizeof raw));
@@ -349,13 +422,9 @@ int main(int argc, char **argv)
     CHECK(!exact(copy, length, raw, sizeof raw));
     /* Escape underflow and surplus are decoder failures, not just bad lengths. */
     memcpy(copy, packed, length); copy[32] |= 15;
-    CHECK(!fwd_parse(&v, copy, length));
-    CHECK(fwd_decode_scalar(&v, raw, sizeof raw));
-    CHECK(fwd_decode_native(&v, raw, sizeof raw));
+    refused(copy, length, sizeof raw);
     memcpy(copy, packed, length); put32(copy+8, 1); copy[length] = 255;
-    CHECK(!fwd_parse(&v, copy, length+1));
-    CHECK(fwd_decode_scalar(&v, raw, sizeof raw));
-    CHECK(fwd_decode_native(&v, raw, sizeof raw));
+    refused(copy, length + 1, sizeof raw);
     /* Single BF16 value: unused high nibble cannot hide garbage. */
     raw[0] = 128; raw[1] = 3;
     length = encode(packed, raw, 2);
