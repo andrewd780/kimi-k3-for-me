@@ -203,6 +203,69 @@ class OfflineCliTests(unittest.TestCase):
         result = self.run_cli("absent", ["--ids", "1", "--trunk-rows"], ok=False)
         self.assertIn("--trunk-rows needs --trunk", result.stderr)
 
+    def test_malformed_trunk_json_is_refused_with_its_reason(self):
+        # Each trunk.json check names the field it rejected, in both reader modes; a
+        # refusal with an empty stderr would leave a user nothing to fix.
+        manifest = json.loads((self.trunk / "trunk.json").read_text())
+
+        def edited(change):
+            doc = json.loads(json.dumps(manifest))
+            change(doc)
+            return doc
+
+        def f32(doc):
+            return next(t for t in doc["layers"][0]["tensors"].values() if t["dtype"] == "F32")
+
+        def first(doc, layer):
+            return next(iter(doc["layers"][layer]["tensors"].values()))
+
+        cases = (
+            (edited(lambda d: d.update(layers=[])), "lists no layers"),
+            (edited(lambda d: d["layers"][2].update(file_off=-4096)),
+             "layer 2: file_off and nbytes must be non-negative integers"),
+            (edited(lambda d: d["layers"][3].update(nbytes=0)), "is empty or overflows"),
+            (edited(lambda d: first(d, 1).update(off=1.5)),
+             "off and nbytes must be non-negative integers"),
+            (edited(lambda d: first(d, 1).update(nbytes=d["layers"][1]["nbytes"] + 2)),
+             "do not fit the layer's"),
+            (edited(lambda d: f32(d).update(off=f32(d)["off"] + 2)),
+             "is not a multiple of its 4-byte element"))
+        trunk = self.path / "trunk"
+        trunk.mkdir()
+        (trunk / "trunk.bin").symlink_to(self.trunk / "trunk.bin")
+        for rows in ([], ["--trunk-rows"]):
+            for doc, message in cases:
+                with self.subTest(rows=rows, message=message):
+                    (trunk / "trunk.json").write_text(json.dumps(doc))
+                    result = self.run_cli(self.packed, ["--ids", "1,2,3", "--trunk", trunk,
+                                                        "--trunk-gb", "0.001", *rows],
+                                          ok=False)
+                    self.assertIn("k3_trunk: ", result.stderr)
+                    self.assertIn(message, result.stderr)
+
+    def test_trunk_with_more_layers_than_the_config_runs(self):
+        # A config that uses 12 of the packed trunk's 13 layers. Only bound layers are
+        # read, so this ran before the row pipeline existed and must still run in both
+        # modes; the CLI refuses only a trunk with FEWER layers than it needs.
+        config = json.loads((self.packed / "config.json").read_text())
+        config["num_hidden_layers"] = 12
+        config["full_attn_layers"] = [i for i in config["full_attn_layers"] if i <= 12]
+        path = self.path / "config12.json"
+        path.write_text(json.dumps(config))
+        for rows in ([], ["--trunk-rows"]):
+            with self.subTest(rows=rows):
+                out = self.path / ("more%d.json" % len(rows))
+                result = subprocess.run(
+                    [str(self.binary), str(self.packed), "--config", str(path), "--ids",
+                     "1,2,3", "--gen", "1", "--cache-gb", "0.0001", "--trunk",
+                     str(self.trunk), "--trunk-gb", "0.001", *rows, "--out", str(out)],
+                    text=True, errors="replace", capture_output=True, env=self.env,
+                    timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads(out.read_text(errors="replace"))
+                self.assertEqual(report["layers_completed"], 12)
+                self.assertEqual(len(report["generated_ids"]), 1)
+
     def test_trunk_rows_under_cgroup_cap(self):
         if os.environ.get("K3_CGROUP_TEST") != "1":
             self.skipTest("requires the Linux CI cgroup gate")
