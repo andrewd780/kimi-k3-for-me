@@ -302,6 +302,122 @@ class OfflineCliTests(unittest.TestCase):
                                                   "--gen", "1"])
             self.assertEqual(report["generated_ids"], [predictions[0][i]], "position %d" % i)
 
+    def wide_head_model(self, vocab):
+        """The plain fixture with both vocabulary tables widened to `vocab` rows. The new
+        rows are random rather than repeated, so logits written at another chunk's offset
+        would differ from the ones that belong there."""
+        import numpy as np
+        config = json.loads((self.plain / "config.json").read_text())
+        hidden, old_vocab = config["hidden_size"], config["vocab_size"]
+        config["vocab_size"] = vocab
+        model = self.path / ("wide-%d" % vocab)
+        model.mkdir()
+        source = (self.plain / "model.safetensors").read_bytes()
+        header_size = struct.unpack("<Q", source[:8])[0]
+        header = json.loads(source[8:8 + header_size])
+        payload = memoryview(source)[8 + header_size:]
+        rng = np.random.default_rng(vocab)
+        new_header, blobs, offset = {}, [], 0
+        for name, entry in header.items():
+            if name == "__metadata__":
+                continue
+            first, last = entry["data_offsets"]
+            raw = bytes(payload[first:last])
+            entry = dict(entry)
+            if name in ("language_model.model.embed_tokens.weight",
+                        "language_model.lm_head.weight"):
+                self.assertEqual(entry["dtype"], "BF16")
+                rows = (rng.standard_normal((vocab - old_vocab, hidden)) * 0.05)
+                raw += (rows.astype(np.float32).view(np.uint32) >> 16).astype("<u2").tobytes()
+                entry["shape"] = [vocab, hidden]
+            entry["data_offsets"] = [offset, offset + len(raw)]
+            new_header[name] = entry
+            blobs.append(raw)
+            offset += len(raw)
+        encoded = json.dumps(new_header, separators=(",", ":")).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        with open(model / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(encoded)))
+            f.write(encoded)
+            for blob in blobs:
+                f.write(blob)
+        (model / "config.json").write_text(json.dumps(config))
+        return model, hidden
+
+    def test_streamed_head_blocks_across_chunks(self):
+        # The other head tests use a 256-row head, which the stream reads in one chunk.
+        # Here the head spans three 4 MiB chunks, so every block of positions is written
+        # through k3_model_stream_project_batch's per-chunk offsets and row stride. Verify
+        # sweeps and a blocked --score-prompt must give the resident head's logits bit
+        # for bit, and a sweep must still read the head exactly once.
+        rows_per_chunk = (4 << 20) // (128 * 2)
+        vocab = 2 * rows_per_chunk + 77
+        model, hidden = self.wide_head_model(vocab)
+        self.assertEqual(hidden, 128)
+        rnd = random.Random(3)
+
+        def run(args):
+            self.counter += 1
+            out = self.path / ("wide%d.json" % self.counter)
+            dump = self.path / ("wide%d.f32" % self.counter)
+            process = subprocess.run([str(self.binary), str(model), "--cache-gb", "0.0001",
+                                      "--out", str(out), "--dump-all-logits", str(dump),
+                                      *map(str, args)], capture_output=True, text=True,
+                                     errors="replace", env=self.env, timeout=120)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            report = json.loads(out.read_text(errors="replace"))
+            self.assertEqual(report["expert_drops"], 0)
+            raw = dump.read_bytes()
+            self.assertEqual(len(raw), vocab * 4 * len(report["generated_ids"]))
+            return report, raw
+
+        # A prompt the n-gram drafter can work with, built as crafted() does: it opens
+        # with its own last two ids and the model's continuation of it, so after the
+        # first emitted id the drafter proposes the rest. Iterated to a fixed point.
+        common = ["--incremental", "--gen", "10", "--trunk", self.trunk, "--trunk-gb", "0.01"]
+        p = [rnd.randrange(256) for _ in range(10)]
+        r = [rnd.randrange(256) for _ in range(5)]
+        y = run(["--ids", ",".join(map(str, p)), *common])[0]["generated_ids"]
+        for _ in range(6):
+            prompt = p[-2:] + y[:6] + r + p
+            serial = run(["--ids", ",".join(map(str, prompt)), *common])
+            if serial[0]["generated_ids"][:2] == y[:2]:
+                break
+            y = serial[0]["generated_ids"]
+        common = ["--ids", ",".join(map(str, prompt)), *common]
+        streamed = [*common, "--stream-lm-head"]
+        for args in ([*common, "--spec", "4"], [*streamed, "--spec", "4"], streamed):
+            with self.subTest(args=args[-3:]):
+                got = run(args)
+                self.assertEqual(got[0]["generated_ids"], serial[0]["generated_ids"])
+                self.assertEqual(got[1], serial[1], "every logit must be bit-identical")
+                if "--stream-lm-head" in args:
+                    self.assertEqual(got[0]["lm_head_bytes_read"],
+                                     got[0]["forward_sweeps"] * vocab * hidden * 2)
+                if "--spec" in args:
+                    self.assertGreater(got[0]["spec_sweeps"], 0)
+
+        ids20 = [rnd.randrange(256) for _ in range(20)]
+
+        def score(first, n, head):
+            self.counter += 1
+            out = self.path / ("wscore%d.json" % self.counter)
+            process = subprocess.run([str(self.binary), str(model), "--score-prompt",
+                                      "--ids", ",".join(map(str, ids20[:n])),
+                                      "--score-start", str(first), "--cache-gb", "0.0001",
+                                      "--trunk", str(self.trunk), "--trunk-gb", "0.01",
+                                      "--out", str(out), *head],
+                                     capture_output=True, text=True, env=self.env, timeout=120)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            return json.loads(out.read_text())["token_nll"]
+
+        for head in ([], ["--stream-lm-head"]):
+            with self.subTest(head=head):
+                full = score(1, len(ids20), head)
+                self.assertEqual(len(full), len(ids20) - 1)
+                for i in (0, 15, 16, 18):
+                    self.assertEqual(score(i + 1, i + 2, head), [full[i]], "position %d" % i)
+
     def test_lm_head_ring_under_cgroup_cap(self):
         if os.environ.get("K3_CGROUP_TEST") != "1":
             self.skipTest("set K3_CGROUP_TEST=1 on a Linux CI runner with sudo/systemd")
