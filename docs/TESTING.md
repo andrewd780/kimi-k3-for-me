@@ -17,17 +17,24 @@ both the original C and opt-in SIMD, compares full oracle-logit traces within ea
 ISA, runs sanitizer coverage, and records three synthetic timing runs per arm.
 
 **`test_mla_variants`** holds the MLA cache variants of `benchmarks/mla_variants.h` to
-the engine's own `k3_mla_cached` by `memcmp`: outputs, accumulators, appended cache
-rows, raw scores and every softmax normaliser, at three value-row budgets and on one
-thread and every thread, with each variant's kv_b application count checked against its
-closed form (including the prefill shape C=0, T=256, where L0 makes 65,792 and L1 256).
-Ordinary random layers cannot see a reordered score chain, a double sum rounded to
-float, and the test prints an order witness showing 0.0% sensitivity there, so it also
-runs *cancelling* layers (exactly negated huge terms built into the weights, where
-94-100% of reordered chains round differently) and *sharp* layers (where the double
-softmax normaliser stops being exact in any order). Mutants that reorder a chain in E+,
-L1, A or E itself pass every ordinary case and fail the cancelling ones; see [the
-variants note](notes/mla-variants.md).
+the engine's own `k3_mla_cached` by `memcmp`: outputs, pre-gate accumulators, appended
+cache rows, raw scores, every double softmax normaliser and every double probability
+quotient e/z. The engine's intermediates come from its trace hook (`k3_mla_trace` in
+`k3.h`, NULL outside tests), because its output rounds the normaliser and quotient away:
+the engine's two layouts are compared on them too. L1 runs at three value-row budgets,
+and E+, L1 and A rerun on every thread on the cases of up to 48 positions. Each
+variant's kv_b application count is checked against its closed form (including the
+prefill shape C=0, T=256, where L0 makes 65,792 and L1 256). Ordinary random layers
+cannot see a reordered score chain, a double sum rounded to float, and the test prints
+an order witness showing 0.0% sensitivity there, so it also runs *cancelling* layers
+(exactly negated huge terms built into the weights, where 94-100% of reordered chains
+round differently) and *sharp* layers (where the double softmax normaliser stops being
+exact in any order). In the mutation run, six score-chain mutants (in E+, L1, A, E
+itself and the engine's latent layout) pass every ordinary case and are caught only on
+the cancelling layers; a reversed normaliser, in the variants or in either engine
+layout, is caught only on the sharp layers; the rest (a value sum reordered, a lane
+swap, A's rope terms moved first, the quotient formed as e*(1/z)) fail on every kind of
+layer. See [the variants note](notes/mla-variants.md) for the table.
 
 **`test_quality`** checks stable NLL arithmetic on synthetic logits. Python quality
 tests cover overlapping target windows and token-weighted aggregation. A tiny CLI

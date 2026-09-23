@@ -5,16 +5,21 @@
  *      runs T new tokens through the ENGINE's k3_mla_cached in both layouts and through
  *      every variant, from the same hidden states. The engine's two outputs, E, E+, L0
  *      and L1 must be the same floats (memcmp, not a tolerance), and so must the cache
- *      rows the engine and the variants append.
+ *      rows the engine and the variants append and the pre-gate accumulators.
  *   2. L1 is bitwise identical to E and L0 at every value-row budget: all rows held,
  *      half held (the rest rebuilt a second time), none held. So is E+.
- *   3. The raw scores before the softmax agree bitwise across E, E+, L0 and L1 too, so
- *      the output match is not two errors cancelling.
+ *   3. The raw scores before the softmax, every softmax normaliser z and every
+ *      probability quotient e/z agree bitwise too: between the engine's two layouts,
+ *      between E and the expanded engine, between L0 and the latent engine, and between
+ *      E, E+, L0 and L1. The engine's are read through its trace hook (k3_mla_trace in
+ *      k3.h), the variants' through mla_probe_row, mla_zprobe and mla_qprobe. So the
+ *      output match is not two errors cancelling, and the doubles the output rounds
+ *      away (see 9) are held to the engine's own, not only to a copy of it.
  *   4. Causal masking across the new positions: with T >= 2, changing the LAST new
  *      token's hidden state must leave the outputs of the earlier new tokens unchanged
  *      bit for bit, in L1 and in A, and must change the last one.
  *   5. Thread-count independence: L1, E+ and A rerun on every available thread give the
- *      bits they gave on one.
+ *      bits they gave on one, on the cases of up to 48 positions (see test_case).
  *   6. A is the plain formula: it matches a scalar, loop-by-loop rendering of the
  *      absorbed attention bitwise, so bench_mla's numerical study measures absorption
  *      itself, not an artefact of the vectorised loop. It is NOT equal to E, and the
@@ -33,14 +38,17 @@
  * residual width cut to 512 to keep the test fast; the hidden width only enters through
  * the shared projections. bench_mla's `numerics` mode runs the full 7168 width.
 
- *   9. The softmax normaliser z of every row agrees bitwise too (mla_zprobe). z is a
- *      double sum of positive terms that reaches the output only as p = (float)(e / z);
- *      no input short of ~2^29 positions moves it by a float ulp, so a reordered z would
- *      pass every other check here. Compared as a double, a reorder can show -- but only
+ *   9. Why 3. records z and e/z as doubles. z is a double sum of positive terms that
+ *      reaches the output only as p = (float)(e / z); no input short of ~2^29 positions
+ *      moves p by a float ulp, so a reordered z would pass every other check here, in
+ *      a variant or in the engine. Compared as a double, a reorder can show -- but only
  *      on SHARP rows: while every e = expf(s - max) is above ~2^-29, the terms are floats
  *      whose sum is exact in double in any order. The sharp layers (query norm scaled
  *      by 16, an exact power of two) give score ranges of tens of nats, as the real
- *      model's sharper heads do, and there the order of z is visible.
+ *      model's sharper heads do, and there the order of z is visible. The quotient is
+ *      the same story without the special layer: formed as e * (1 / z) it rounds twice
+ *      and differs from e / z in about a fifth of all quotients, yet p almost never
+ *      moves. The order witness prints both rates.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -61,6 +69,7 @@ typedef struct {
     double scores, rev, split, lanes;   /* score chains: count, and differing floats */
     double vals, vrev;                  /* value sums of 3+ terms, and differing     */
     double zrows, zrev;                 /* normalisers of 3+ terms, and differing    */
+    double quots, qrecip;               /* quotients e/z, and differing as e*(1/z)   */
 } Witness;
 enum { LAYER_ORDINARY, LAYER_CANCELLING, LAYER_SHARP, LAYER_KINDS };
 static Witness g_wit[LAYER_KINDS];
@@ -126,8 +135,8 @@ static int max_threads(void)
 /* ------------------------------------------------ scalar absorbed reference ---- */
 /* The absorbed attention written as plainly as possible: per query token, per head,
  * one loop per formula. mla_attend_A must reproduce this bit for bit. */
-static void attend_A_scalar(float *acc, double *zs, const float *q, int T, int C,
-                            const MlaCache *k, const K3MlaW *w, const K3Cfg *c)
+static void attend_A_scalar(float *acc, double *zs, double *qs, const float *q, int T,
+                            int C, const MlaCache *k, const K3MlaW *w, const K3Cfg *c)
 {
     const int H = c->n_heads, qn = c->qk_nope, qr = c->qk_rope, vh = c->v_head;
     const int qh = qn + qr, kvd = qn + vh, kvl = c->kv_lora, N = C + T;
@@ -165,7 +174,9 @@ static void attend_A_scalar(float *acc, double *zs, const float *q, int T, int C
             zs[(size_t)t * H + h] = z;
             for (int j = 0; j < kvl; j++) u[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const double pq = sc[s] / z;
+                qs[((size_t)t * H + h) * N + s] = pq;
+                const float pr = (float)pq;
                 const float *cs = k->kv + (size_t)s * kvl;
                 for (int j = 0; j < kvl; j++) u[j] += pr * cs[j];
             }
@@ -235,14 +246,29 @@ static void case_prefill(Case *K)
 typedef struct {
     float *acc, *out, *probe;   /* [T][H][vh], [T][E], [T][H][N] */
     double *z;                  /* [T][H] softmax normalisers */
+    double *quot;               /* [T][H][N] probability quotients e/z, before rounding */
     MlaCache cache;             /* after the call */
     unsigned long long kvb;     /* kv_b applications the call made */
 } Run;
 
 static void run_free(Run *r)
 {
-    free(r->acc); free(r->out); free(r->probe); free(r->z);
+    free(r->acc); free(r->out); free(r->probe); free(r->z); free(r->quot);
     cache_free(&r->cache);
+}
+
+/* The recorded intermediates of a run, zeroed so that a row nobody wrote compares equal
+ * only to another row nobody wrote. */
+static void run_alloc_trace(Run *r, int T, int H, int vh, int N)
+{
+    r->acc   = (float *)xmalloc((size_t)T * H * vh * sizeof(float));
+    r->probe = (float *)xmalloc((size_t)T * H * N * sizeof(float));
+    r->z     = (double *)xmalloc((size_t)T * H * sizeof(double));
+    r->quot  = (double *)xmalloc((size_t)T * H * N * sizeof(double));
+    memset(r->acc, 0, (size_t)T * H * vh * sizeof(float));
+    memset(r->probe, 0, (size_t)T * H * N * sizeof(float));
+    memset(r->z, 0, (size_t)T * H * sizeof(double));
+    memset(r->quot, 0, (size_t)T * H * N * sizeof(double));
 }
 
 /* One whole layer in variant v on a private copy of the prefilled cache. */
@@ -256,17 +282,14 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     float *ql   = (float *)xmalloc((size_t)c->q_lora * sizeof(float));
     float *gbuf = (float *)xmalloc((size_t)H * vh * sizeof(float));
     void  *scr  = xmalloc(mla_scratch_bytes(v, c, T, N, vcap));
-    r->acc   = (float *)xmalloc((size_t)T * H * vh * sizeof(float));
+    run_alloc_trace(r, T, H, vh, N);
     r->out   = (float *)xmalloc((size_t)T * E * sizeof(float));
-    r->probe = (float *)xmalloc((size_t)T * H * N * sizeof(float));
-    memset(r->probe, 0, (size_t)T * H * N * sizeof(float));
-    r->z = (double *)xmalloc((size_t)T * H * sizeof(double));
-    memset(r->z, 0, (size_t)T * H * sizeof(double));
     cache_copy(&r->cache, mla_is_latent(v) ? &K->lat : &K->exp_, c, mla_is_latent(v));
 
     mla_project(q, ct, xnew, K->w, c, T, ql);
     const unsigned long long k0 = mla_kvb_calls;
     mla_zprobe = r->z;
+    mla_qprobe = r->quot;
     set_threads(g_attend_threads);
     if (mla_attend(v, r->acc, q, ct, T, K->C, &r->cache, K->w, c, scr, vcap, r->probe)) {
         fprintf(stderr, "variant %s refused the layer\n", MLA_NAME[v]);
@@ -274,6 +297,7 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     }
     set_threads(1);
     mla_zprobe = NULL;
+    mla_qprobe = NULL;
     r->kvb = mla_kvb_calls - k0;
     /* The gate works in place, so keep the pre-gate accumulator for comparison. */
     float *acc2 = (float *)xmalloc((size_t)T * H * vh * sizeof(float));
@@ -282,22 +306,31 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     free(acc2); free(q); free(ct); free(ql); free(gbuf); free(scr);
 }
 
-/* The engine itself, in either layout, on a private copy of the prefilled cache. */
+/* The engine itself, in either layout, on a private copy of the prefilled cache, with
+ * its trace hook (k3_mla_trace) recording the same intermediates the variants record:
+ * the raw scores, every softmax normaliser and probability quotient, and the pre-gate
+ * accumulator. Those are what the engine's output cannot show; see k3.h. */
 static void run_engine(Run *r, const Case *K, int latent)
 {
     const K3Cfg *c = K->c;
+    const int N = K->C + K->T;
     const size_t n = k3_mla_scratch_cached(c, K->T, K->cap, 1, latent);
     float *scr = (float *)xmalloc(n * sizeof(float));
     memset(r, 0, sizeof *r);
+    run_alloc_trace(r, K->T, c->n_heads, c->v_head, N);
     r->out = (float *)xmalloc((size_t)K->T * c->hidden * sizeof(float));
     cache_copy(&r->cache, latent ? &K->lat : &K->exp_, c, latent);
+    K3MlaTrace tr = {N, r->probe, r->z, r->quot, r->acc};
+    k3_mla_trace = &tr;
     k3_mla_cached(r->out, K->xnew, K->w, c, K->T, scr, r->cache.kv, r->cache.rope, K->C,
                   K->cap, latent);
+    k3_mla_trace = NULL;
     free(scr);
 }
 
 /* A itself, and the scalar rendering, on the same prefilled latent cache. */
-static void run_A_scalar(float *acc, double *zs, const Case *K, const float *xnew)
+static void run_A_scalar(float *acc, double *zs, double *qs, const Case *K,
+                         const float *xnew)
 {
     const K3Cfg *c = K->c;
     const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, kvw = c->kv_lora + c->qk_rope;
@@ -308,7 +341,7 @@ static void run_A_scalar(float *acc, double *zs, const Case *K, const float *xne
     cache_copy(&k, &K->lat, c, 1);
     mla_project(q, ct, xnew, K->w, c, K->T, ql);
     mla_append(&k, 1, ct, K->T, K->C, K->w, c);
-    attend_A_scalar(acc, zs, q, K->T, K->C, &k, K->w, c);
+    attend_A_scalar(acc, zs, qs, q, K->T, K->C, &k, K->w, c);
     cache_free(&k); free(q); free(ct); free(ql);
 }
 
@@ -368,9 +401,19 @@ static int witness(Witness *W, const Case *K, const Run *rE)
                 for (int s = p; s >= 0; s--) zr += expf(probe[s] - m);
                 ok &= !memcmp(&zf, rE->z + (size_t)t * H + h, sizeof zf);
                 if (p >= 2) { W->zrows += 1.0; W->zrev += zr != zf; }
+                /* the quotients, e / z as E forms them and as e * (1 / z) */
+                const double *qe = rE->quot + ((size_t)t * H + h) * N;
+                const double rz = 1.0 / zf;
+                for (int s = 0; s <= p; s++) {
+                    const float e = expf(probe[s] - m);
+                    const double qf = e / zf;
+                    ok &= !memcmp(&qf, qe + s, sizeof qf);
+                    W->quots += 1.0;
+                    W->qrecip += e * rz != qf;
+                }
             }
             memcpy(pr, probe, (size_t)(p + 1) * sizeof(float));
-            mla_softmax_row(pr, p);
+            mla_softmax_row(pr, p, NULL);
             const float *acc = rE->acc + ((size_t)t * H + h) * vh;
             for (int j = 0; j < vh; j++) {
                 float up = 0.0f, dn2 = 0.0f;
@@ -420,6 +463,7 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
     const size_t outb = (size_t)T * E * sizeof(float);
     const size_t prb  = (size_t)T * H * N * sizeof(float);
     const size_t zb   = (size_t)T * H * sizeof(double);
+    const size_t qb   = (size_t)T * H * N * sizeof(double);
     const size_t latb = (size_t)T * c->kv_lora * sizeof(float);
     const size_t expb = (size_t)T * H * kvd * sizeof(float);
     const size_t ropb = (size_t)T * c->qk_rope * sizeof(float);
@@ -432,14 +476,16 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
     run_variant(&rL0, &K, K.xnew, MLA_L0, 0);
     run_variant(&rA, &K, K.xnew, MLA_A, 0);
 
-    /* 1. the engine's two layouts, and E, against each other */
-    CHECK(same(eng_x.out, eng_l.out, outb), "%s C=%d T=%d: engine expanded != engine latent",
-          geom, C, T);
-    CHECK(same(rE.out, eng_x.out, outb), "%s C=%d T=%d: E != engine", geom, C, T);
-    CHECK(same(rL0.out, eng_l.out, outb), "%s C=%d T=%d: L0 != engine latent", geom, C, T);
+    /* 1. the engine's two layouts, and E and L0, against each other: outputs, and the
+     *    engine's traced accumulators (3. has its scores, normalisers and quotients) */
+    CHECK(same(eng_x.out, eng_l.out, outb) && same(eng_x.acc, eng_l.acc, accb),
+          "%s C=%d T=%d: engine expanded != engine latent", geom, C, T);
+    CHECK(same(rE.out, eng_x.out, outb) && same(rE.acc, eng_x.acc, accb),
+          "%s C=%d T=%d: E != engine", geom, C, T);
+    CHECK(same(rL0.out, eng_l.out, outb) && same(rL0.acc, eng_l.acc, accb),
+          "%s C=%d T=%d: L0 != engine latent", geom, C, T);
     CHECK(same(rEP.out, rE.out, outb) && same(rEP.acc, rE.acc, accb),
           "%s C=%d T=%d: E+ != E", geom, C, T);
-    CHECK(same(rL0.acc, rE.acc, accb), "%s C=%d T=%d: L0 acc != E acc", geom, C, T);
     /* the appended rows are the engine's rows */
     CHECK(same(rE.cache.kv + (size_t)C * H * kvd, eng_x.cache.kv + (size_t)C * H * kvd, expb)
               && same(rE.cache.rope + (size_t)C * c->qk_rope,
@@ -450,11 +496,27 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
               && same(rL0.cache.rope + (size_t)C * c->qk_rope,
                       eng_l.cache.rope + (size_t)C * c->qk_rope, ropb),
           "%s C=%d T=%d: latent append differs from the engine's", geom, C, T);
-    /* 3. scores agree before the softmax, and so do the softmax normalisers */
+    /* 3. scores agree before the softmax, and so do the softmax normalisers and the
+     *    probability quotients, first between the engine's own two layouts, then between
+     *    each copy and the engine layout it copies, then between the variants and E */
+    CHECK(same(eng_l.probe, eng_x.probe, prb) && same(eng_l.z, eng_x.z, zb)
+              && same(eng_l.quot, eng_x.quot, qb),
+          "%s C=%d T=%d: the engine's two layouts differ in scores, normalisers or "
+          "quotients", geom, C, T);
+    CHECK(same(rE.probe, eng_x.probe, prb) && same(rE.z, eng_x.z, zb)
+              && same(rE.quot, eng_x.quot, qb),
+          "%s C=%d T=%d: E's scores, normalisers or quotients != the engine's", geom, C,
+          T);
+    CHECK(same(rL0.probe, eng_l.probe, prb) && same(rL0.z, eng_l.z, zb)
+              && same(rL0.quot, eng_l.quot, qb),
+          "%s C=%d T=%d: L0's scores, normalisers or quotients != the latent "
+          "engine's", geom, C, T);
     CHECK(same(rEP.probe, rE.probe, prb) && same(rL0.probe, rE.probe, prb),
           "%s C=%d T=%d: raw scores differ between E, E+ and L0", geom, C, T);
     CHECK(same(rEP.z, rE.z, zb) && same(rL0.z, rE.z, zb),
           "%s C=%d T=%d: softmax normalisers differ between E, E+ and L0", geom, C, T);
+    CHECK(same(rEP.quot, rE.quot, qb) && same(rL0.quot, rE.quot, qb),
+          "%s C=%d T=%d: probability quotients differ between E, E+ and L0", geom, C, T);
     /* 7. kv_b applications */
     check_count(&rE, MLA_E, C, T, 0, geom);
     check_count(&rEP, MLA_EP, C, T, 0, geom);
@@ -469,6 +531,7 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
         acc->scores += wk.scores; acc->rev += wk.rev; acc->split += wk.split;
         acc->lanes += wk.lanes; acc->vals += wk.vals; acc->vrev += wk.vrev;
         acc->zrows += wk.zrows; acc->zrev += wk.zrev;
+        acc->quots += wk.quots; acc->qrecip += wk.qrecip;
     }
 
     /* 2. L1 at three value-row budgets */
@@ -478,8 +541,10 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
         run_variant(&r, &K, K.xnew, MLA_L1, vcaps[i]);
         CHECK(same(r.out, eng_x.out, outb) && same(r.acc, rE.acc, accb),
               "%s C=%d T=%d: L1 (vcap %d) != E", geom, C, T, vcaps[i]);
-        CHECK(same(r.probe, rE.probe, prb) && same(r.z, rE.z, zb),
-              "%s C=%d T=%d: L1 (vcap %d) scores or normalisers != E", geom, C, T, vcaps[i]);
+        CHECK(same(r.probe, rE.probe, prb) && same(r.z, rE.z, zb)
+                  && same(r.quot, rE.quot, qb),
+              "%s C=%d T=%d: L1 (vcap %d) scores, normalisers or quotients != E", geom, C,
+              T, vcaps[i]);
         CHECK(same(r.cache.kv + (size_t)C * c->kv_lora, eng_l.cache.kv + (size_t)C * c->kv_lora,
                    latb),
               "%s C=%d T=%d: L1 appended different latent rows", geom, C, T);
@@ -491,10 +556,12 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
     {
         float *acc = (float *)xmalloc(accb);
         double *zs = (double *)xmalloc(zb);
-        run_A_scalar(acc, zs, &K, K.xnew);
-        CHECK(same(acc, rA.acc, accb) && same(zs, rA.z, zb),
+        double *qs = (double *)xmalloc(qb);
+        memset(qs, 0, qb);
+        run_A_scalar(acc, zs, qs, &K, K.xnew);
+        CHECK(same(acc, rA.acc, accb) && same(zs, rA.z, zb) && same(qs, rA.quot, qb),
               "%s C=%d T=%d: A != scalar absorbed reference", geom, C, T);
-        free(acc); free(zs);
+        free(acc); free(zs); free(qs);
         const double d_acc = rel_l2(rA.acc, rE.acc, (size_t)T * H * vh);
         const double d_out = rel_l2(rA.out, rE.out, (size_t)T * E);
         CHECK(cancelling || (d_acc < 1e-4 && d_out < 1e-4),
@@ -538,7 +605,7 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
             Run r;
             run_variant(&r, &K, K.xnew, vs[i], N / 2);
             CHECK(same(r.acc, base[i]->acc, accb) && same(r.out, base[i]->out, outb)
-                      && same(r.z, base[i]->z, zb),
+                      && same(r.z, base[i]->z, zb) && same(r.quot, base[i]->quot, qb),
                   "%s C=%d T=%d: %s changes with the thread count", geom, C, T,
                   MLA_NAME[vs[i]]);
             run_free(&r);
@@ -741,9 +808,11 @@ static void print_witness(const char *label, const Witness *w)
            "  different float in %.1f%% (reversed), %.1f%% (nope and rope summed apart), "
            "%.1f%% (two lanes);\n  of %.0f float value sums of 3+ terms, %.1f%% change "
            "when summed in reverse;\n  of %.0f softmax normalisers of 3+ terms, %.1f%% "
-           "change when summed in reverse\n", label, w->scores, pct(w->rev, w->scores),
+           "change when summed in reverse;\n  of %.0f probability quotients e/z, %.1f%% "
+           "change when formed as e*(1/z)\n", label, w->scores, pct(w->rev, w->scores),
            pct(w->split, w->scores), pct(w->lanes, w->scores), w->vals,
-           pct(w->vrev, w->vals), w->zrows, pct(w->zrev, w->zrows));
+           pct(w->vrev, w->vals), w->zrows, pct(w->zrev, w->zrows), w->quots,
+           pct(w->qrecip, w->quots));
 }
 
 int main(void)
@@ -865,6 +934,11 @@ int main(void)
         const Witness *z = &g_wit[LAYER_SHARP];
         CHECK(z->zrows > 400 && z->zrev >= 0.3 * z->zrows,
               "sharp layers no longer expose a reordered softmax normaliser");
+        /* The quotient needs no special layer: e*(1/z) rounds twice where e/z rounds
+         * once, and differs in about a fifth to a quarter of the quotients anywhere. */
+        for (int k = 0; k < LAYER_KINDS; k++)
+            CHECK(g_wit[k].quots > 20000 && g_wit[k].qrecip >= 0.1 * g_wit[k].quots,
+                  "layer kind %d no longer exposes a reciprocal-multiply quotient", k);
     }
 
     printf("%d/%d cases, %d checks, %d failed\n", nok, ncase, checks, failures);

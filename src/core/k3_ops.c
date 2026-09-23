@@ -421,7 +421,17 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  * from x and caches nothing. All three paths must produce identical output; the op
  * fixtures gate the uncached path and tests/unit/k3_model.c gates them against each
  * other, logit for logit.
+ *
+ * THE TRACE HOOK (k3_mla_trace, see k3.h) copies out the raw scores, the double
+ * normaliser z, the double quotient e/z and the pre-gate accumulator of every row, which
+ * is how tests/unit/test_mla_variants.c holds the two layouts to each other on the
+ * doubles the output rounds away. The quotient is named before it is rounded so that the
+ * value recorded IS the value used: `pq = sc[s] / z; (float)pq` is `(float)(sc[s] / z)`,
+ * since a double quotient is evaluated in double on every target this file builds for
+ * (FLT_EVAL_METHOD 0 on x86-64 and aarch64). Nothing else here reads the trace.
  */
+K3MlaTrace *k3_mla_trace = NULL;
+
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
                    float *kvc, float *ropec, int cached, int cap, int kv_latent)
@@ -438,6 +448,10 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     const int last = cached + T - 1;              /* highest absolute position      */
     if (kvc && last >= cap)
         k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
+    /* The test hook, read once per call: NULL outside tests. */
+    K3MlaTrace *const tr = k3_mla_trace;
+    if (tr && (tr->scores || tr->quot) && last + 1 > tr->n)
+        k3_fatal_bound("MLA trace row length", (long)last + 1, (long)tr->n);
 
     /* Scratch layout. Every region below is DISJOINT and must stay so. Overlapping
      * any two of them can appear to work, aliasing the gate buffer onto q, say, is
@@ -505,11 +519,20 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
              * per-head denominator: (float)(sc[s]/z) is the same value either way. */
             for (int h = 0; h < H; h++) {
                 float *sh = sc + (size_t)h * (last + 1);
+                const size_t row = (size_t)t * H + h;          /* trace row (t, h) */
+                if (tr && tr->scores)
+                    memcpy(tr->scores + row * tr->n, sh, (size_t)(p + 1) * sizeof(float));
                 float m = -INFINITY;
                 for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
                 double z = 0.0;
                 for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
-                for (int s = 0; s <= p; s++) sh[s] = (float)(sh[s] / z);
+                if (tr && tr->z) tr->z[row] = z;
+                double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
+                for (int s = 0; s <= p; s++) {
+                    const double pq = sh[s] / z;
+                    if (qrow) qrow[s] = pq;
+                    sh[s] = (float)pq;
+                }
                 float *o = acc + (size_t)h * vh;
                 for (int j = 0; j < vh; j++) o[j] = 0.0f;
             }
@@ -538,17 +561,27 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 sc[s] = (float)d * scale;
                 if (sc[s] > m) m = sc[s];
             }
+            const size_t row = (size_t)t * H + h;              /* trace row (t, h) */
+            if (tr && tr->scores)
+                memcpy(tr->scores + row * tr->n, sc, (size_t)(p + 1) * sizeof(float));
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            if (tr && tr->z) tr->z[row] = z;
+            double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
 
             float *o = acc + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const double pq = sc[s] / z;
+                if (qrow) qrow[s] = pq;
+                const float pr = (float)pq;
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
         }
+
+        if (tr && tr->acc)
+            memcpy(tr->acc + (size_t)t * H * vh, acc, (size_t)H * vh * sizeof(float));
 
         /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
          * unlike KDA which norms first. :470-473 ---- */

@@ -1,6 +1,7 @@
 # MLA KV-cache variants: what each one costs, and what absorbing `kv_b` changes
 
-**A benchmark and a numerical study. Nothing in the engine changed.** Four ways to run
+**A benchmark and a numerical study. Nothing in the engine's arithmetic changed**; the
+only engine change is a recording hook for the test (`k3_mla_trace`, below). Four ways to run
 one MLA layer's cached attention, plus one bit-exact restructuring added as a fair
 baseline, are implemented side by side in `benchmarks/mla_variants.h`. They are held to
 the engine bit for bit by `tests/unit/test_mla_variants.c`, which is part of `make test`,
@@ -39,12 +40,28 @@ different association, and so different floats.
 
 `test_mla_variants` runs each case through the **engine's own** `k3_mla_cached` in both
 cache layouts and through every variant, from the same hidden states, and compares with
-`memcmp`: layer outputs, attention accumulators, the rows appended to the cache, the raw
-scores before the softmax, and the softmax normaliser of every row. L1 runs at three
-value-row budgets (all, half, none); E+, L1 and A rerun on every thread (on the cases of
-up to 48 positions, which span three of their 16-position blocks); A is compared bitwise
-with a plain scalar rendering of its formulas. The count of kv_b applications
-each call makes is checked against the closed form in the table above.
+`memcmp`: layer outputs, pre-gate attention accumulators, the rows appended to the cache,
+the raw scores before the softmax, the double softmax normaliser z of every row and the
+double probability quotient e/z of every score. It compares them between the engine's
+two layouts, between E and the expanded engine, between L0 and the latent engine, and
+between each variant and E. L1 runs at three value-row budgets (all, half, none); E+, L1
+and A rerun on every thread (on the cases of up to 48 positions, which span three of
+their 16-position blocks); A is compared bitwise with a plain scalar rendering of its
+formulas. The count of kv_b applications each call makes is checked against the closed
+form in the table above.
+
+The engine's intermediates come from a recording hook, `k3_mla_trace` in `k3.h`, which
+is NULL outside tests. It is needed because the output cannot show them: z and e/z are
+doubles that reach the output only as p = (float)(e / z), and summing z in another order,
+or forming the quotient as e * (1 / z), moves p by a float ulp about once in 2^29 values.
+A gate on outputs alone would pass an engine whose two layouts summed z differently,
+which is a different reduction tree and so, somewhere in a long enough run, a different
+logit. With the hook set, `k3_mla_cached` copies each value out as it forms it (the
+quotient is named before it is rounded, so the recorded double is the one rounded);
+nothing reads the copies back, and with the hook NULL the cost is a pointer test per
+row and per probability. A replacement for the engine's latent loop, such as L1, is
+held by this gate to the expanded layout's normaliser and quotient as well as its
+output.
 
 Ordinary random layers are not enough for a gate like this, and the test measures why.
 Every score is a double chain rounded to float once, and on terms of one size a
@@ -61,15 +78,20 @@ also runs two constructed kinds of layer through the same gates:
   Until softmax terms fall below about 2^-29 the double normaliser is a sum of floats that
   is exact in any order; on sharp rows it is not.
 
-| order witness (this commit) | score chains | changed if reversed | nope and rope summed apart | two lanes | normalisers of 3+ terms changed if reversed |
-|---|---:|---:|---:|---:|---:|
-| ordinary layers | 305,712 | 0.0% | 0.0% | 0.0% | 0.0% of 3,397 |
-| cancelling layers | 25,459 | 100.0% | 100.0% | 93.7% | 0.0% of 1,024 |
-| sharp layers | 34,384 | 0.0% | 0.0% | 0.0% | 51.7% of 944 |
+| order witness (this commit) | score chains | changed if reversed | nope and rope summed apart | two lanes | normalisers of 3+ terms changed if reversed | quotients changed as e*(1/z) |
+|---|---:|---:|---:|---:|---:|---:|
+| ordinary layers | 305,712 | 0.0% | 0.0% | 0.0% | 0.0% of 3,397 | 25.9% |
+| cancelling layers | 25,459 | 100.0% | 100.0% | 93.7% | 0.0% of 1,024 | 25.4% |
+| sharp layers | 34,384 | 0.0% | 0.0% | 0.0% | 51.7% of 944 | 21.0% |
+
+The quotient needs no special layer: e * (1 / z) rounds twice where e / z rounds once, so
+the doubles differ often, on every kind of layer, while the float p they round to almost
+never does.
 
 The witness only says whether a reordering *could* be seen. A mutation run shows that
-the test does see one: each mutant below was compiled into a scratch copy of the header
-and run through the unchanged test (57 cases: 29 ordinary, 16 cancelling, 12 sharp).
+the test does see one: each mutant below was compiled into a scratch copy of the header,
+or for the engine rows of `src/core/k3_ops.c`, and run through the unchanged test on
+four threads (57 cases: 29 ordinary, 16 cancelling, 12 sharp).
 
 | mutant | ordinary cases failed | cancelling | sharp |
 |---|---:|---:|---:|
@@ -78,14 +100,27 @@ and run through the unchanged test (57 cases: 29 ordinary, 16 cancelling, 12 sha
 | L1 score chain, two lanes over the nope terms | 0 / 29 | 13 / 16 | 0 / 12 |
 | A score step, four terms regrouped pairwise | 0 / 29 | 10 / 16 | 0 / 12 |
 | E itself, rope terms before nope terms (E drifts from the engine) | 0 / 29 | 16 / 16 | 0 / 12 |
-| softmax normaliser summed in reverse | 0 / 29 | 0 / 16 | 11 / 12 |
+| engine, latent layout: score chain with rope terms before nope terms | 0 / 29 | 16 / 16 | 0 / 12 |
+| softmax normaliser summed in reverse (E+, L1 and A) | 0 / 29 | 0 / 16 | 11 / 12 |
+| engine, latent layout: normaliser summed in reverse | 0 / 29 | 0 / 16 | 11 / 12 |
+| engine, both layouts: normaliser summed in reverse | 0 / 29 | 0 / 16 | 11 / 12 |
 | A score chain, rope terms before latent terms | 26 / 29 | 14 / 16 | 12 / 12 |
 | L1 value sums, positions reversed within a block | 23 / 29 | 14 / 16 | 12 / 12 |
 | A value sums, positions reversed within a block | 23 / 29 | 14 / 16 | 12 / 12 |
 | E+ lane swap, positions 1 and 2 of a group exchanged | 21 / 29 | 13 / 16 | 12 / 12 |
+| quotient formed as e * (1 / z) (E+, L1 and A) | 24 / 29 | 14 / 16 | 12 / 12 |
+| engine, latent layout: quotient formed as e * (1 / z) | 24 / 29 | 14 / 16 | 12 / 12 |
+| engine, both layouts: quotient formed as e * (1 / z) | 24 / 29 | 14 / 16 | 12 / 12 |
 
-The first five would pass a test built on ordinary layers alone, and so would the
-reversed normaliser without the sharp layers. Every mutant fails the test as committed.
+The first six would pass a test built on ordinary layers alone, and the three reversed
+normalisers would pass without the sharp layers. Five rows also need the recorded
+doubles: the two engine normaliser rows and the three quotient rows. The test before
+the trace hook compared the engine only on outputs and appended rows and recorded no
+quotient anywhere, and all five passed it, 57 of 57 cases: a z or e/z formed another
+way moves no output float on these inputs. In the both-layouts rows the engine's two
+layouts still agree with each other; the change is caught because E, the copy of the
+engine's original order, no longer matches either. Every mutant fails the test as
+committed.
 
 ## Counts: kv_b applications, multiply-adds and bytes
 

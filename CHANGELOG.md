@@ -7,13 +7,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **MLA cache variants study** (benchmark-only, the engine is unchanged): one MLA
-  layer's cached attention five ways in `benchmarks/mla_variants.h` -- expanded (E),
-  the same arithmetic threaded (E+), the engine's latent loop (L0), a latent loop that
-  rebuilds each position once per call (L1), and absorbed (A). E+, L0 and L1 are held to
-  `k3_mla_cached` bit for bit by `test_mla_variants`, now in `make test`, on ordinary,
-  cancelling and sharp layers, with a mutation run showing the gate catches reordered
-  chains. `bench_mla counts` counts kv_b applications: at a 256-token prefill L0 makes
+- **MLA cache variants study** (benchmark-only; the engine's arithmetic is unchanged):
+  one MLA layer's cached attention five ways in `benchmarks/mla_variants.h` -- expanded
+  (E), the same arithmetic threaded (E+), the engine's latent loop (L0), a latent loop
+  that rebuilds each position once per call (L1), and absorbed (A). E+, L0 and L1 are
+  held to `k3_mla_cached` bit for bit by `test_mla_variants`, now in `make test`, on
+  ordinary, cancelling and sharp layers, including the double softmax normalisers and
+  probability quotients the output rounds away, which the engine exposes through a new
+  test-only hook, `k3_mla_trace` (NULL outside tests); a mutation run shows the gate
+  catches reordered chains in the variants and in both engine layouts. `bench_mla counts` counts kv_b applications: at a 256-token prefill L0 makes
   65,792 per layer and L1 256. A differs from E by ~1e-6 relative, as much as E differs
   from a double reference, with no argmax change in 30,000 softmax rows; it is not
   bitwise, so it cannot be a mode under the exactness contract. Timings are pending a

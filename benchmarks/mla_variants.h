@@ -2,8 +2,10 @@
  *
  * Benchmark and test code only. Nothing in src/ includes this file and the engine's own
  * k3_mla_cached is untouched by it; tests/unit/test_mla_variants.c holds the copies
- * below to the engine bit for bit, and benchmarks/bench_mla.c times them and measures
- * how far the one inexact variant moves. docs/notes/mla-variants.md has the results.
+ * below to the engine bit for bit (its outputs, and through its k3_mla_trace hook the
+ * scores, normalisers, quotients and accumulators the output cannot show), and
+ * benchmarks/bench_mla.c times them and measures how far the one inexact variant
+ * moves. docs/notes/mla-variants.md has the results.
  *
  * WHAT IS BEING COMPARED
  *   Every variant runs the engine's own projections (q_a, q_a_norm, q_b for the query;
@@ -261,8 +263,9 @@ static inline void mla_probe_row(float *probe, const float *row, int t, int h, i
 /* The softmax normaliser z of row (t, h), for the test: mla_zprobe[t*H + h]. z is a
  * double sum of positive terms that only ever reaches the output as p = (float)(e / z),
  * where a reordered sum would round to the same float almost surely; recording z itself
- * is what lets the test hold its ORDER to E's bit for bit. NULL (no recording) except in
- * tests/unit/test_mla_variants.c. Each (t, h) is written by one thread. */
+ * is what lets the test hold its ORDER to E's, and E's to the engine's (k3_mla_trace),
+ * bit for bit. NULL (no recording) except in tests/unit/test_mla_variants.c. Each (t, h)
+ * is written by one thread. */
 static double *mla_zprobe;
 
 static inline void mla_probe_z(int t, int h, int H, double z)
@@ -270,15 +273,34 @@ static inline void mla_probe_z(int t, int h, int H, double z)
     if (mla_zprobe) mla_zprobe[(size_t)t * H + h] = z;
 }
 
+/* The probability quotients of row (t, h), for the test: mla_qprobe[(t*H + h)*N + s] is
+ * the double e_s / z that p_s is rounded from. Like z, it reaches the output only
+ * through that rounding, which a reciprocal multiply or any other way of forming it
+ * would survive almost surely; recording the double is what lets the test hold the step
+ * itself to the engine's. NULL except in the test. mla_qrow is the row to record into,
+ * or NULL. */
+static double *mla_qprobe;
+
+static inline double *mla_qrow(int t, int h, int H, int N)
+{
+    return mla_qprobe ? mla_qprobe + ((size_t)t * H + h) * N : NULL;
+}
+
 /* The engine's softmax form, in place over row[0..p]: max ascending, expf(x - m) and a
- * double sum ascending, then p = (float)(e / z) folded back into the row. Returns z. */
-static inline double mla_softmax_row(float *row, int p)
+ * double sum ascending, then p = (float)(e / z) folded back into the row, the quotient
+ * named first so that the value recorded in qrow (when not NULL) is the value rounded,
+ * exactly as in k3_mla_cached. Returns z. */
+static inline double mla_softmax_row(float *row, int p, double *qrow)
 {
     float m = -INFINITY;
     for (int s = 0; s <= p; s++) if (row[s] > m) m = row[s];
     double z = 0.0;
     for (int s = 0; s <= p; s++) { row[s] = expf(row[s] - m); z += row[s]; }
-    for (int s = 0; s <= p; s++) row[s] = (float)(row[s] / z);
+    for (int s = 0; s <= p; s++) {
+        const double pq = row[s] / z;
+        if (qrow) qrow[s] = pq;
+        row[s] = (float)pq;
+    }
     return z;
 }
 
@@ -310,11 +332,14 @@ static void mla_attend_E(float *acc, const float *q, int T, int C, const MlaCach
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
             mla_probe_z(t, h, H, z);
+            double *qrow = mla_qrow(t, h, H, N);
 
             float *o = acc + ((size_t)t * H + h) * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const double pq = sc[s] / z;
+                if (qrow) qrow[s] = pq;
+                const float pr = (float)pq;
                 const float *vs = k->kv + (size_t)s * H * kvd + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
@@ -393,7 +418,7 @@ static void mla_attend_EP(float *acc, const float *q, int T, int C, const MlaCac
         for (int t = 0; t < T; t++) {
             float *r = sh + (size_t)t * N;
             mla_probe_row(probe, r, t, h, H, N, C + t);
-            mla_probe_z(t, h, H, mla_softmax_row(r, C + t));
+            mla_probe_z(t, h, H, mla_softmax_row(r, C + t, mla_qrow(t, h, H, N)));
             float *o = acc + ((size_t)t * H + h) * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
         }
@@ -443,7 +468,12 @@ static void mla_attend_L0(float *acc, const float *q, int T, int C, const MlaCac
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
             mla_probe_z(t, h, H, z);
-            for (int s = 0; s <= p; s++) sh[s] = (float)(sh[s] / z);
+            double *qrow = mla_qrow(t, h, H, N);
+            for (int s = 0; s <= p; s++) {
+                const double pq = sh[s] / z;
+                if (qrow) qrow[s] = pq;
+                sh[s] = (float)pq;
+            }
             float *o = acc + ((size_t)t * H + h) * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
         }
@@ -509,7 +539,7 @@ static void mla_attend_L1(float *acc, const float *q, int T, int C, const MlaCac
         const int t = th / H, h = th % H;
         float *r = sc + (size_t)th * N;
         mla_probe_row(probe, r, t, h, H, N, C + t);
-        mla_probe_z(t, h, H, mla_softmax_row(r, C + t));
+        mla_probe_z(t, h, H, mla_softmax_row(r, C + t, mla_qrow(t, h, H, N)));
         float *o = acc + (size_t)th * vh;
         for (int j = 0; j < vh; j++) o[j] = 0.0f;
     }
@@ -634,7 +664,7 @@ static int mla_attend_A(float *acc, const float *q, int T, int C, const MlaCache
         const int t = th / H, h = th % H;
         float *r = sc + (size_t)th * N;
         mla_probe_row(probe, r, t, h, H, N, C + t);
-        mla_probe_z(t, h, H, mla_softmax_row(r, C + t));
+        mla_probe_z(t, h, H, mla_softmax_row(r, C + t, mla_qrow(t, h, H, N)));
         float *ut = u + (size_t)th * kvl;
         for (int j = 0; j < kvl; j++) ut[j] = 0.0f;
     }
