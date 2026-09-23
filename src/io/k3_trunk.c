@@ -200,12 +200,16 @@ static void rows_submit(K3Rows *r, int slot, int64_t off, size_t len)
     pthread_mutex_unlock(&r->mu);
 }
 
+/* Called only by the main thread, which is what makes the wait it adds to
+ * row_wait_seconds time that no compute overlapped. */
 static int rows_wait(K3Rows *r)
 {
+    const double start = now_s();
     pthread_mutex_lock(&r->mu);
     while (r->busy) pthread_cond_wait(&r->cv, &r->mu);
     const int result = r->result;
     pthread_mutex_unlock(&r->mu);
+    r->tr->row_wait_seconds += now_s() - start;
     return result;
 }
 
@@ -284,6 +288,7 @@ static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
     const size_t esz = dt == K3_DT_BF16 ? 2u : 4u;
     size_t done = 0;
     float *dst = (float *)(r->small + start);
+    const double sync_start = now_s();   /* main thread, inside bind: never overlapped */
     while (done < (size_t)take) {
         size_t count = (size_t)take - done;
         if (count > r->payload / esz) count = r->payload / esz;
@@ -297,6 +302,7 @@ static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
         }
         done += count;
     }
+    r->tr->row_sync_seconds += now_s() - sync_start;
     *dest = dst; r->small_used = start + (size_t)take * 4;
     return 0;
 }
@@ -915,6 +921,26 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
 {
     const uint64_t n = tr->hits + tr->misses;
     printf("trunk [%s]\n", label ? label : "");
+    if (tr->row_state) {
+        /* The row pipeline has no pins, no ring and no timed bind: each matrix is read
+         * tile by tile inside the matmul that uses it, so the ring's bind-wall breakdown
+         * below would divide device time by zero binds and call all of it overlapped.
+         * What is measured instead is split by thread. The main thread's own vector reads
+         * and its waits for a tile are time no compute overlapped; the reader thread's
+         * tile reads are the rest of load_seconds, and whatever of them the main thread
+         * did not wait for ran beside a matmul. */
+        const double reader = tr->load_seconds - tr->row_sync_seconds;
+        printf("  row pipeline: %llu layer binds, %llu matrix passes, two %.2f MiB buffers\n",
+               (unsigned long long)n, (unsigned long long)tr->matrix_calls,
+               (double)tr->row_buffer_bytes / 2.0 / (1 << 20));
+        printf("  read %.2f GB in %.2f s of device time (%.0f MB/s)\n",
+               (double)tr->bytes_read / 1e9, tr->load_seconds,
+               tr->load_seconds > 0 ? (double)tr->bytes_read / 1e6 / tr->load_seconds : 0.0);
+        printf("  reader thread %.2f s of tile reads; main thread waited %.2f s for tiles "
+               "and read layer vectors for %.2f s\n",
+               reader, tr->row_wait_seconds, tr->row_sync_seconds);
+        return;
+    }
     printf("  pinned %d/%d layers, ring %d slots\n", tr->npin, tr->n_layers, tr->nslot);
     printf("  binds %llu, hits %llu (%.1f%%), reads %llu\n",
            (unsigned long long)n, (unsigned long long)tr->hits,

@@ -103,6 +103,10 @@ typedef struct {
     void         *row_state;   /* opt-in bounded row pipeline, separate from layer ring */
     int           read_error;  /* sticky: never emit output after a failed matrix read */
     uint64_t      row_buffer_bytes, small_buffer_bytes, matrix_calls;
+    /* Row pipeline only, both on the main thread: time blocked waiting for a row tile,
+     * and time spent reading the current layer's vectors synchronously in bind. The rest
+     * of load_seconds is the reader thread's, which may overlap the matmuls. */
+    double        row_wait_seconds, row_sync_seconds;
 
     /* stats */
     uint64_t     hits, misses;

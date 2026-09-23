@@ -266,6 +266,23 @@ class OfflineCliTests(unittest.TestCase):
                 self.assertEqual(report["layers_completed"], 12)
                 self.assertEqual(len(report["generated_ids"]), 1)
 
+    def test_trunk_rows_report_says_what_it_measured(self):
+        # The row pipeline has no timed binds, so the ring's bind-wall breakdown would
+        # call all of its device time overlapped. Its final report instead names the
+        # mode, the main thread's waits for tiles and its own vector reads, and makes no
+        # overlap claim it did not measure.
+        out = self.path / "rows-report.json"
+        result = subprocess.run(
+            [str(self.binary), str(self.packed), "--ids", "1,2,3", "--gen", "2",
+             "--cache-gb", "0.0001", "--trunk", str(self.trunk), "--trunk-gb", "0.001",
+             "--trunk-rows", "--out", str(out)],
+            text=True, errors="replace", capture_output=True, env=self.env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = result.stdout[result.stdout.rindex("trunk [final]"):]
+        self.assertIn("row pipeline:", report)
+        self.assertIn("main thread waited", report)
+        self.assertNotIn("overlapped", report)
+
     def test_trunk_rows_under_cgroup_cap(self):
         if os.environ.get("K3_CGROUP_TEST") != "1":
             self.skipTest("requires the Linux CI cgroup gate")
