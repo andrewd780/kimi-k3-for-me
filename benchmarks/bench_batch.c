@@ -4,9 +4,10 @@
  * positions. The per-position loop streams the matrix through the core T times and redoes
  * the bf16 -> f32 -> f64 widening, the kernel's real cost, T times; k3_matmul_bf16_batch
  * streams it once per pass and widens each weight once per block of positions. This times
- * both at the REAL shape of a KDA q/k/v/g projection, 12288 x 7168, for T = 1, 2, 4, 8,
- * at one thread and at the OpenMP default (four on the reference VM), and checks that
- * both produce the same bits.
+ * both, by default at the REAL shape of a KDA q/k/v/g projection, 12288 x 7168, for
+ * T = 1, 2, 4, 8 (see usage for lm_head's 163840 x 7168 and larger T), at one thread and
+ * at the OpenMP default (four on the reference VM), and checks that both produce the same
+ * bits.
  *
  * Columns:
  *   ms median / min   wall time of one call over all T positions, over the repetitions
@@ -20,7 +21,11 @@
  * Timings are wall clock on whatever else the machine is doing; repeat them, and read the
  * median and the minimum together.
  *
- * usage: bench_batch [reps]   (default 7)
+ * usage: bench_batch [reps] [out] [Tmax]   (defaults 7, 12288, 8)
+ *   out   output rows; 163840 is lm_head (2.35 GB of bf16), which a --spec verify sweep,
+ *         --tf-check and --score-prompt now apply to a block of positions per pass
+ *   Tmax  largest T timed, from 1, 2, 4, 8, 9 (a --spec 8 sweep) and 16 (one lm_head
+ *         block, and one pass of the batched kernel at in = 7168)
  */
 #define _POSIX_C_SOURCE 199309L
 
@@ -68,9 +73,15 @@ static void loop_tokens(float *Y, const float *X, const uint16_t *W, int in, int
 
 int main(int argc, char **argv)
 {
-    const int in = 7168, out = 12288, reps = argc > 1 ? atoi(argv[1]) : 7;
-    const int Ts[] = {1, 2, 4, 8}, nT = (int)(sizeof Ts / sizeof *Ts), Tmax = 8;
+    const int in = 7168, reps = argc > 1 ? atoi(argv[1]) : 7;
+    const int out = argc > 2 ? atoi(argv[2]) : 12288, Tmax = argc > 3 ? atoi(argv[3]) : 8;
+    const int Tall[] = {1, 2, 4, 8, 9, 16};
+    int Ts[sizeof Tall / sizeof *Tall], nT = 0;
+    for (int i = 0; i < (int)(sizeof Tall / sizeof *Tall); i++)
+        if (Tall[i] <= Tmax) Ts[nT++] = Tall[i];
     if (reps < 1 || reps > 1000) { fprintf(stderr, "reps must be 1..1000\n"); return 2; }
+    if (out < 1 || out > 1 << 20) { fprintf(stderr, "out must be 1..1048576\n"); return 2; }
+    if (Tmax < 1 || Tmax > 16) { fprintf(stderr, "Tmax must be 1..16\n"); return 2; }
     uint16_t *W = (uint16_t *)malloc((size_t)in * out * sizeof(uint16_t));
     float *X  = (float *)malloc((size_t)Tmax * in * sizeof(float));
     float *Yl = (float *)malloc((size_t)Tmax * out * sizeof(float));
