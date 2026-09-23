@@ -18,6 +18,11 @@
  *                                  rows. Hidden states ~ N(0,1) go through the engine's
  *                                  own projections and rmsnorms with weights ~ N(0,0.02)
  *                                  rounded to bf16, exactly as k3_mla_cached runs them.
+ *   bench_mla counts [options]     no timing at all: per variant, the kv_b applications
+ *                                  one call makes (COUNTED, by running it), and the
+ *                                  multiply-adds and bytes that follow at K3 geometry.
+ *                                  The prefill shape C=0, T=256 is the point of it: L0's
+ *                                  count is quadratic in T there, L1's linear.
  *
  * WHAT IS AND IS NOT MEASURED
  *   Latent-path time is dominated by kv_b applications, whose count per call is exact
@@ -914,6 +919,123 @@ static int run_numerics(const NumOpt *o)
     return 0;
 }
 
+/* ================================================================== counts ==== */
+/* How many kv_b applications a call makes depends only on (C, T, vcap): the loops that
+ * make them never look at the geometry. So they are counted where counting is cheap, by
+ * running each variant on the fixture geometry (4 heads, kv_lora 32) with mla_kvb_calls
+ * watching, and held to the closed form mla_rebuilds(); a mismatch fails the run. The
+ * multiply-adds (mla_macs), bytes, and kv_b weight bytes touched are then quoted at the
+ * released geometry. None of it moves with machine load, which is why this phase of the
+ * study reports it and leaves wall time to a quiet machine. */
+
+/* kv_b at K3 geometry in bf16: 24,576 rows of 512, read in full by every application. */
+#define KVB_BYTES_K3 (24576.0 * 512.0 * 2.0)
+
+/* kv_b weight traffic per call, in whole-matrix units: one per application, except A,
+ * which never applies the whole matrix but reads its key half once per call (absorbing
+ * every query token) and its value half once per query token. */
+static double kvb_reads(int v, int T, double applications)
+{
+    return v == MLA_A ? 0.5 * (1.0 + T) : applications;
+}
+
+typedef struct {
+    int nC, Cs[MAX_LIST], nT, Ts[MAX_LIST];
+    double vbuf_mb;
+    const char *json;
+} CountOpt;
+
+static int run_counts(const CountOpt *o)
+{
+    K3Cfg k3, fx;
+    mla_cfg_k3(&k3, 7168);
+    mla_cfg_tiny(&fx);
+    const int fH = fx.n_heads, fqh = fx.qk_nope + fx.qk_rope, fkvw = fx.kv_lora + fx.qk_rope;
+    const int fkvd = fx.qk_nope + fx.v_head, fvh = fx.v_head;
+    FILE *json = o->json ? fopen(o->json, "a") : NULL;
+    if (o->json && !json) { fprintf(stderr, "cannot open %s\n", o->json); return 1; }
+    MlaSynth S;
+    if (mla_synth_layer(&S, &fx, K3_WBF16, 0.1f, 0.1f, 3, 0)) return 1;
+    int bad = 0;
+    printf("kv_b applications per call, COUNTED on the fixture geometry (the count does not\n"
+           "depend on it) and checked against mla_rebuilds(); multiply-adds and bytes at K3\n"
+           "geometry (96 heads, 128+64, v 128, kv_lora 512), one MLA layer; x24 = all MLA\n"
+           "layers. L1's value-row budget is --vbuf-mb %.0f MB at K3 geometry.\n",
+           o->vbuf_mb);
+    for (int ic = 0; ic < o->nC; ic++)
+        for (int it = 0; it < o->nT; it++) {
+            const int C = o->Cs[ic], T = o->Ts[it], N = C + T;
+            const int vbudget = (int)fmin((double)N, o->vbuf_mb * 1e6
+                                          / (k3.n_heads * k3.v_head * 4.0));
+            /* rows: E, E+, L0, L1 at the budget, L1 holding no value rows, A */
+            const int rv[6] = {MLA_E, MLA_EP, MLA_L0, MLA_L1, MLA_L1, MLA_A};
+            const int rc[6] = {0, 0, 0, vbudget, 0, 0};
+            MlaCache lat = {0}, ex = {0};
+            lat.cap = ex.cap = N;
+            lat.kv = (float *)xmalloc((size_t)N * fx.kv_lora * sizeof(float));
+            lat.rope = (float *)xmalloc((size_t)N * fx.qk_rope * sizeof(float));
+            ex.kv = (float *)xmalloc((size_t)N * fH * fkvd * sizeof(float));
+            ex.rope = (float *)xmalloc((size_t)N * fx.qk_rope * sizeof(float));
+            fill_fast(lat.kv, (size_t)N * fx.kv_lora, 1.0f, 11);
+            fill_fast(lat.rope, (size_t)N * fx.qk_rope, 1.0f, 12);
+            fill_fast(ex.kv, (size_t)N * fH * fkvd, 1.0f, 13);
+            fill_fast(ex.rope, (size_t)N * fx.qk_rope, 1.0f, 12);
+            float *q = (float *)xmalloc((size_t)T * fH * fqh * sizeof(float));
+            float *ct = (float *)xmalloc((size_t)T * fkvw * sizeof(float));
+            float *acc = (float *)xmalloc((size_t)T * fH * fvh * sizeof(float));
+            fill_fast(q, (size_t)T * fH * fqh, 1.0f, 14);
+            fill_fast(ct, (size_t)T * fkvw, 1.0f, 15);
+            double counted[6];
+            printf("\nC=%d T=%d (N=%d)\n  %-3s %6s  %12s  %11s  %13s  %11s  %13s  %12s\n", C, T,
+                   N, "", "vcap", "kv_b applied", "closed form", "GMAC per call",
+                   "GMAC/tok x24", "kv_b GB read", "cache B/pos");
+            for (int i = 0; i < 6; i++) {
+                const int v = rv[i];
+                void *scr = xmalloc(mla_scratch_bytes(v, &fx, T, N, rc[i]));
+                const unsigned long long k0 = mla_kvb_calls;
+                if (mla_attend(v, acc, q, ct, T, C, mla_is_latent(v) ? &lat : &ex, &S.w, &fx,
+                               scr, rc[i], NULL)) {
+                    fprintf(stderr, "%s refused the layer\n", MLA_NAME[v]);
+                    return 1;
+                }
+                free(scr);
+                counted[i] = (double)(mla_kvb_calls - k0);
+                const double want = mla_rebuilds(v, T, C, rc[i]);
+                const double macs = mla_macs(v, &k3, T, C, rc[i]);
+                const double pbytes = (double)mla_cache_floats(&k3, mla_is_latent(v)) * 4.0;
+                const double tbytes = (double)mla_scratch_bytes(v, &k3, T, N, rc[i]);
+                const int ok = counted[i] == want;
+                bad |= !ok;
+                char vc[16];
+                if (v == MLA_L1) snprintf(vc, sizeof vc, "%d", rc[i]);
+                else snprintf(vc, sizeof vc, "-");
+                printf("  %-3s %6s  %12.0f  %11.0f%s  %13.3f  %11.3f  %13.3f  %12.0f\n",
+                       MLA_NAME[v], vc, counted[i], want, ok ? " " : "!", macs / 1e9,
+                       macs / T * N_MLA_LAYERS / 1e9,
+                       kvb_reads(v, T, counted[i]) * KVB_BYTES_K3 / 1e9, pbytes);
+                if (json)
+                    fprintf(json, "{\"mode\":\"counts\",\"variant\":\"%s\",\"C\":%d,\"T\":%d,"
+                            "\"vcap\":%d,\"kv_b_applications\":%.0f,"
+                            "\"kv_b_applications_closed_form\":%.0f,\"macs_per_call\":%.9g,"
+                            "\"gmac_per_token_x24\":%.9g,\"kv_b_bytes_read\":%.9g,"
+                            "\"persistent_bytes_per_position_per_layer\":%.0f,"
+                            "\"transient_bytes\":%.0f,\"counted_on\":\"fixture geometry\"}\n",
+                            MLA_NAME[v], C, T, rc[i], counted[i], want, macs,
+                            macs / T * N_MLA_LAYERS / 1e9,
+                            kvb_reads(v, T, counted[i]) * KVB_BYTES_K3, pbytes, tbytes);
+            }
+            printf("  L0 / L1 kv_b applications: %.1fx (L1 holding no value rows: %.1fx)\n",
+                   counted[2] / counted[3], counted[2] / counted[4]);
+            free(q); free(ct); free(acc);
+            free(lat.kv); free(lat.rope); free(ex.kv); free(ex.rope);
+        }
+    if (json) fclose(json);
+    mla_synth_free(&S);
+    if (bad) { fprintf(stderr, "a counted kv_b total differs from mla_rebuilds()\n"); return 1; }
+    printf("\nall counts equal their closed forms\n");
+    return 0;
+}
+
 /* ==================================================================== main ==== */
 
 static void usage(void)
@@ -924,14 +1046,17 @@ static void usage(void)
             "                 [--vbuf-mb 2560] [--mem-mb 3072] [--quiet-wait 120]\n"
             "                 [--common] [--json FILE]\n"
             "       bench_mla numerics [--threads N] [--C 1024,16384] [--queries 105]\n"
-            "                 [--rows 10000] [--qscale 1] [--json FILE]\n");
+            "                 [--rows 10000] [--qscale 1] [--json FILE]\n"
+            "       bench_mla counts [--C 0] [--T 1,16,64,256] [--vbuf-mb 2560]\n"
+            "                 [--json FILE]\n");
 }
 
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);             /* progress is visible when logged */
-    int numerics = 0, a = 1;
+    int numerics = 0, counts = 0, a = 1;
     if (a < argc && !strcmp(argv[a], "numerics")) { numerics = 1; a++; }
+    else if (a < argc && !strcmp(argv[a], "counts")) { counts = 1; a++; }
     else if (a < argc && !strcmp(argv[a], "time")) a++;
 
     TimeOpt t;
@@ -946,6 +1071,7 @@ int main(int argc, char **argv)
     n.nC = parse_list("1024,16384", n.Cs);
     n.queries = 105; n.rows = 10000; n.qscale = 1.0;
 
+    int c_given = 0, t_given = 0;
     for (; a < argc; a++) {
         const char *k = argv[a], *v = a + 1 < argc ? argv[a + 1] : NULL;
         if (!strcmp(k, "--common")) { t.common = 1; continue; }
@@ -956,7 +1082,11 @@ int main(int argc, char **argv)
             if ((t.nC = parse_list(v, t.Cs)) < 1 || (n.nC = parse_list(v, n.Cs)) < 1) {
                 usage(); return 2;
             }
-        } else if (!strcmp(k, "--T")) { if ((t.nT = parse_list(v, t.Ts)) < 1) { usage(); return 2; } }
+            c_given = 1;
+        } else if (!strcmp(k, "--T")) {
+            if ((t.nT = parse_list(v, t.Ts)) < 1) { usage(); return 2; }
+            t_given = 1;
+        }
         else if (!strcmp(k, "--runs")) t.runs = atoi(v);
         else if (!strcmp(k, "--max-run-s")) t.max_run_s = atof(v);
         else if (!strcmp(k, "--vbuf-mb")) t.vbuf_mb = atof(v);
@@ -988,5 +1118,17 @@ int main(int argc, char **argv)
     t.ncpu = 1;
 #endif
     t.threads = threads_now();
+    if (counts) {
+        /* the prefill shape by default; --C and --T replace it */
+        CountOpt k;
+        memset(&k, 0, sizeof k);
+        k.nC = c_given ? t.nC : parse_list("0", k.Cs);
+        k.nT = t_given ? t.nT : parse_list("1,16,64,256", k.Ts);
+        if (c_given) memcpy(k.Cs, t.Cs, sizeof k.Cs);
+        if (t_given) memcpy(k.Ts, t.Ts, sizeof k.Ts);
+        k.vbuf_mb = t.vbuf_mb;
+        k.json = t.json;
+        return run_counts(&k);
+    }
     return numerics ? run_numerics(&n) : run_time(&t);
 }
