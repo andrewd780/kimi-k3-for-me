@@ -4,7 +4,7 @@ Every test in `make test` runs **without model weights**. The checkpoint is 1.56
 correctness depended on having it, correctness would not get checked.
 
 ```bash
-make test          # everything below; about 15 s, peak RSS ~1.7 GB
+make test          # everything below; about 20 s on four cores, peak RSS ~1.7 GB
 make test-all SHARD_DIR=~/k3model   # adds the checkpoint-dependent tests
 ```
 
