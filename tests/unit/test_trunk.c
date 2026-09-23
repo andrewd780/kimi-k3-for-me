@@ -24,10 +24,18 @@
  *                   proves the ring correctly recycles slots.
  *   6  FAILED-READ  truncating trunk.bin after open causes a prefetch to fail;
  *                   the slot is never published and bind returns an error.
+ *   7  ROWS         the --trunk-rows pipeline (k3_trunk_open_rows): two full walks and
+ *                   a batch of positions give products bitwise equal to the resident
+ *                   trunk's, a batch reads each matrix once, a failed read is sticky and
+ *                   an undersized budget is refused.
  *
  * usage: test_trunk
- *   writes a synthetic 3-layer trunk fixture to a temp directory, then drives
- *   k3_trunk_open / bind / prefetch / close at two budgets.
+ *   writes a synthetic trunk fixture to a temp directory, then drives k3_trunk_open /
+ *   bind / prefetch / close at two budgets and the row pipeline at one. Built with
+ *   -DK3_TEST_ROWS_ONLY (bin/test_trunk_rows) it runs check 7 alone on 93 layers whose
+ *   257-row dense matrices span several 4 KiB row tiles, the case where the pipeline's
+ *   double buffering, tile offsets and O_DIRECT prefixes are actually exercised; in the
+ *   3-layer build every matrix fits in a single tile.
  */
 #define _GNU_SOURCE            /* O_DIRECT, mkdtemp, ftruncate */
 #define _POSIX_C_SOURCE 200809L
@@ -71,25 +79,41 @@ static void ck(int ok, const char *what, const char *detail)
     if (!ok) g_fail++;
 }
 
-static unsigned char marker_byte(int layer, int tensor_index)
+/* Byte i of tensor (layer, tensor_index): a hash of all three, so no two rows of a matrix
+ * are alike and no two tensors share bytes.
+ *
+ * WHY EVERY BYTE DIFFERS. This fixture used to fill each tensor with one repeated byte.
+ * Every row of every matrix was then the same, every output of a product had the same
+ * value, and a row tile read from the wrong offset, applied to the wrong output rows or
+ * shifted by a wrong O_DIRECT prefix produced exactly the right answer: the row-pipeline
+ * checks below compared equal floats whatever the pipeline did. With a different byte at
+ * every position, any such error moves some output and memcmp sees it.
+ *
+ * Odd bytes are the high byte of a BF16 value (and bytes 1 and 3 of an F32 one). They keep
+ * a hashed sign and take an exponent near 1 (0x3A..0x3F), so every weight and vector is
+ * finite and moderate: no NaN or infinity can make two different products compare the
+ * same, and no sum overflows. */
+static unsigned char fixture_byte(int layer, int tensor_index, int i)
 {
-    return (unsigned char)((layer * 67 + tensor_index * 13 + 1) % 251);
+    uint32_t h = (uint32_t)layer * 0x9E3779B1u ^ (uint32_t)tensor_index * 0x85EBCA77u ^
+                 (uint32_t)i * 0xC2B2AE3Du;
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+    if (!(i & 1)) return (unsigned char)h;
+    return (unsigned char)((h & 0x80u) | (0x3Au + (h >> 8) % 6u));
 }
 
-/* Verify that the first n bytes at ptr match the marker for (layer, tensor_index). */
+/* Verify that the first n bytes at raw are tensor (layer, tensor_index)'s fixture bytes. */
 static int check_marker(const unsigned char *raw, int layer, int tensor_index, int n)
 {
-    unsigned char expect = marker_byte(layer, tensor_index);
     for (int i = 0; i < n; i++)
-        if (raw[i] != expect) return 0;
+        if (raw[i] != fixture_byte(layer, tensor_index, i)) return 0;
     return 1;
 }
 
-/* Fill n bytes at dst with the marker for (layer, tensor_index). */
+/* Fill n bytes at dst with tensor (layer, tensor_index)'s fixture bytes. */
 static void fill_marker(unsigned char *dst, int layer, int tensor_index, int n)
 {
-    unsigned char m = marker_byte(layer, tensor_index);
-    memset(dst, m, (size_t)n);
+    for (int i = 0; i < n; i++) dst[i] = fixture_byte(layer, tensor_index, i);
 }
 
 /* Lay out one layer's tensors into dst, returning the number of bytes written.
@@ -548,6 +572,14 @@ static int test_rows(const char *dir, const K3Cfg *c)
     }
     ck(tr.row_buffer_bytes + tr.small_buffer_bytes < 32768,
        "rows: bounded two-buffer arena", "metadata also charged at allocation");
+    /* The comparisons below can only see a misplaced tile if rows differ: see fixture_byte. */
+    {
+        K3LayerBind d;
+        const int ok = !k3_trunk_bind(&resident, c, 0, &d) &&
+                       memcmp(d.lay.dense_gate, (const unsigned char *)d.lay.dense_gate +
+                              HIDDEN * 2, HIDDEN * 2) != 0;
+        ck(ok, "rows: fixture rows differ", "a repeated-byte fixture hides misplaced tiles");
+    }
     int same = 1;
     for (int walk = 0; walk < 2; walk++) {
         for (int L = 0; L < N_LAYERS; L++) {
@@ -693,8 +725,8 @@ int main(void)
     }
 
     printf("trunk streaming regression\n"
-           "  fixture: %s (3 layers, %.0f KB)\n\n", tmpdir,
-           (double)(3 * 4096) / 1024.0);
+           "  fixture: %s (%d layers, %.0f KB)\n\n", tmpdir, N_LAYERS,
+           (double)N_LAYERS * FIXTURE_RUN_BYTES / 1024.0);
 
     /* §1 one-slot budget */
     if (N_LAYERS == 3 && test_one_slot(tmpdir, &c) != 0) g_fail++;

@@ -84,9 +84,18 @@ slot count, draining on free/reset_stats before any `get()`, and an injected sho
 read; see [the pipelining note](notes/expert-pipeline.md).
 
 **`test_trunk`**, the streaming trunk: ring-slot budget enforcement, one-slot
-guard, async prefetch, slot-isolation under concurrency, ring wrap-around, and
-truncated-read failure isolation. Uses a synthetic 3-layer trunk fixture of a few
-KB that is generated inline, so no checkpoint is required. The one-slot guard check
+guard, async prefetch, slot-isolation under concurrency, ring wrap-around,
+truncated-read failure isolation, and the `--trunk-rows` pipeline (two full walks
+and a batch of positions whose products must equal the resident trunk's bit for bit,
+one read per matrix per batch, a sticky failed read, a refused undersized budget).
+Uses a synthetic 3-layer trunk fixture of a few KB that is generated inline, so no
+checkpoint is required. **`test_trunk_rows`** is the same file built with
+`-DK3_TEST_ROWS_ONLY`: the row checks alone over 93 layers whose 257-row dense
+matrices span several 4 KiB row tiles, which is where the double buffering, tile
+offsets and `O_DIRECT` prefixes are exercised; in the 3-layer build every matrix fits
+one tile. Every fixture byte depends on its layer, tensor and position, and the test
+fails if two rows of a matrix are equal, so a tile read from the wrong offset cannot
+pass. The one-slot guard check
 fails against any build that starts the reader thread unconditionally, which is the
 condition the real model exhibited as silent token corruption: with one ring slot
 the reader would write layer L+1 over layer L while the caller was still computing

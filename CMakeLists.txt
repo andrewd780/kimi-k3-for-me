@@ -119,6 +119,9 @@ k3_add_test(test_cfg    tests/unit/test_cfg.c)
 k3_add_test(test_tok    tests/unit/test_tok.c)
 k3_add_test(scale_test  tests/unit/scale_test.c)
 k3_add_test(test_trunk  tests/unit/test_trunk.c)
+# The rows-only build: 93 layers whose dense matrices span several row tiles.
+k3_add_test(test_trunk_rows tests/unit/test_trunk.c)
+target_compile_definitions(test_trunk_rows PRIVATE K3_TEST_ROWS_ONLY)
 k3_add_test(k3_model    tests/unit/k3_model.c)
 k3_add_test(test_mla_variants tests/unit/test_mla_variants.c)
 
@@ -135,6 +138,7 @@ add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
 add_test(NAME scale      COMMAND scale_test)
 add_test(NAME trunk      COMMAND test_trunk)
+add_test(NAME trunk_rows COMMAND test_trunk_rows)
 add_test(NAME oracle     COMMAND k3_model   ${FIX})
 add_test(NAME mla_variants COMMAND test_mla_variants)
 

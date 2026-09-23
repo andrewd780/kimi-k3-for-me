@@ -177,7 +177,7 @@ CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_kda_exact test_quality test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk \
-              test_matmul_exact test_mla_variants
+              test_trunk_rows test_matmul_exact test_mla_variants
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -255,6 +255,15 @@ $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
                    $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+# The same test on a 93-layer fixture whose dense matrices span several row tiles: the
+# only build in which --trunk-rows double-buffers, so the only one that can catch a tile
+# read from the wrong offset or applied to the wrong rows.
+$(BIN)/test_trunk_rows: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
+                        $(BUILD)/src/io/k3_st.o \
+                        $(BUILD)/src/model/k3_bind.o \
+                        $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) -DK3_TEST_ROWS_ONLY $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 $(BIN)/bench_kda: benchmarks/bench_kda.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
@@ -322,6 +331,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	  fi
 	@echo "== real dimensions ==";   ./$(BIN)/scale_test
 	@echo "== trunk streaming ==";   ./$(BIN)/test_trunk
+	@echo "== trunk rows, 93 layers =="; ./$(BIN)/test_trunk_rows
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
 	@echo
 	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
