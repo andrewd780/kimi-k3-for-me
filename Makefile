@@ -264,6 +264,9 @@ $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(
 $(BIN)/bench_batch: benchmarks/bench_batch.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+$(BIN)/bench_router: benchmarks/bench_router.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 # The MLA cache variants live in a header under benchmarks/, not in the engine: the test
 # holds E+, L0 and L1 to k3_mla_cached bit for bit, and bench_mla times all of them and
 # measures the absorbed one. $< plus the object, because $^ would pass the header too.
@@ -359,10 +362,12 @@ cfg: $(BIN)/test_cfg
 ## bench: kernel microbenchmarks, no weights required
 # bench_batch times the batched trunk matmul against the per-position loop at T = 1..8;
 # it is a separate binary because the sanitizer CI job runs bench_kernels for coverage
-# and a sweep at real width is minutes under ASan.
-bench: $(BIN)/bench_kernels $(BIN)/bench_batch
+# and a sweep at real width is minutes under ASan. bench_router times one MoE router
+# call at the released shape and hashes its output.
+bench: $(BIN)/bench_kernels $(BIN)/bench_batch $(BIN)/bench_router
 	./$(BIN)/bench_kernels
 	./$(BIN)/bench_batch
+	./$(BIN)/bench_router
 
 ## bench-mla: MLA cache variants, one layer at K3 geometry (quick; see docs/notes/mla-variants.md)
 # The quick form stops at 4,096 cached positions and projects any run longer than 20 s

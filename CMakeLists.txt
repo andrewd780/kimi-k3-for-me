@@ -177,6 +177,9 @@ target_link_libraries(bench_kernels PRIVATE k3)
 add_executable(bench_batch benchmarks/bench_batch.c)
 target_link_libraries(bench_batch PRIVATE k3)
 
+add_executable(bench_router benchmarks/bench_router.c)
+target_link_libraries(bench_router PRIVATE k3)
+
 add_executable(bench_mla benchmarks/bench_mla.c)
 target_link_libraries(bench_mla PRIVATE k3)
 

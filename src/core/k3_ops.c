@@ -1144,9 +1144,13 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * exactly as before: the interleaving changes WHEN each add issues, never which adds
      * happen or in what order within an expert, so every score is bit-identical to the
      * one-expert loop. The product needs no care either way: a float times a float fits
-     * in double's 53 bits, so it is exact whether or not the compiler fuses it. Measured
-     * single-threaded at the released shape (896 x 7168): 8.3 ms -> 4.0 ms per layer,
-     * about 0.39 s per token across the 92 MoE layers, with memcmp-equal scores. The
+     * in double's 53 bits, so it is exact whether or not the compiler fuses it. Timed
+     * with bench_router at the released shape (896 x 7168) against the one-expert loop,
+     * on a 4-vCPU AVX-512 guest with GCC 13.3, -march=native: 8.4 -> 4.6 ms per call on
+     * one thread, and 2.1 -> 1.2 ms on four, the engine's threaded case, which is about
+     * 0.09 s per token across the 92 MoE layers; the output hash was the same in all 40
+     * runs. docs/notes/decode-kernels.md has every run. test_ops holds this form bitwise
+     * to the one-expert loop on data where a reordered chain changes the scores. The
      * tail block (n_experts % K3_ROUTER_BLOCK experts) runs the same per-expert loop. */
     enum { K3_ROUTER_BLOCK = 8 };
     const int nblk = (n_experts + K3_ROUTER_BLOCK - 1) / K3_ROUTER_BLOCK;

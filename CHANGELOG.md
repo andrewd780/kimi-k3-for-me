@@ -187,6 +187,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   12288 x 7168 is 1.50x faster at 1 thread with AVX-512 and 1.34x with AVX2 (1.44x and
   1.27x at 4 threads), now 82% to 93% of the machine's plain read rate; MXFP4 is 2.4x to
   2.9x faster on AVX-512 and unchanged on AVX2. Kernel figures only, no s/token claim.
+- **The MoE router scores eight experts per pass over x, with the same bits.**
+  `k3_router` used to run each expert's 7168-term double chain alone, so a core waited
+  out the add latency on every element; it now walks eight experts side by side, each
+  still receiving its terms in order, one add per term, so every score, index and
+  weight is unchanged. `test_ops` holds it bitwise to the one-expert loop on
+  cancelling data where a reversed or split chain changes every score (checked
+  in-test), at 1 to 896 experts. The new `bench_router` times one call at 896 x 7168:
+  on the 4-vCPU AVX-512 guest, old kernel against new in one harness, 8.4 to 4.6 ms on
+  one thread and 2.1 to 1.2 ms on four (AVX2 build: 8.4 to 4.8 and 2.1 to 1.2), about
+  0.09 s per token over the 92 MoE layers at four threads; every run is in
+  [docs/notes/decode-kernels.md](docs/notes/decode-kernels.md#the-moe-router).
 - **Speculative decode never replays.** A partially accepted `--spec` sweep used to
   restore a copy of the whole carried state and replay the accepted prefix through a
   second forward, re-reading the trunk and the prefix's experts (at K3 scale 108.81 GB

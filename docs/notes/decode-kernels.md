@@ -105,6 +105,62 @@ Read bandwidth per run, GB/s: 1 thread 8.5 to 10.1; 4 threads 20.6 to 37.8.
   is re-read every call, so these are cache rates: a routed expert read from RAM or SSD
   per token runs at the memory rate, and this table does not predict that.
 
+## The MoE router
+
+`k3_router` now scores eight experts per pass over x instead of one (see the comment at
+its definition); each expert still sums its 7168 terms in order in one double chain, so
+nothing moves a bit. It is timed with `benchmarks/bench_router.c`, one call at the
+released shape (896 experts x 7168, top-16) on the ordinary router distribution, and the
+harness hashes the indices and weights of 64 calls.
+
+Conditions as above, except: old kernel `src/core/k3_ops.c` at 49f5ccb, new at 6cd0668;
+harness `benchmarks/bench_router.c`, linked against each kernel object; 5 runs per
+binary and thread count, each the median and best of 51 timed calls after one warm call;
+per round old native, new native, old avx2, new avx2, five rounds at 1 thread, then five
+at 4; the 1-minute load was 0.57 to 0.72 before every run, 2026-09-23.
+
+| threads | build | old ms | new ms | speedup | old best | new best |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | native | 8.41 | 4.57 | 1.84x | 8.13 | 4.05 |
+| 1 | avx2 | 8.36 | 4.75 | 1.76x | 8.15 | 4.15 |
+| 4 | native | 2.09 | 1.16 | 1.80x | 1.99 | 1.08 |
+| 4 | avx2 | 2.10 | 1.18 | 1.78x | 1.99 | 1.07 |
+
+Per-run median call in ms, in run order:
+
+| threads | binary | runs 1-5 |
+|---:|---|---|
+| 1 | old native | 8.76 8.30 8.28 8.41 8.56 |
+| 1 | new native | 4.64 4.25 4.57 4.63 4.53 |
+| 1 | old avx2 | 8.33 8.29 8.36 8.49 8.43 |
+| 1 | new avx2 | 4.70 4.86 4.75 5.44 4.69 |
+| 4 | old native | 2.22 2.16 2.09 2.06 2.07 |
+| 4 | new native | 1.16 1.15 1.17 1.13 1.16 |
+| 4 | old avx2 | 2.10 2.16 2.10 2.08 2.05 |
+| 4 | new avx2 | 1.18 1.62 1.19 1.15 1.14 |
+
+All 40 runs print the same `router OUTPUT FNV1a = e27b309fc654a05f`. The old and new run
+ranges do not overlap at either thread count. The engine runs the router threaded, so
+the four-thread row is the one that applies: 0.93 ms less per MoE layer, which over the
+92 of them is 0.09 s per token by arithmetic (0.35 s at one thread), not a measured
+s/token. The hash is a same-data check only: on this ordinary data a reordered chain
+almost never moves a float, which is why `test_ops` holds the order on cancelling data
+instead.
+
+Five minutes earlier the same protocol ran with a scratch copy of the harness that
+differs only in its output format (load 0.72 to 0.94), with the same hash in all 40 runs:
+
+| threads | binary | runs 1-5 | median |
+|---:|---|---|---:|
+| 1 | old native | 8.45 8.61 8.58 8.62 8.50 | 8.58 |
+| 1 | new native | 5.02 5.07 4.70 5.03 4.64 | 5.02 |
+| 1 | old avx2 | 8.38 8.44 8.45 8.61 8.39 | 8.44 |
+| 1 | new avx2 | 4.77 4.57 4.72 4.78 4.72 | 4.72 |
+| 4 | old native | 2.18 2.31 2.19 2.63 2.10 | 2.19 |
+| 4 | new native | 1.19 1.19 1.24 1.15 1.24 | 1.19 |
+| 4 | old avx2 | 2.08 2.17 2.11 2.64 2.13 | 2.13 |
+| 4 | new avx2 | 1.17 1.38 1.16 1.17 1.74 | 1.17 |
+
 ## Not measured
 
 - **aarch64 / NEON.** No native arm64 machine was available; timings under qemu mean
@@ -133,6 +189,25 @@ for t in 1 4; do for i in 1 2 3 4 5; do
   done
 done; done 2>&1 | tee $D/timing.log
 grep FNV $D/timing.log | sort | uniq -c    # exactly two distinct lines
+```
+
+The router, with the same two kernel objects per build:
+
+```sh
+for n in native avx2; do a=$([ $n = native ] && echo -march=native || echo "-mavx2 -mfma")
+  for k in old:$D/base/build/$n new:build/t-$n; do
+    cc -O3 -std=gnu99 $a -fopenmp -pthread -ffp-contract=off -Iinclude -Iinclude/k3 \
+       -Ithird_party -Isrc/core benchmarks/bench_router.c ${k#*:}/src/core/k3_ops.o \
+       -o $D/router_${k%%:*}_$n -lm
+  done
+done
+for t in 1 4; do for i in 1 2 3 4 5; do
+  for b in old_native new_native old_avx2 new_avx2; do
+    echo "== $b threads=$t run=$i"
+    OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores $D/router_$b 51
+  done
+done; done 2>&1 | tee $D/router.log
+grep FNV $D/router.log | sort | uniq -c    # exactly one distinct line
 ```
 
 Wait for a quiet machine (1-minute load below 1.0) before each run; the runs above did.
