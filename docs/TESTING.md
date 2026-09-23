@@ -16,6 +16,19 @@ misalignment, tails and heap-sized widths. The dedicated KDA workflow compiles
 both the original C and opt-in SIMD, compares full oracle-logit traces within each
 ISA, runs sanitizer coverage, and records three synthetic timing runs per arm.
 
+**`test_matmul_exact`** holds the decode matmuls (`k3_matmul`, `k3_matmul_bf16`,
+`k3_matmul_mxfp4`) to their summation order, bit for bit. Each order is written out
+again in plain C (bf16 and fp32 share one order on every ISA; MXFP4 has one per ISA, and
+AVX-512 must reproduce AVX2's), and every output is compared on data where equal and
+opposite 2^60 terms land in different accumulators, so any other partition or tree
+changes the float, not just a double's last bit. It proves that on each run: the same
+data is summed in wrong orders (a sequential sum, the neighbouring tree, rotated or
+swapped lanes, another MXFP4 partition) and every one must be caught, so the test fails
+rather than passing vacuously if the data stops discriminating. Shapes cover the in % 16
+tails, odd row counts, groups that are and are not multiples of 16, NaN scale bytes, and
+FTZ/DAZ. The banner names the path it built (scalar, AVX2, AVX-512 or NEON); CI runs the
+AVX-512 one only on runners whose CPU has it.
+
 **`test_quality`** checks stable NLL arithmetic on synthetic logits. Python quality
 tests cover overlapping target windows and token-weighted aggregation. A tiny CLI
 primitive check compares native scores with ordinary prefix logits. These tests

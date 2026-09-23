@@ -96,6 +96,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Decode matmul kernels do less work per weight, with the same bits.** `k3_matmul`,
+  `k3_matmul_bf16` and `k3_matmul_mxfp4` widen x to double once per call instead of once
+  per row (x86 reads it in an even/odd layout that drops the bf16 zero-extend shuffles);
+  x86 bf16 and the AVX-512 MXFP4 path take two rows per pass sharing each x load; x86
+  issues a software prefetch ahead of each streamed row; and an AVX-512 build now has
+  its own bf16, fp32 and MXFP4 flat paths instead of running the AVX2 ones. Every path
+  keeps the accumulation partition and reduction tree it had, so bf16/fp32 stay
+  bit-identical across scalar, AVX2, AVX-512 and NEON, and MXFP4 keeps its per-ISA bits
+  (AVX-512 reproduces AVX2). A new gate, `test_matmul_exact`, re-implements each order
+  in plain C and compares every bit on cancelling data built so that any other order
+  changes the float; it rejects reordered, rotated and lane-swapped sums in-test, and a
+  CI job runs it on the AVX-512 build whenever the runner has AVX-512. `bench_kernels`
+  reports the median and best call (`K3_BENCH_REPS`) and the machine's streaming read
+  bandwidth beside the bf16 rate. No speedup figure is claimed here until quiet-machine
+  timings are recorded.
 - **Speculative decode never replays.** A partially accepted `--spec` sweep used to
   restore a copy of the whole carried state and replay the accepted prefix through a
   second forward, re-reading the trunk and the prefix's experts (at K3 scale 108.81 GB
