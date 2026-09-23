@@ -41,8 +41,9 @@ different association, and so different floats.
 cache layouts and through every variant, from the same hidden states, and compares with
 `memcmp`: layer outputs, attention accumulators, the rows appended to the cache, the raw
 scores before the softmax, and the softmax normaliser of every row. L1 runs at three
-value-row budgets (all, half, none); E+, L1 and A rerun on every thread; A is compared
-bitwise with a plain scalar rendering of its formulas. The count of kv_b applications
+value-row budgets (all, half, none); E+, L1 and A rerun on every thread (on the cases of
+up to 48 positions, which span three of their 16-position blocks); A is compared bitwise
+with a plain scalar rendering of its formulas. The count of kv_b applications
 each call makes is checked against the closed form in the table above.
 
 Ordinary random layers are not enough for a gate like this, and the test measures why.
