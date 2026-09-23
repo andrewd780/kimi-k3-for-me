@@ -367,6 +367,27 @@ static inline double k3_tree16(const double *a)
     return (b0 + b1) + (b2 + b3);
 }
 
+/* EVERY NaN OUTPUT IS THE SAME NaN. The partition and tree fix every other output's
+ * bits, but not a NaN's sign and payload: IEEE 754 leaves unspecified which input NaN
+ * an operation passes on, x86 takes the one in the first source operand of whichever
+ * instruction form the compiler picked, and compilers treat the operands of a*b, a+b
+ * and fma's product as interchangeable. k3_matmul_bf16 sums the two rows of a pair
+ * with separate instruction sequences, so the same row can leave with different NaN
+ * bits as the first of a pair or the second (observed on the AVX2 and scalar builds),
+ * and the row pipeline in k3_trunk.c splits a matrix into calls whose length follows
+ * the memory budget, which moves rows between the two. Storing every NaN as the one
+ * quiet NaN 0x7FC00000 makes a NaN output, like every other output, the same bits at
+ * every budget and on every path. Nothing else changes: a value that is not NaN is
+ * stored exactly as (float)acc. k3_matmul does the same so that the two kernels, which
+ * share one order, also share one NaN. */
+static inline float k3_out_f32(double acc)
+{
+    union { uint32_t u; float f; } v;
+    v.f = (float)acc;
+    if (v.f != v.f) v.u = 0x7FC00000u;
+    return v.f;
+}
+
 /* The vector paths read x from a double copy made once per call (see "WIDEN x ONCE" in
  * k3_matmul_mxfp4); without a vector unit there is nothing to hoist. */
 #if defined(__AVX2__) || (defined(__ARM_NEON) && defined(__aarch64__))
@@ -476,7 +497,7 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
         double acc = k3_f32_row_c(row, x, n16);
 #endif
         for (int i = n16; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
-        y[o] = (float)acc;
+        y[o] = k3_out_f32(acc);
     }
 
 #if K3_MM_HOIST
@@ -1591,15 +1612,17 @@ static inline double k3_bf16_row_c(const uint16_t *row, const float *x, int n16)
 
 #if defined(__AVX2__)
 /* SOFTWARE PREFETCH, x86 only. A decode-time matmul streams its weights from DRAM once
- * per token. On the Cascade Lake reference VM one core reads 10.8 GB/s in a plain
- * streaming loop, but the vector loops below reached only ~7 GB/s on a 176 MB bf16
- * matrix: with compute between loads, the hardware prefetcher does not run far enough
- * ahead to keep enough misses in flight. One prefetcht0 per 64-byte line, 1 KB ahead
- * of each row's read pointer, brought it to ~10 GB/s; 512 B ahead did the same for the
- * MXFP4 path (whose 16-byte groups are consumed faster per byte). A prefetch is only a
- * hint -- it reads nothing into a register, cannot fault, and changes no arithmetic --
- * so the one thing it can do is change speed. Apple Silicon's prefetchers were not
- * measured here and the NEON loops are left without one. */
+ * per token. With compute between the loads, the hardware prefetcher may not run far
+ * enough ahead of a row's read pointer to keep enough misses in flight, and the loop
+ * then reads below the machine's streaming bandwidth. One prefetcht0 per 64-byte line,
+ * 1 KB ahead of each row's read pointer (512 B for MXFP4, whose 16-byte groups are
+ * consumed faster per byte), asks for the lines early. The distances come from
+ * exploratory runs on a shared x86 VM that are not recorded, so no speed figure is
+ * claimed for them: bench_kernels prints the bf16 kernel's weight traffic beside the
+ * machine's read bandwidth, which is the measurement to take on a quiet machine before
+ * tuning them. A prefetch is only a hint -- it reads nothing into a register, cannot
+ * fault, and changes no arithmetic -- so the one thing it can change is speed. The NEON
+ * loops are left without one. */
 #define K3_PF_BF16  1024
 #define K3_PF_MXFP4 512
 
@@ -1664,9 +1687,10 @@ static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r
 #elif defined(__AVX2__)
 /* The same with 256-bit registers: eight accumulators for the pair, each 16-element
  * chunk loaded as two 16-byte halves so the conversions need no lane extract. Two rows
- * measured ~18% faster than one on the reference VM (12.0 against 10.2 GFLOP/s with the
- * matrix in L2) despite the register pressure; the body is ordered so that it needs no
- * spill. */
+ * share every xd load, as on AVX-512; the body is ordered so that the eight
+ * accumulators, one x vector and two temporaries fit the sixteen ymm registers without
+ * a spill. The gain was seen only in unrecorded exploratory runs on a shared VM, so no
+ * figure is claimed for it (see the CHANGELOG). */
 static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
                                    const uint16_t *r1, const double *xd, int n16)
 {
@@ -1804,8 +1828,8 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
             acc0 = fma((double)k3_bf16f(r0[i]), (double)x[i], acc0);
             acc1 = fma((double)k3_bf16f(r1[i]), (double)x[i], acc1);
         }
-        y[o0] = (float)acc0;
-        if (o1 != o0) y[o1] = (float)acc1;
+        y[o0] = k3_out_f32(acc0);
+        if (o1 != o0) y[o1] = k3_out_f32(acc1);
     }
 
 #if K3_MM_HOIST
@@ -2170,12 +2194,23 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
      *
      * Read-only and shared by every thread, so one copy serves the whole parallel
      * region. At the K3 shapes it is 28 KB, which stays in L2 while the packed weights
-     * stream past it. NULL is a valid state: the group loop then widens into a small
-     * stack buffer instead, so an allocation failure costs speed and nothing else.
+     * stream past it.
+     *
+     * A FAILED ALLOCATION ABORTS ON x86 when group % 16 == 0. The flat row path below
+     * exists only with the copy; without it the rows would take the grouped path, whose
+     * summation order is different, so the output bits would follow the allocator -- not
+     * a speed cost but a change of result, which the engine does not allow (see the
+     * fatal-error note at the top of this file). Elsewhere NULL is a valid state: the
+     * group loop widens each group into a small stack buffer, the same values the copy
+     * holds, so there an allocation failure costs speed and nothing else.
      *
      * On AVX-512 the flat path reads x in the even/odd chunk layout its nibble split
      * produces (k3_widen_eo16); every other path reads natural order. */
     double *const xd = (double *)malloc((size_t)in * sizeof(double));
+#if defined(__AVX2__)
+    if (!xd && (group & 15) == 0)
+        k3_fatal_oom("the widened x of an MXFP4 matmul", (size_t)in * sizeof(double));
+#endif
 #if defined(__AVX512F__)
     const int flat512 = xd && (group & 15) == 0;
     if (flat512) k3_widen_eo16(xd, x, in);
@@ -2186,8 +2221,9 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
 #if defined(__AVX512F__)
     /* The AVX-512 flat path, two rows per iteration sharing each xd load. It runs under
      * exactly the condition the AVX2 flat path does, so an AVX-512 build and an AVX2
-     * build of this file agree bit for bit on every input, including the xd == NULL
-     * and group % 16 != 0 cases, which fall through to the unchanged loop below.
+     * build of this file agree bit for bit on every input, including the
+     * group % 16 != 0 case, which falls through to the unchanged loop below (and a
+     * failed xd, which aborted above in both builds).
      * Rows stay independent: pairing them changes no arithmetic. */
     if (flat512) {
         double e8d[256];                          /* exact: float to double */
@@ -2434,11 +2470,12 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                  *
                  * ACCURACY CONTRACT (test_expert.c:219) is maxrel < 1e-6 against
                  * dequant-then-matmul, NOT bit-identity. This grouped path is the
-                 * FALLBACK for group not a multiple of 16, or a failed xd hoist; on
-                 * the normal K3 shape the flat row path above is taken instead. It
-                 * keeps four independent accumulators (v0..v3) to break the FMA
-                 * latency chain, so its intra-lane accumulation order differs from
-                 * the scalar path below; the difference is a few ulps of double,
+                 * FALLBACK for group not a multiple of 16 (a failed xd hoist aborts
+                 * above rather than landing here); on the normal K3 shape the flat row
+                 * path above is taken instead. It keeps four independent
+                 * accumulators (v0..v3) to break the FMA latency chain, so its
+                 * intra-lane accumulation order differs from the scalar path
+                 * below; the difference is a few ulps of double,
                  * orders of magnitude inside the 1e-6 gate. The bench FNV1a of the
                  * mxfp4 output differs from the pre-optimisation value -- that hash
                  * is a determinism check, not a correctness oracle. */

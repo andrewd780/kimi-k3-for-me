@@ -242,8 +242,13 @@ int main(void)
         const double gflop = 2.0 * in * rows / 1e9;
         printf("\nMXFP4 matmul %5d x %-5d  %7.2f ms  %8.1f GFLOP/s\n",
                rows, in, dt * 1e3, gflop / dt);
-        printf("             best %.2f ms (%.1f GFLOP/s); the 5.9 MB matrix is cache-resident\n",
-               best * 1e3, gflop / best);
+        /* The same packed matrix is re-read on every call, so where the last-level
+         * cache holds it this is a cache rate, and where it does not, a DRAM rate. The
+         * bench does not know which: it states the size and leaves that to the reader. */
+        printf("             best %.2f ms (%.1f GFLOP/s); the same %.1f MB matrix every call "
+               "(a cache rate if it fits the last-level cache)\n",
+               best * 1e3, gflop / best,
+               ((double)rows * pcols + (double)rows * ngrp) / 1e6);
 
         /* One expert is w1 + w3 (both 3072x3584) + w2 (3584x3072) = 3 of these.
          * 16 experts x 92 MoE layers per token. */

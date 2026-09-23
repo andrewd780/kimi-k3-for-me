@@ -25,9 +25,14 @@ changes the float, not just a double's last bit. It proves that on each run: the
 data is summed in wrong orders (a sequential sum, the neighbouring tree, rotated or
 swapped lanes, another MXFP4 partition) and every one must be caught, so the test fails
 rather than passing vacuously if the data stops discriminating. Shapes cover the in % 16
-tails, odd row counts, groups that are and are not multiples of 16, NaN scale bytes, and
-FTZ/DAZ. The banner names the path it built (scalar, AVX2, AVX-512 or NEON); CI runs the
-AVX-512 one only on runners whose CPU has it.
+tails, odd row counts, and groups that are and are not multiples of 16. The MXFP4 scale
+bytes with special handling have data of their own: a NaN scale byte beside an infinite
+x on one or both rows of an AVX-512 row pair, overflowing scales in whole chunks and in
+the scalar tail, and subnormal-weight scales under FTZ/DAZ, each with a check that the
+data separates the right handling from the wrong one. The bf16 and fp32 kernels' NaN
+outputs must all be the one quiet NaN, whatever a row's place in the call. The banner
+names the path it built (scalar, AVX2, AVX-512 or NEON); CI runs the AVX-512 one only on
+runners whose CPU has it.
 
 **`test_quality`** checks stable NLL arithmetic on synthetic logits. Python quality
 tests cover overlapping target windows and token-weighted aggregation. A tiny CLI

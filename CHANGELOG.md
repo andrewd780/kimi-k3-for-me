@@ -107,10 +107,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (AVX-512 reproduces AVX2). A new gate, `test_matmul_exact`, re-implements each order
   in plain C and compares every bit on cancelling data built so that any other order
   changes the float; it rejects reordered, rotated and lane-swapped sums in-test, and a
-  CI job runs it on the AVX-512 build whenever the runner has AVX-512. `bench_kernels`
-  reports the median and best call (`K3_BENCH_REPS`) and the machine's streaming read
-  bandwidth beside the bf16 rate. No speedup figure is claimed here until quiet-machine
-  timings are recorded.
+  CI job runs it on the AVX-512 build whenever the runner has AVX-512. Every NaN output
+  of `k3_matmul` and `k3_matmul_bf16` is now the quiet NaN `0x7FC00000`: a NaN's sign
+  and payload are not fixed by the summation order, and the two rows of a bf16 pair
+  could pass on different ones, so a NaN row's bits followed its place in a call, and
+  the row pipeline's call lengths follow the memory budget. On x86, `k3_matmul_mxfp4`
+  with a group that is a multiple of 16 (K3's is 32) aborts if it cannot allocate its
+  copy of x, instead of falling back to the grouped path, whose different order would
+  have changed the bits. `bench_kernels` reports the median and best call
+  (`K3_BENCH_REPS`) and the machine's streaming read bandwidth beside the bf16 rate. No
+  speedup figure is claimed here until quiet-machine timings are recorded.
 - **Speculative decode never replays.** A partially accepted `--spec` sweep used to
   restore a copy of the whole carried state and replay the accepted prefix through a
   second forward, re-reading the trunk and the prefix's experts (at K3 scale 108.81 GB

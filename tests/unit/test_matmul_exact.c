@@ -60,9 +60,19 @@
  *   still be exact; the same holds for a rotation by one under the MXFP4 flat tree,
  *   which is why that mutant is not applied there.
  *
- * Inputs are finite except where a case is ABOUT non-finite values (the NaN scale byte
- * skipping an infinite x, and E8M0 scales that overflow a float weight to inf). NaN
- * outputs, which only those cases can produce, compare equal to NaN.
+ * THE SCALE BYTES WITH SPECIAL HANDLING get data of their own, where the ordinary
+ *   tree data would not show a mistake: a NaN scale byte (255) beside an infinite x,
+ *   on both rows of an AVX-512 row pair and on only one of them; E8M0 scales (253, 254)
+ *   that overflow a float weight to inf, in whole chunks and in the scalar tail; and
+ *   scales 0..3, whose subnormal float weights must flush under FTZ and DAZ exactly as
+ *   AVX2's float multiply flushes them. Each carries its own check that the data can
+ *   tell the right handling from the wrong one (a skipped row is finite, an overflow
+ *   gives +inf, a weight formed in double differs under FTZ).
+ *
+ * Inputs are finite except where a case is ABOUT non-finite values (those scale-byte
+ * cases, and the NaN rows below). Where the order is the question, NaN outputs compare
+ * equal to NaN; check_nan_rows then holds the bf16 and fp32 kernels' NaN outputs to
+ * the one quiet NaN, bit for bit, wherever a row sits in the call.
  */
 #include <math.h>
 #include <stdint.h>
@@ -147,8 +157,9 @@ static void pick_pairs(unsigned char *role, int in, int group, int want)
 /* Teeth bookkeeping: per mutant, rows rejecting it and rows eligible, over all checks. */
 static int g_teeth_differ[8], g_teeth_rows[8];
 
-/* Mutants: wrong orders the data must reject. */
-enum { M_RIGHT, M_SEQ, M_TREE, M_ROT, M_SWAP, M_COUNT };
+/* Mutants: wrong orders the data must reject. M_DOUBLEW is not an order but a wrong
+ * MXFP4 flat weight (see mx_wflat), checked only by the scenarios built for it. */
+enum { M_RIGHT, M_SEQ, M_TREE, M_ROT, M_SWAP, M_COUNT, M_DOUBLEW = M_COUNT };
 static const char *MNAME[M_COUNT] = { "right", "sequential", "other tree",
                                       "lanes rotated", "lanes 0,1 swapped" };
 
@@ -290,6 +301,74 @@ done:
     free(wb); free(wf); free(x); free(yb); free(yf); free(wrow); free(role);
 }
 
+/* NaN outputs of the bf16 and fp32 kernels: every one is the quiet NaN 0x7FC00000, so
+ * a row's bits do not depend on where it sits in the call. The row pipeline splits a
+ * matrix into calls whose length follows the memory budget, which moves a row between
+ * the first and second place of a k3_matmul_bf16 pair, and the two places are separate
+ * instruction sequences that can pass on different input NaNs. So each matrix is
+ * multiplied whole and again from its second row on (every row one place earlier,
+ * its pair parity flipped), and the two must agree bit for bit, NaN or not. Rows get
+ * several NaNs with random signs and payloads, in x and in the weights, both in the
+ * whole chunks and in the tail, so that NaNs meet in fmas and in the tree. */
+static uint32_t fbits(float f)
+{
+    union { float f; uint32_t u; } v;
+    v.f = f;
+    return v.u;
+}
+static float nan_bits(void)
+{
+    union { uint32_t u; float f; } v;
+    v.u = 0x7FC00000u | (rnd() & 0x803FFFFFu);   /* quiet, random sign and payload */
+    return v.f;
+}
+
+static void check_nan_rows(int in, int out, int xnan)
+{
+    uint16_t *wb = (uint16_t *)malloc((size_t)in * out * sizeof(uint16_t));
+    float *wf = (float *)malloc((size_t)in * out * sizeof(float));
+    float *x = (float *)malloc((size_t)in * sizeof(float));
+    float *y = (float *)malloc((size_t)out * 4 * sizeof(float));
+    if (!wb || !wf || !x || !y) { report(0, "nan rows (alloc)"); goto done; }
+
+    for (int i = 0; i < in; i++) x[i] = rndf(-4, 4);
+    if (xnan) x[rndi(0, in - 1)] = nan_bits();   /* then every row is NaN */
+    for (int o = 0; o < out; o++) {
+        for (int i = 0; i < in; i++) {
+            wf[(size_t)o * in + i] = rndf(-4, 4);
+            wb[(size_t)o * in + i] = f2bf16(rndf(-4, 4));
+        }
+        for (int k = rndi(0, 3); k > 0; k--) {
+            const int at = rndi(0, in - 1);
+            const float v = nan_bits();
+            wf[(size_t)o * in + at] = v;
+            wb[(size_t)o * in + at] = f2bf16(v);
+        }
+    }
+    float *yb = y, *yb1 = y + out, *yf = y + 2 * out, *yf1 = y + 3 * out;
+    k3_matmul_bf16(yb, x, wb, in, out);
+    k3_matmul_bf16(yb1, x, wb + in, in, out - 1);
+    k3_matmul(yf, x, wf, in, out);
+    k3_matmul(yf1, x, wf + in, in, out - 1);
+
+    int nan_b = 0, nan_f = 0, canon = 0, moved = 0;
+    for (int o = 0; o < out; o++) {
+        nan_b += yb[o] != yb[o];
+        nan_f += yf[o] != yf[o];
+        canon += (yb[o] != yb[o] && fbits(yb[o]) != 0x7FC00000u) +
+                 (yf[o] != yf[o] && fbits(yf[o]) != 0x7FC00000u);
+        if (o > 0)
+            moved += (fbits(yb[o]) != fbits(yb1[o - 1])) + (fbits(yf[o]) != fbits(yf1[o - 1]));
+    }
+    char msg[320];
+    snprintf(msg, sizeof msg, "nan   in=%-5d out=%-4d NaN rows bf16 %d, fp32 %d: %d not 0x7FC00000, "
+             "%d change bits one place earlier", in, out, nan_b, nan_f, canon, moved);
+    /* Some rows must be NaN, or the check says nothing. */
+    report(canon == 0 && moved == 0 && nan_b > 0 && nan_f > 0, msg);
+done:
+    free(wb); free(wf); free(x); free(y);
+}
+
 /* ----------------------------------------------------------- MXFP4 ---- */
 static const float E2M1[16] = {
     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
@@ -308,6 +387,17 @@ static void set_nib(unsigned char *pr, int i, unsigned c)
 
 enum { MX_FLAT, MX_GROUPED16, MX_GROUPED8 };
 
+/* The flat path's weight: the E2M1 value times the scale IN FLOAT, then widened, which
+ * is how AVX2 forms it, so a product that is subnormal flushes to zero under FTZ and
+ * one past 2^128 becomes inf. M_DOUBLEW forms the same product exactly in double
+ * instead: it agrees everywhere else, and the SC_LOW and SC_INF data exist to tell the
+ * two apart. */
+static double mx_wflat(unsigned code, unsigned sb, int mut)
+{
+    if (mut == M_DOUBLEW) return sb == 255 ? 0.0 : (double)E2M1[code] * ldexp(1.0, (int)sb - 127);
+    return (double)(E2M1[code] * e8m0(sb));
+}
+
 static float ref_mx(int kind, const unsigned char *pr, const unsigned char *sr,
                     const float *x, int in, int group, int mut)
 {
@@ -318,7 +408,7 @@ static float ref_mx(int kind, const unsigned char *pr, const unsigned char *sr,
             const unsigned sb = sr[i / group];
             if (sb == 255) continue;
             for (int l = 0; l < 16; l++) {
-                const double w = (double)(E2M1[nib(pr, i + l)] * e8m0(sb));
+                const double w = mx_wflat(nib(pr, i + l), sb, mut);
                 if (mut == M_SEQ) { acc = fma(w, (double)x[i + l], acc); continue; }
                 const int k = lane(l, mut, 16);
                 a[k] = fma(w, (double)x[i + l], a[k]);
@@ -331,7 +421,7 @@ static float ref_mx(int kind, const unsigned char *pr, const unsigned char *sr,
                                   : (q[0] + q[2]) + (q[1] + q[3]);
         }
         for (; i < in; i++)
-            acc = fma((double)(E2M1[nib(pr, i)] * e8m0(sr[i / group])), (double)x[i], acc);
+            acc = fma(mx_wflat(nib(pr, i), sr[i / group], mut), (double)x[i], acc);
         return (float)acc;
     }
     const int ngrp = (in + group - 1) / group;
@@ -391,7 +481,10 @@ static int mx_kind(int group)
 #endif
 }
 
-enum { SC_HUGE, SC_INF, SC_NAN, SC_NAN_TAIL, SC_WIDE, SC_COUNT };
+enum { SC_HUGE, SC_INF, SC_INF_TAIL, SC_NAN, SC_NAN_TAIL, SC_WIDE, SC_LOW, SC_COUNT };
+
+/* Set while main runs checks with FTZ and DAZ on: SC_LOW's expectations depend on it. */
+static int g_ftz = 0;
 
 /* SC_HUGE  HUGE pairs within each group (where the two scales agree), ordinary scales
  *          2^-3..2^3, plus three groups -- the same group index in every row -- that
@@ -406,14 +499,28 @@ enum { SC_HUGE, SC_INF, SC_NAN, SC_NAN_TAIL, SC_WIDE, SC_COUNT };
  * SC_INF   one group per row with scale 253 or 254 and weights that DO overflow to
  *          +inf in float; x is tiny and positive there, so a table that stayed finite
  *          would give a finite row where the right one gives +inf.
- * SC_NAN   scale 255 on one group for every row, with x = +inf at one element of that
- *          group inside the whole 16-element chunks: a skipped chunk contributes
- *          nothing, a zero-weight product would be 0 * inf = NaN.
+ * SC_INF_TAIL  the same in the LAST group, the one holding the in % 16 tail, with the
+ *          overflowing weights only in the tail (the group's whole chunks, if it has
+ *          any, keep |w| <= 1.5 and stay finite): the flat path's scalar tail must fold
+ *          the scale in float too, where a double product would stay finite.
+ * SC_NAN   scale 255 on one group in two rows of every three, with x = +inf at one
+ *          element of that group inside the whole 16-element chunks: a skipped chunk
+ *          contributes nothing, a zero-weight product would be 0 * inf = NaN. The
+ *          pattern puts, among the kernels' row pairs (0,1), (2,3), ..., pairs where
+ *          only the first row has the 255, only the second, and both, so a kernel that
+ *          lets a 255 row through with its partner's decision is caught. A row without
+ *          the 255 has its own non-finite result, which the reference gives too.
  * SC_NAN_TAIL  the same with the +inf in the last in % 16 elements, where the flat
  *          path's scalar tail does NOT skip a 255 group (so those rows are NaN there,
  *          and finite on the grouped paths), and the reference says so.
  * SC_WIDE  one scale per row, drawn from 2^-105..2^105, and the HUGE positions paired
  *          ACROSS groups, so whole group sums cancel in the running total.
+ * SC_LOW   every group's scale 0..3 (0 and 1 make the float weights of codes +-0.5 and
+ *          more SUBNORMAL, 2 and 3 are the smallest normal ones) with x grown by 2^120
+ *          away from the HUGE positions, whose weights are zero, so no accumulator is
+ *          swamped and a subnormal weight flushed or kept moves the float. Under FTZ and
+ *          DAZ this is where a weight formed in double, not flushed as AVX2's float
+ *          multiply flushes it, must show; without them the two agree, and must.
  * HUGE positions outside a pair, and all of them in the three special groups, get
  * weight zero (code 0). */
 static void check_mxfp4(int in, int rows, int group, int scenario)
@@ -427,7 +534,8 @@ static void check_mxfp4(int in, int rows, int group, int scenario)
     if (!pk || !sc || !x || !y || !role) { report(0, "mxfp4 (alloc)"); goto done; }
 
     fill_x(x, in);
-    const int gspec = rndi(0, ngrp - 1);
+    int gspec = rndi(0, ngrp - 1);
+    if (scenario == SC_INF_TAIL) gspec = ngrp - 1;
     const int huge_groups = scenario == SC_HUGE && ngrp >= 4;
     const int ghigh = huge_groups ? 1 : -1, glow = huge_groups ? 2 : -1;
     const int gnan = huge_groups ? 3 : -1;
@@ -437,6 +545,9 @@ static void check_mxfp4(int in, int rows, int group, int scenario)
             if (i / group == ghigh) x[i] = ldexpf(x[i], -120);
             if (i / group == glow)  x[i] = ldexpf(x[i], 120);
         }
+    if (scenario == SC_LOW)
+        for (int i = 0; i < in; i++)
+            if (!is_huge(i)) x[i] = ldexpf(x[i], 120);
     int gnanx = gspec;                            /* the group holding x = +inf */
     if (scenario == SC_NAN) {
         const int at = rndi(0, (in & ~15) - 1);
@@ -454,14 +565,15 @@ static void check_mxfp4(int in, int rows, int group, int scenario)
         for (int j = 0; j < pcols; j++) pr[j] = (unsigned char)(rnd() >> 24);
         const int wide = rndi(22, 232);
         for (int g = 0; g < ngrp; g++)
-            sr[g] = (unsigned char)(scenario == SC_WIDE ? wide : rndi(124, 130));
+            sr[g] = (unsigned char)(scenario == SC_WIDE ? wide
+                                    : scenario == SC_LOW ? rndi(0, 3) : rndi(124, 130));
         /* HUGE pairs with opposite signs: within a group, where the two scales agree,
          * or (SC_WIDE, one scale per row) across groups. */
         pick_pairs(role, in, scenario == SC_WIDE ? 0 : group, 1 + (r & 1));
         for (int i = 0; i < in; i++) {
             if (!is_huge(i)) continue;
             const int g = i / group;
-            const int special = g == ghigh || g == glow || g == gnan;
+            const int special = g == ghigh || g == glow || g == gnan || scenario == SC_LOW;
             if (role[i] == 1 && !special)
                 set_nib(pr, i, (unsigned)rndi(1, 7) | (rnd() & 8u));
             else if (role[i] == 2 && !special && nib(pr, i - 11) != 0)
@@ -482,9 +594,19 @@ static void check_mxfp4(int in, int rows, int group, int scenario)
             sr[gspec] = (unsigned char)(253 + (r & 1));
             for (int i = lo; i < hi; i++) set_nib(pr, i, (unsigned)rndi(4, 7));  /* 2..6 */
         }
-        if (scenario == SC_NAN || scenario == SC_NAN_TAIL) sr[gnanx] = 255;
+        if (scenario == SC_INF_TAIL) {
+            /* Whole chunks: codes 0..3 and 8..11, |w| <= 1.5, finite at 253 and 254.
+             * Tail: 2..6, the last element 4 or 6, which overflow at either scale. */
+            const int lo = gspec * group, n16 = in & ~15;
+            sr[gspec] = (unsigned char)(253 + (r & 1));
+            for (int i = lo; i < in; i++)
+                set_nib(pr, i, i < n16 ? nib(pr, i) & 0xBu : (unsigned)rndi(4, 7));
+            set_nib(pr, in - 1, (unsigned)rndi(6, 7));
+        }
+        if (scenario == SC_NAN && r % 3 != 1) sr[gnanx] = 255;
+        if (scenario == SC_NAN_TAIL) sr[gnanx] = 255;
     }
-    if (scenario == SC_INF) {
+    if (scenario == SC_INF || scenario == SC_INF_TAIL) {
         const int lo = gspec * group, hi = (lo + group < in) ? lo + group : in;
         for (int i = lo; i < hi; i++) x[i] = ldexpf(1.0f, -100);
     }
@@ -504,8 +626,9 @@ static void check_mxfp4(int in, int rows, int group, int scenario)
                                          pr, sr, x, in, group, M_RIGHT));
     }
     static const char *names[] = { "flat", "grouped16", "grouped8" };
-    static const char *scen[SC_COUNT] = { "huge+special", "inf-weight", "nan-scale-skip",
-                                          "nan-scale-tail", "wide-scale" };
+    static const char *scen[SC_COUNT] = { "huge+special", "inf-weight", "inf-weight-tail",
+                                          "nan-scale-skip", "nan-scale-tail", "wide-scale",
+                                          "low-scale" };
     char msg[320];
     snprintf(msg, sizeof msg, "mxfp4 in=%-5d rows=%-4d group=%-2d %-9s %-14s %d/%d rows differ",
              in, rows, group, names[kind], scen[scenario], bad, rows);
@@ -527,12 +650,45 @@ static void check_mxfp4(int in, int rows, int group, int scenario)
         }
         report(ok, msg);
     }
-    if (scenario == SC_INF && kind == MX_FLAT) {  /* grouped paths scale after the sum */
+    if ((scenario == SC_INF || scenario == SC_INF_TAIL) && kind == MX_FLAT) {
+        /* grouped paths scale after the sum, so only the flat path overflows */
         int inf_rows = 0;
         for (int r = 0; r < rows; r++) inf_rows += (y[r] == INFINITY);
-        snprintf(msg, sizeof msg, "      in=%-5d group=%-2d overflowing scale gives +inf in %d/%d rows",
-                 in, group, inf_rows, rows);
+        snprintf(msg, sizeof msg, "      in=%-5d group=%-2d overflowing scale%s gives +inf in %d/%d rows",
+                 in, group, scenario == SC_INF_TAIL ? " in the tail" : "", inf_rows, rows);
         report(inf_rows == rows, msg);
+    }
+    if (scenario == SC_LOW && kind == MX_FLAT) {
+        /* Teeth for the FTZ run, and the reason only it has any: without FTZ every
+         * product here is exact in float too, so the double weights must agree. */
+        int dw = 0;
+        for (int r = 0; r < rows; r++)
+            dw += !same_bits(ref_mx(kind, pk + (size_t)r * pcols, sc + (size_t)r * ngrp,
+                                    x, in, group, M_RIGHT),
+                             ref_mx(kind, pk + (size_t)r * pcols, sc + (size_t)r * ngrp,
+                                    x, in, group, M_DOUBLEW));
+        snprintf(msg, sizeof msg, "      in=%-5d group=%-2d weights formed in double differ in %d/%d rows%s",
+                 in, group, dw, rows, g_ftz ? " (FTZ: at least half must)" : " (none may)");
+        report(g_ftz ? dw * 2 >= rows : dw == 0, msg);
+    }
+    if (scenario == SC_NAN) {
+        /* Every path skips a 255 group's whole chunks, so each row that has one is
+         * finite, whatever its pair partner's scale; and the pattern must have produced
+         * both kinds of mixed pair, or this proves nothing about them. */
+        int nan_rows = 0, finite = 0, first = 0, second = 0;
+        for (int r = 0; r < rows; r++) {
+            const int has = sc[(size_t)r * ngrp + gnanx] == 255;
+            nan_rows += has;
+            finite += has && isfinite(y[r]);
+            if ((r & 1) == 0 && r + 1 < rows) {
+                const int has1 = sc[(size_t)(r + 1) * ngrp + gnanx] == 255;
+                first += has && !has1;
+                second += !has && has1;
+            }
+        }
+        snprintf(msg, sizeof msg, "      in=%-5d group=%-2d scale 255 beside +inf x skipped in %d/%d rows "
+                 "(mixed pairs %d+%d)", in, group, finite, nan_rows, first, second);
+        report(finite == nan_rows && first > 0 && second > 0, msg);
     }
 done:
     free(pk); free(sc); free(x); free(y); free(role);
@@ -559,6 +715,8 @@ int main(void)
     for (size_t a = 0; a < sizeof din / sizeof din[0]; a++)
         check_dense(din[a], dout[(a * 3) % (sizeof dout / sizeof dout[0])]);
     check_dense(7168, 67);                        /* the trunk's width, exactly */
+    for (int t = 0; t < 8; t++)                   /* x NaN too in every other one */
+        check_nan_rows(din[(size_t)t % (sizeof din / sizeof din[0])] + 40, 66, t & 1);
 
     /* MXFP4: in even (a precondition), groups that take each path on x86 (16, 32, 48,
      * 64 flat; 8, 10, 24, 40 grouped), K3's 3584 and 3072 widths. */
@@ -582,24 +740,37 @@ int main(void)
             check_mxfp4(1066, 9, mgroup[g], SC_NAN_TAIL);   /* 1066 % 16 == 10 */
         }
     }
+    /* The overflowing scale in the last group's in % 16 tail: at group 48 that group
+     * also has two whole chunks, at 16, 32 and 64 it is the tail alone. */
+    for (size_t g = 0; g < sizeof mgroup / sizeof mgroup[0]; g++) {
+        check_mxfp4(1090, 65, mgroup[g], SC_INF_TAIL);      /* 1090 % 16 == 2 */
+        check_mxfp4(1066, 66, mgroup[g], SC_INF_TAIL);      /* 1066 % 16 == 10 */
+        check_mxfp4(1090, 64, mgroup[g], SC_LOW);
+    }
 
 #if defined(__AVX2__)
     /* The same order under flush-to-zero and denormals-are-zero. The engine never sets
      * them, but a host built with -ffast-math does (crtfastmath), and the AVX-512 MXFP4
      * table is built so that it still agrees with AVX2 there: scale bytes 0 and 1, whose
      * float weights are subnormal, go through the float multiply AVX2 uses rather than
-     * the exact double one, and flush the same way. rows <= 64 keeps these calls on this
-     * thread, the only one whose MXCSR is changed. */
+     * the exact double one, and flush the same way; SC_LOW is the data on which a
+     * double weight would show (SC_HUGE's LOW group alone is mostly swamped). rows <= 64
+     * keeps these calls on this thread, the only one whose MXCSR is changed. */
     {
         const unsigned csr = _mm_getcsr();
         _mm_setcsr(csr | 0x8040u);                /* FTZ (bit 15) | DAZ (bit 6) */
+        g_ftz = 1;
+        printf("  -- FTZ and DAZ set --\n");
         for (size_t g = 0; g < 4; g++) {          /* the flat-path groups */
             check_mxfp4(3584, 64, mgroup[g], SC_HUGE);
             check_mxfp4(1090, 33, mgroup[g], SC_HUGE);
+            check_mxfp4(3584, 64, mgroup[g], SC_LOW);
+            check_mxfp4(1090, 33, mgroup[g], SC_LOW);
         }
         check_dense(7168, 64);
+        g_ftz = 0;
         _mm_setcsr(csr);
-        printf("  (the nine checks above ran with FTZ and DAZ set)\n");
+        printf("  -- FTZ and DAZ cleared --\n");
     }
 #endif
 
