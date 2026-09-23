@@ -306,6 +306,42 @@ void k3_bind_free(K3LayerBind *b)
     memset(b, 0, sizeof *b);
 }
 
+int k3_bind_layer_stream(const K3Cfg *c, int L, K3LayerBind *b,
+                         const K3MemSrc *src, K3AcquireWeight acquire, void *ctx,
+                         size_t *small_bytes)
+{
+    memset(b, 0, sizeof *b);
+    b->layer = L;
+    const int mla = k3_is_mla(c, L), dense = k3_is_dense(c, L);
+    Plan p; memset(&p, 0, sizeof p);
+    p.narrow_ok = 1;
+    plan_layer(&p, c, L, b, mla, dense);
+    if (p.bad) return -1;
+    size_t small = 0;
+    for (int i = 0; i < p.n; i++) {
+        Req *q = &p.r[i];
+        int64_t off = 0, nb = 0; int dt = 0;
+        if (src->find(src->ctx, q->name, &off, &nb, &dt) || off < 0 || nb <= 0 ||
+            (dt != K3_DT_BF16 && dt != K3_DT_F32)) return -1;
+        const int esz = dt == K3_DT_BF16 ? 2 : 4;
+        if (nb % esz || nb / esz != q->want || q->take < 0 ||
+            q->take > nb / esz || (uint64_t)q->take > SIZE_MAX / 4) return -1;
+        if (!q->narrow) {
+            const size_t bytes = (size_t)q->take * 4;
+            if (small > SIZE_MAX - 7 || align8(small) > SIZE_MAX - bytes) return -1;
+            small = align8(small) + bytes;
+        }
+        if (acquire && acquire(ctx, off, nb, dt, q->take, q->narrow, q->dest))
+            return -1;
+    }
+    b->kda.wdt = b->mla.wdt = b->moe.wdt = b->lay.wdt = K3_WSTREAM;
+    b->lay.kda = mla ? NULL : &b->kda;
+    b->lay.mla = mla ? &b->mla : NULL;
+    b->lay.moe = dense ? NULL : &b->moe;
+    if (small_bytes) *small_bytes = small;
+    return 0;
+}
+
 /* ------------------------------------------------- binding from a memory buffer */
 
 size_t k3_bind_widen_bytes(const K3Cfg *c)

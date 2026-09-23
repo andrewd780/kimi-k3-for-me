@@ -132,6 +132,53 @@ class OfflineCliTests(unittest.TestCase):
                         self.env = old_env
                     self.assert_same(base, piped_env)
 
+    def test_trunk_rows_all_logits_and_bounded_buffers(self):
+        for trunk in (self.trunk, self.ztrunk):
+            for mode in ([], ["--incremental"], ["--incremental", "--kv-latent"]):
+                with self.subTest(trunk=trunk, mode=mode):
+                    args = ["--ids", "3,7,11", "--trunk", trunk, "--trunk-gb", "0.00005", *mode]
+                    baseline = self.run_cli(self.selective, args)
+                    rows = self.run_cli(self.selective, [*args, "--trunk-rows", "--expert-pipeline"])
+                    self.assert_same(baseline, rows)
+                    self.assertTrue(rows[0]["trunk_rows"])
+                    self.assertEqual(rows[0]["trunk_ring_slots"], 2)
+                    self.assertGreater(rows[0]["trunk_matrix_calls"], 0)
+                    self.assertLess(rows[0]["trunk_row_buffer_bytes"] +
+                                    rows[0]["trunk_small_buffer_bytes"], 50000)
+
+    def test_trunk_rows_invalid_mode_is_refused_before_loading(self):
+        result = self.run_cli("absent", ["--ids", "1", "--trunk-rows"], ok=False)
+        self.assertIn("--trunk-rows needs --trunk", result.stderr)
+
+    def test_trunk_rows_under_cgroup_cap(self):
+        if os.environ.get("K3_CGROUP_TEST") != "1":
+            self.skipTest("requires the Linux CI cgroup gate")
+        cap = 64 << 20
+        output, logits = self.path / "rows.json", self.path / "rows.f32"
+        limits = self.path / "rows-cgroup.json"
+        command = [str(self.binary), str(self.selective), "--ids", "3,7,11", "--gen", "2",
+                   "--incremental", "--cache-gb", "0.0001", "--trunk", str(self.ztrunk),
+                   "--trunk-gb", "0.00005", "--trunk-rows", "--out", str(output),
+                   "--dump-logits", str(logits)]
+        process = subprocess.run([
+            "sudo", "-n", "systemd-run", "--quiet", "--wait", "--pipe", "--collect",
+            f"--unit=k3-rows-{os.getpid()}", f"--property=MemoryMax={cap}",
+            "--property=MemorySwapMax=0", "--property=MemoryAccounting=yes",
+            "--setenv=OMP_NUM_THREADS=2", "--setenv=K3_NOHUGE=1",
+            sys.executable, str(ROOT / "tools/cgroup_probe.py"), "--limit", str(cap),
+            "--report", str(limits), "--", *command],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        report = json.loads(output.read_text())
+        group = json.loads(limits.read_text())
+        self.assertEqual(group["memory_max_bytes"], cap)
+        self.assertEqual(group["memory_swap_max_bytes"], 0)
+        self.assertLessEqual(group["memory_peak_bytes"], cap)
+        self.assertEqual(group["events"]["oom"], 0)
+        self.assertEqual(report["layers_completed"], 13)
+        baseline = self.run_cli(self.plain, ["--ids", "3,7,11", "--incremental"])
+        self.assert_same(baseline, (report, logits.read_bytes()))
+
     def test_native_score_primitive_on_synthetic_logits(self):
         # Does not invoke the corpus harness or produce a K3 quality measurement.
         # Compare the new native score path to ordinary prefix logits of this toy.

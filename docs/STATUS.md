@@ -1,8 +1,9 @@
 # Where everything stands
 
 *Plain-language status of this fork, written for the project owner. Last updated
-2026-09-14 with pull request #8. Every number links to the file it
-was measured in. Engineering priorities stay in [ROADMAP.md](ROADMAP.md).*
+2026-09-20 with merged work through #10 and the under-review experiments in
+[PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12). Measurements and
+projections are distinguished below. Engineering priorities stay in [ROADMAP.md](ROADMAP.md).*
 
 ## The short version
 
@@ -14,8 +15,9 @@ proven by tests that run in seconds with no weights (`make test`), by the
 
 **It is slow, and the model is enormous on disk.** The released checkpoint is
 1.56 TB. At 8 GB of RAM the measured speed was 32.7 seconds per token, on a rented
-124-core server with a fast NVMe ([environment](data/environment.txt)). On the 8 GB
-Jetson it was about 16 minutes per token. The best measured full-model speed on that
+124-core server with a fast NVMe ([environment](data/environment.txt)). The Jetson's
+949-second run includes a five-token prompt prefill; it is not an isolated decode
+estimate for a Mac. The best reported full-model speed on that
 same rental, with memory allocated well rather than at the 8 GB floor, is **10.66
 seconds per token in sustained decode, at 127.9 GB peak RSS**
 ([README](../README.md), [PERFORMANCE.md](PERFORMANCE.md#longer-runs-are-faster)). A
@@ -23,22 +25,17 @@ laptop with 8 to 12 cores is expected to be slower than the server, because comp
 rather than disk becomes the limit there. That expectation is an estimate; it has not
 been measured.
 
-**Full quality at 20 to 50 tokens per second.** No Mac configuration reaches that,
-at any price. Four 512 GB M3 Ultra Studios pipelined across the layers project to
-about 6 tokens/second for a single stream; splitting the model across them with
-tensor parallelism instead projects to about 12 to 16. Both are estimates, not
-measurements, and both are short of 20. Only a data-center node that holds the whole
-model in fast accelerator memory gets there. An 8 GB Mac can only be a *client* of
-such a node, never the machine doing the work; see
-[notes/remote-k3.md](notes/remote-k3.md) for what that costs today.
+**No demonstrated path here reaches 20 to 50 tokens per second on Andrew's Macs.**
+Server-to-Mac core-count scaling and multi-machine projections are not benchmarks.
+The engine's actual Mac speed remains unmeasured. A remote service is a different
+deployment choice and does not satisfy offline inference.
 
-**No lossless trick gets it under 200 GB, or even under 1 TB.** Every compression
-route was measured or argued to the end. The best lossless result leaves about
-1.49 TB ([bounds](measurements/streaming-bounds.json)). A 200 GB model would need
-0.42 bits per parameter on average, and the released weights already sit at 4.25.
-Below one bit per parameter, weights must share codes, which is the same thing as
-removing parameters, which is a different model. A different model needs a quality
-evaluation, and the harness for that exists now but has never been run on K3.
+**No implemented technique demonstrates storage below 1 TB, let alone 200 GB.**
+Selective scale compression projects about 1.49 TB
+([bounds](measurements/streaming-bounds.json)). The new small trunk-codec samples
+are not a full-checkpoint result. Compression samples do not prove every future
+lossless method impossible. A lossy change still needs real quality evaluation;
+the harness exists but has never been run on K3.
 
 **Neither of Andrew's Macs can hold the checkpoint at all.** The M1 Air has a 256 GB
 disk and the M4 Max has about 90 GB free. Disk, not RAM, is the first wall. A 2 TB
@@ -50,7 +47,7 @@ gives is unmeasured.
 | | GB |
 |---|---:|
 | Released checkpoint | 1,560 |
-| After every lossless trick measured so far (projection) | 1,488 |
+| After selective scale compression (sample-based projection) | 1,488 |
 | M1 Air disk, total | 256 |
 | The goal | 200 |
 | M4 Max free space | 90 |
@@ -58,9 +55,9 @@ gives is unmeasured.
 The context window has its own, separate cost. The attention cache is stored
 **expanded**, in fp32, across the 24 MLA layers: 2.37 MB per position, which is
 19.38 GB of cache at an 8,192-token context, read again every token
-([README](../README.md)). A latent cache, `--kv-latent`, is in progress and would
-remove most of that by keeping the cache compressed instead of expanding it; see the
-[proposed techniques](#proposed-not-started) below.
+([README](../README.md)). The merged opt-in `--kv-latent` reduces this allocation
+by keeping latent values and rebuilding keys/values on use. It adds matrix work;
+its full-model latency is unmeasured. See the shipped row below.
 
 ## Every technique, where it stands
 
@@ -75,7 +72,7 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 |---|---|---|---|---|
 | Streamed inference engine (upstream) | Reads weights from disk during each token instead of holding the model in RAM | done | 12 memory budgets, one identical token sequence, 33% run-to-run speed noise ([ladder](data/memory-ladder.tsv), [noise](data/replication.tsv)) | Re-run with 3 repeats; needs a checkpoint host |
 | Trunk read-ahead ring (upstream) | Reads the next layer while the current one computes | done | 1.70x measured on the campaign host | At 8 GB only one slot fits, so the overlap is lost there |
-| Hybrid draft decode, `--draft-trunk` (upstream) | A cheaper copy proposes tokens; the exact model verifies them | done, but slower unless the draft fits in RAM (64 GB and up) | One real flight accepted 66.7% of drafts ([note](notes/int8-draft-container.md)) | Int8 container never built; irrelevant on a small laptop |
+| Hybrid draft decode, `--draft-trunk` (upstream) | A cheaper copy proposes tokens; the exact model verifies them | built; negative streaming result | The int8 container and kernel were built; streaming routed experts made the draft slower ([note](notes/int8-draft-container.md)) | Draft agreement with a verifier is not main-model quality validation |
 | Offline lossless archives, K3ZSTD1 (#1) | Compressed weights the engine reads directly, no network | done, opt-in | Native tests; 32 real samples ([doc](OFFLINE_STORAGE.md)) | Experts shrink only 5.7%, so not a route to a smaller model |
 | Prompt rereading (#1) | Processes the prompt twice before generating | done, exact | CLI tests | Nothing |
 | Calibrated expert pinning (#2, #4) | Keeps the most-used experts resident | done, opt-in; **negative** | Held-out replay saves 0.44% of expert reads at 8 GB; the earlier 36% hit rate was an artifact of repeated prompts ([doc](EXPERT_PROFILES.md)) | Dead as a speed lever |
@@ -85,6 +82,7 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Selective scale archives, K3ZMAP1 (#6) | Compresses only the 5.9% of expert bytes that compress (the scales) and reads the rest raw | done, opt-in | 24 storage tests, sanitizers, synthetic CLI parity ([doc](SELECTIVE_SCALES.md)) | Saves 0.95% of bytes per token; unmeasured on the real model |
 | Direct I/O for selective raw extents (#8) | Reads the raw parts of a selective archive past the page cache, the way plain shards are read | done | Native test proves the direct path is taken and falls back cleanly; bytes identical | Speed unmeasured on the real model |
 | Known-route expert pipelining, `--expert-pipeline` (#9) | Publishes each routed expert as its read lands instead of waiting for the whole top-k | done, opt-in | Native pipeline-mode cases plus sanitizers; CLI parity for full recompute and `--incremental` at pool sizes 1 and 16 ([note](notes/expert-pipeline.md)) | Speed unmeasured on the real model |
+| MLA latent KV cache, `--kv-latent` (#10) | Keeps the attention cache in its 512-wide latent form and rebuilds keys and values on use: 55 KB per position instead of 2.37 MB, 42.8x less | done, opt-in | GATE 3b holds all 20 incremental steps bit-identical between layouts; state save/load round-trips; 20 CI checks green ([note](notes/kv-latent.md)) | Costs one kv_b matmul per cached position per use; speed unmeasured on the real model |
 
 ### Measured, no new code
 
@@ -100,17 +98,19 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 
 | Technique | What it would do | Status | Why it closed | What would reopen it |
 |---|---|---|---|---|
-| Huffman-coded trunk (upstream) | A 1.45x smaller trunk, lossless | shelved | Decoder ran at 0.31 GB/s per core; a laptop SSD would need about 10 cores decoding ([note](notes/compressed-trunk.md)) | A small decoder above 1 GB/s per core |
+| Huffman-coded trunk (upstream) | Smaller byte-identical trunk | old prototype shelved; new decoder experiment built in #12 | Historical single-stream decoder was too slow; new x86/ARM range benchmarks explicitly report reconstructed BF16 GB/s ([results](notes/research-results.md)) | Supported container/reader and concurrent-compute gate; kernel speed alone is insufficient |
 | Expert pruning (studied) | Drop rarely used experts | dead | Held-out coverage plateaus at 35%; usage is deliberately flattened by the router | It changes the model, so the quality harness first |
 | Shared base plus low-rank delta (studied, closed PR #3) | Store one expert per layer plus small differences | dead on paper | Needs 0.99 correlation between experts; real expert weights look random. The write-up itself had errors and was closed unmerged | Kept only at PR #3 for the record |
 | Int8 trunk as the main model (upstream note) | Halve the trunk by rounding | not validated | The 90.9% figure was a 22-token draft with the exact model verifying, not a quality result | A real quality evaluation |
 
-### Proposed, not started
+### New research, under review
 
 | Technique | What it would do | Status | What is known | Size of the job |
 |---|---|---|---|---|
-| Asymmetric trunk ring or row tiles (#6 map) | Smaller trunk buffers so read-ahead survives at 8 GB | proposal | Pairwise arithmetic only; needs a 93-layer wraparound proof | Large exact change |
-| MLA latent KV cache, `--kv-latent` | Keep the attention cache in its compressed latent form instead of expanding it, removing most of the 2.37 MB/position, 19.38 GB/8K-context cost | done, opt-in (`--kv-latent`) | n/a yet | Exact change across the 24 MLA layers |
+| Bounded trunk rows | Overlaps matrix-row reads and exact compute with two small buffers | implemented, opt-in `--trunk-rows` in #12 | 93-layer wraparound, sanitizer, CLI logit and capped-allocation gates ([results](notes/research-results.md)) | Real speed unmeasured; prefill and latent-cache rereads can hurt |
+| Next-layer expert prefetch | Would predict upcoming routes; true routing still decides computation | paused at gate 1; diagnostic only in #12 | Synthetic validation only; [audit](notes/predictive-prefetch-gates.md) records unmeasured k=1/2/4, equal-slot static null and bytes/decode token | Needs real generation trajectories; prefix replay is ineligible; no engine predictor |
+| Bounded lookahead verification | Drafts without a matching history suffix | reference and cost gate built in #12 | Exhaustive toy-model exactness; proposal and replay work explicitly charged ([results](notes/research-results.md)) | K3 acceptance and state integration blocked; `--spec` unchanged |
+| io_uring reads | Linux asynchronous read submission | standalone experiment built in #12 | Three runs per arm at five queue depths; noisy overlapping timings, no consistent meaningful gain ([results](notes/research-results.md)) | No engine backend replacement justified |
 | Speculative decoding on resident hardware | A cheap draft proposes tokens, the exact model verifies; ~1.7x fewer weight bytes per accepted token at the measured 66.7% acceptance ([note](notes/int8-draft-container.md)) | proposal | Only pays off once the model is resident in RAM; nothing on 8 GB, where both draft and exact stream from disk | Needs a large-memory host to pay for |
 | Chunked prefill, sampling, chat template, vision, HTTP serving | Usability features from the upstream roadmap | not started | n/a | Do not change size or speed |
 
@@ -122,23 +122,24 @@ since the rental. Doing it needs roughly 3 TB of NVMe and hours to download 1.56
 Each quality window reads about 1.4 TB, so a 10,000-token corpus is on the order of
 a day of disk time.
 
-## Three decisions
+## Next decisions
 
 1. **Organization, now.** Delete the merged branches (each merged pull request page
    has a "Delete branch" button) and turn on *Settings, General, Pull Requests,
    Automatically delete head branches* so this stops recurring.
 2. **Checkpoint-free engineering, in order of value per risk.** The lint findings
    and direct I/O for selective raw extents landed in #8; known-route expert
-   pipelining landed in #9. Next is the asymmetric trunk ring, which can also be
-   built and gated in CI without the checkpoint.
+   pipelining landed in #9; the latent KV cache landed in #10. The ranked list of
+   current state is [notes/research-queue.md](notes/research-queue.md). #12 implements
+   bounded trunk rows and gives the four other proposals executable research gates.
+   Read the measured results before selecting further integration work.
 3. **The rental remains the only way to measure.** Everything marked blocked needs one
    machine with the checkpoint for a day or two. Without it there will never be a
    laptop speed or quality number; with it, one core-limited ladder run answers the
    decisive question.
-4. **Remote K3 or not.** Full quality at 20 to 50 tokens/second is not a laptop
-   outcome at any price; it needs a data-center node or Moonshot's own API. See
-   [notes/remote-k3.md](notes/remote-k3.md) for the real prices found and what each
-   route costs the project owner in money versus engineering time.
+4. **Remote K3 or not.** Remote serving changes the offline requirement. Its
+   feasibility and current cost are a separate decision; no remote service is
+   provisioned by this work.
 
 ## Where things live
 
