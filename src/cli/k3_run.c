@@ -197,9 +197,12 @@ static void k3_state_fp(const K3Cfg *c, int32_t *fp)
 #define K3_SPEC_MAX 8
 
 /* Positions whose logits one lm_head pass serves when a run needs EVERY position's logits
- * (--tf-check, --score-prompt; --spec verification needs K3_SPEC_MAX + 1). One pass of
- * the batched kernel covers 16 positions at hidden 7168 (see k3_mm_pass in k3_ops.c), so
- * a larger block would buy no fewer passes; the buffer is 16 x vocab floats, 10.5 MB. */
+ * (--tf-check, --score-prompt, and a --spec verify sweep of spec_n + 1 <= K3_SPEC_MAX + 1
+ * positions). One pass of the batched kernel covers 16 positions at hidden 7168 (see
+ * k3_mm_pass in k3_ops.c), so for a resident head a larger block would buy no fewer
+ * passes. A streamed head (--stream-lm-head, --ultra-low-memory) is read from disk once
+ * per block, 16x less than once per position; a larger block would cut that further but
+ * costs a vocab row (0.66 MB) per position, and 16 keeps the buffer at 10.5 MB. */
 #define K3_LOGIT_ROWS 16
 /* Longest-suffix n-gram drafting for --spec: if the last n ids (n=3, then 2) already
  * appeared earlier in the sequence, propose the ids that followed them there. Costs
@@ -626,8 +629,9 @@ typedef struct {
  * what batched greedy verification consumes. logits_last still gets the final position's
  * full vector either way. The extra cost is lm_head applied to the additional positions,
  * which with a logit block is one pass over the head per block of positions rather than
- * one per position (the ~22% of a serial token per extra verified position measured at
- * streamed-trunk budgets predates that and was mostly this head traffic). */
+ * one per position. (The ~22% of a serial token per extra verified position once measured
+ * at streamed-trunk budgets predates batching the trunk matrices and the head over
+ * positions; it needs remeasuring.) */
 static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
                    float *logits_last, float *scratch, float *h, float *br, float *kstate,
                    int *arg_all)
@@ -1373,9 +1377,11 @@ int main(int argc, char **argv)
     /* Runs that need every position's logits project them a block at a time: see
      * K3_LOGIT_ROWS and forward(). Sized here so the memory plan below counts it. */
     int logit_rows = 1;
-    if (tf_check)                    logit_rows = np < K3_LOGIT_ROWS ? np : K3_LOGIT_ROWS;
-    else if (score_prompt)           logit_rows = np - 1 < K3_LOGIT_ROWS ? np - 1 : K3_LOGIT_ROWS;
-    else if (spec_n > 0 || draft_dir) logit_rows = K3_SPEC_MAX + 1;
+    if (score_prompt)    logit_rows = np - score_start;   /* the positions scored       */
+    else if (tf_check)   logit_rows = np;                 /* every position             */
+    else if (spec_n > 0) logit_rows = spec_n + 1;         /* one verify sweep; a draft
+                                                           * trunk has set spec_n above */
+    if (logit_rows > K3_LOGIT_ROWS) logit_rows = K3_LOGIT_ROWS;
     if (logit_rows < 1) logit_rows = 1;
 
     /* Add up EVERYTHING before allocating anything. Being OOM-killed halfway through
@@ -2181,7 +2187,8 @@ int main(int argc, char **argv)
                 "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
                 "\"spec_full_accepts\":%ld,\"spec_partial_accepts\":%ld,"
                 "\"spec_cut_by_stop\":%ld,\"spec_dropped_positions\":%ld,"
-                "\"spec_log_bytes\":%.0f,\"draft_forward_sweeps\":%ld,"
+                "\"spec_log_bytes\":%.0f,\"logit_block_bytes\":%.0f,"
+                "\"draft_forward_sweeps\":%ld,"
                 "\"draft_accepted\":%ld,\"draft_dropped_positions\":%ld,"
                 "\"spec_trace\":[",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
@@ -2202,7 +2209,9 @@ int main(int argc, char **argv)
                 (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0), stopped_at,
                 steps, w.forwards, spec_n, spec_sweeps, spec_drafted, spec_accepted,
                 spec_full, spec_partial, spec_cut, spec_dropped,
-                spec_log_bytes, dw.forwards, hyb_accepted, draft_dropped);
+                spec_log_bytes,
+                (double)sizeof(float) * (w.logit_block ? (double)w.logit_rows * c.vocab : 0.0),
+                dw.forwards, hyb_accepted, draft_dropped);
         for (long i = 0; i < spec_sweeps && i < gen + 1; i++)
             fprintf(f, "%s[%d,%d,%d]", i ? "," : "", spec_trace[3 * i],
                     spec_trace[3 * i + 1], spec_trace[3 * i + 2]);

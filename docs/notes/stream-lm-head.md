@@ -7,7 +7,11 @@ state-reuse policy. No tensor format or model weights change.
 
 The released BF16 lm_head is 2,348,810,240 bytes. Streaming replaces that resident
 table with a 4,202,496-byte I/O buffer, releasing 2,344,607,744 bytes. It also reads
-the lm_head again for every projected position. Those are geometry and mechanism
+the lm_head again for every forward that projects logits: once per decode step and once
+per `--spec` verify sweep, whose positions are projected together from each chunk read
+(`k3_model_stream_project_batch`), and once per block of up to 16 positions for
+`--tf-check` and `--score-prompt`, which need every position's logits. Each position's
+logits are bit-identical to projecting it alone. Those are geometry and mechanism
 calculations, not measured full-model memory or throughput results.
 
 Fixed presets and explicit `--trunk-gb` values stay explicit. The flag alone frees

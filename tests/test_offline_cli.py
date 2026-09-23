@@ -248,6 +248,60 @@ class OfflineCliTests(unittest.TestCase):
                                            "--draft-trunk", "absent"], ok=False)
         self.assertIn("--stream-lm-head does not yet support --draft-trunk", refused.stderr)
 
+    def run_teacher_forced(self, model, args):
+        """A --score-prompt or --tf-check run: (its JSON, its stdout)."""
+        self.counter += 1
+        out = self.path / ("tf%d.json" % self.counter)
+        process = subprocess.run([str(self.binary), str(model), "--cache-gb", "0.0001",
+                                  "--out", str(out), *map(str, args)],
+                                 capture_output=True, text=True, errors="replace",
+                                 env=self.env, timeout=60)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        return json.loads(out.read_text()), process.stdout
+
+    def test_all_position_logits_in_blocks_match_one_position(self):
+        # --score-prompt and --tf-check need every position's logits, and project them
+        # through lm_head a block of up to 16 positions per pass (k3_mmw_batch, or one
+        # streamed pass over the head per block under --stream-lm-head). A run that scores
+        # ONE position takes the one-position projection, so each NLL of a 40-id run
+        # (positions 0..38, blocks 0-15, 16-31, 32-38) must equal that run's to the last
+        # bit of the printed double, and each --tf-check prediction must be the greedy
+        # next id of that prefix. Positions sit on both sides of each block boundary.
+        rnd = random.Random(11)
+        ids = [rnd.randrange(256) for _ in range(40)]
+        probe = (0, 1, 14, 15, 16, 17, 31, 32, 33, 38)
+        heads = ((self.plain, []),
+                 (self.packed, ["--trunk", self.ztrunk, "--trunk-gb", "0.001",
+                                "--stream-lm-head"]))
+        predictions = []
+        for model, head in heads:
+            with self.subTest(head=head):
+                full, _ = self.run_teacher_forced(model, ["--score-prompt", "--ids",
+                                                          ",".join(map(str, ids)), *head])
+                self.assertEqual(full["scored_tokens"], len(ids) - 1)
+                for i in probe:
+                    one, _ = self.run_teacher_forced(model, [
+                        "--score-prompt", "--ids", ",".join(map(str, ids[:i + 2])),
+                        "--score-start", str(i + 1), *head])
+                    self.assertEqual(one["token_nll"], [full["token_nll"][i]], "position %d" % i)
+                tf, text = self.run_teacher_forced(model, ["--tf-check", "--ids",
+                                                           ",".join(map(str, ids)), *head])
+                # Only mismatches are printed, as [i p=predicted a=actual].
+                predicted = ids[1:]
+                line = next(x for x in text.splitlines() if "per-position" in x)
+                for item in line.split("[")[1:]:
+                    i, p, _ = item.split()
+                    predicted[int(i)] = int(p[2:])
+                self.assertEqual(tf["tf_matches"],
+                                 sum(p == a for p, a in zip(predicted, ids[1:])))
+                predictions.append(predicted)
+        self.assertEqual(len(predictions), 2, "a head mode failed above")
+        self.assertEqual(predictions[0], predictions[1])
+        for i in probe:
+            report, _ = self.run_cli(self.plain, ["--ids", ",".join(map(str, ids[:i + 1])),
+                                                  "--gen", "1"])
+            self.assertEqual(report["generated_ids"], [predictions[0][i]], "position %d" % i)
+
     def test_lm_head_ring_under_cgroup_cap(self):
         if os.environ.get("K3_CGROUP_TEST") != "1":
             self.skipTest("set K3_CGROUP_TEST=1 on a Linux CI runner with sudo/systemd")
@@ -644,10 +698,14 @@ class OfflineCliTests(unittest.TestCase):
                                                                self.SPEC + 1])
                 self.assertEqual(serial[0]["decode_steps"], 12)
                 self.assertEqual(serial[0]["spec_log_bytes"], 0)
-                # The plan counts exactly what --spec allocates, and nothing more.
+                # The plan counts exactly what --spec allocates, and nothing more: the
+                # rollback log, and the block a verify sweep's SPEC + 1 logit vectors are
+                # projected into with one pass over lm_head.
                 self.assertGreater(report["spec_log_bytes"], 0)
+                self.assertEqual(serial[0]["logit_block_bytes"], 0)
+                self.assertEqual(report["logit_block_bytes"], (self.SPEC + 1) * 256 * 4)
                 self.assertEqual(report["memory_plan_bytes"] - serial[0]["memory_plan_bytes"],
-                                 report["spec_log_bytes"])
+                                 report["spec_log_bytes"] + report["logit_block_bytes"])
                 seen.update("full" if s[1] == s[0] else "partial%d" % s[1]
                             for s in report["spec_trace"])
         self.assertTrue({"partial0", "partial1", "partial2", "partial3", "full"} <= seen, seen)
@@ -674,6 +732,26 @@ class OfflineCliTests(unittest.TestCase):
                     self.assert_no_replay(spec[0])
                     self.assertEqual(spec[0]["spec_trace"][0],
                                      [self.SPEC, accept, accept + 1])
+
+    def test_streamed_head_is_read_once_per_verify_sweep(self):
+        # A sweep needs the logits of every position it verifies. Under --stream-lm-head
+        # they are projected together (k3_model_stream_project_batch), so a sweep streams
+        # the head from disk exactly once, like a one-position step, where it used to
+        # stream it once per verified position.
+        prompt, _ = self.crafted(2, True)
+        args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", "12",
+                "--trunk", self.ztrunk, "--trunk-gb", "0.001", "--stream-lm-head"]
+        serial = self.run_logits(self.packed, args)
+        spec = self.run_logits(self.packed, [*args, "--spec", str(self.SPEC)])
+        self.assert_same_run(serial, spec)
+        self.assert_no_replay(spec[0])
+        self.assertEqual(spec[0]["spec_trace"][:2], [[self.SPEC, 2, 3],
+                                                     [self.SPEC, self.SPEC, self.SPEC + 1]])
+        per_forward = serial[0]["lm_head_bytes_read"] // serial[0]["forward_sweeps"]
+        self.assertGreater(per_forward, 0)
+        self.assertEqual(serial[0]["lm_head_bytes_read"],
+                         per_forward * serial[0]["forward_sweeps"])
+        self.assertEqual(spec[0]["lm_head_bytes_read"], per_forward * spec[0]["forward_sweeps"])
 
     def test_spec_saved_state_is_the_serial_state(self):
         # --save-state after a sweep must write what serial decode writes at the same

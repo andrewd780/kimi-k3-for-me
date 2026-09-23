@@ -17,6 +17,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   T == 1 takes the existing kernel. `k3_moe_scratch` now takes T. Gated bitwise by
   `test_ops` on cancelling inputs that expose a wrong summation order, by the oracle's
   GATE 3c, and by a rows-mode byte-count check in `test_offline_cli.py`.
+- **lm_head batched over positions** where a forward needs every position's logits:
+  a `--spec` verify sweep projects its positions in one pass over the head, and
+  `--tf-check` / `--score-prompt` in blocks of up to 16, through `k3_mmw_batch`, or
+  under `--stream-lm-head` through `k3_model_stream_project_batch`, which reads each
+  chunk of the head once per block instead of streaming the 2.35 GB head once per
+  position. Every logit is bit-identical to the one-position projection; the block
+  (10.5 MB at most on K3) is counted in the memory plan and reported as
+  `logit_block_bytes`. `test_offline_cli.py` checks NLLs and `--tf-check`
+  predictions on both sides of each block boundary against one-position runs, and
+  that a streamed-head verify sweep reads the head exactly once.
 - **Fixed-width trunk dictionary gates** (benchmark-only, not in inference): a
   4-bit high-byte index into one pooled 15-entry table with an escape code, the
   low byte raw, decoded by SSSE3 `pshufb` / NEON `tbl`. The eight-range histogram
