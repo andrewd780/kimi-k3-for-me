@@ -343,6 +343,78 @@ static void t_recur(const char *dir, const char *file)
     free(txt); free(ar);
 }
 
+/* The router as it was written before experts were interleaved: one expert at a time,
+ * one double chain over i = 0..hidden-1. Kept verbatim as the bitwise reference. */
+static void router_plain(int *idx, float *w, const float *x, const float *W,
+                         const float *bias, int hidden, int n_experts, int topk,
+                         int renorm, float routed_scale)
+{
+    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
+    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
+    if (!score || !choice) { free(score); free(choice); return; }
+    for (int e = 0; e < n_experts; e++) {
+        const float *row = W + (size_t)e * hidden;
+        double acc = 0.0;
+        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
+        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
+        choice[e] = score[e] + (bias ? bias[e] : 0.0f);
+    }
+    for (int j = 0; j < topk; j++) {
+        int best = -1; float bv = -INFINITY;
+        for (int e = 0; e < n_experts; e++)
+            if (choice[e] > bv) { bv = choice[e]; best = e; }
+        if (best < 0) { idx[j] = 0; w[j] = 0.0f; continue; }
+        idx[j] = best; w[j] = score[best]; choice[best] = -INFINITY;
+    }
+    if (renorm && topk > 1) {
+        double s = 0.0;
+        for (int j = 0; j < topk; j++) s += (double)w[j];
+        const float inv = (float)(1.0 / (s + 1e-20));
+        for (int j = 0; j < topk; j++) w[j] *= inv;
+    }
+    for (int j = 0; j < topk; j++) w[j] *= routed_scale;
+    free(score); free(choice);
+}
+
+static int router_matches_plain_form(void)
+{
+    const int shapes[][3] = {           /* n_experts, hidden, topk */
+        {1, 33, 1}, {7, 64, 3}, {8, 130, 2}, {9, 257, 4}, {17, 1000, 16}, {896, 7168, 16}
+    };
+    int ok = 1;
+    unsigned s = 20260922u;
+    for (size_t c = 0; c < sizeof shapes / sizeof *shapes; c++) {
+        const int E = shapes[c][0], H = shapes[c][1], K = shapes[c][2];
+        float *W = (float *)malloc((size_t)E * H * sizeof(float));
+        float *x = (float *)malloc((size_t)H * sizeof(float));
+        float *b = (float *)malloc((size_t)E * sizeof(float));
+        int   ia[64], ib[64];
+        float wa[64], wb[64];
+        if (!W || !x || !b) { free(W); free(x); free(b); return 0; }
+        for (size_t i = 0; i < (size_t)E * H; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            W[i] = ((float)(s >> 8) / 8388608.0f - 1.0f) * 0.05f;
+        }
+        for (int i = 0; i < H; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            x[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
+        }
+        for (int e = 0; e < E; e++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            b[e] = ((float)(s >> 8) / 8388608.0f - 1.0f) * 0.01f;
+        }
+        router_plain(ia, wa, x, W, b, H, E, K, 1, 2.5f);
+        k3_router(ib, wb, x, W, b, H, E, K, 1, 2.5f);
+        if (memcmp(ia, ib, (size_t)K * sizeof(int)) != 0 ||
+            memcmp(wa, wb, (size_t)K * sizeof(float)) != 0) {
+            printf("        router blocked form differs at n_experts=%d hidden=%d\n", E, H);
+            ok = 0;
+        }
+        free(W); free(x); free(b);
+    }
+    return ok;
+}
+
 /* Router. The fixture's frozen bias reorders the top-k in 5 of 6 rows, so an engine
  * that ignored e_score_correction_bias, or that gathered the weights from the BIASED
  * scores, fails here rather than silently degrading. Indices are compared as SETS
@@ -386,13 +458,28 @@ static void t_router(const char *dir)
                 }
             }
         }
-        if (set_ok && worst_w <= 1.0) {
+        /* k3_router walks experts in interleaved blocks; the fixture's handful of experts
+         * cannot tell that apart from a one-expert-at-a-time loop, and neither can a
+         * tolerance. So the blocked kernel is also held BITWISE to the plain form it
+         * replaced, over expert counts that fill whole blocks, leave a tail, or are
+         * smaller than one block, including the released 896 x 7168.
+         *
+         * What this can and cannot see, from mutants run against it: a block reading the
+         * wrong expert's row FAILS, a tail block that drops its last expert FAILS, and an
+         * accumulator rounded to float per term FAILS. Reversing the order of the double
+         * sum PASSES: a few ulps of double difference almost never cross a float
+         * rounding boundary once the logit is narrowed, which is also why the logit is
+         * robust to it. The claim rests on the per-expert order being unchanged, which
+         * is argued at the kernel, not on this check detecting every reordering. */
+        const int bit_ok = router_matches_plain_form();
+        if (set_ok && worst_w <= 1.0 && bit_ok) {
             printf("  PASS  router         rows=%-4d k=%d  index sets match, "
-                   "worst weight=%.2fx tol\n", rows, K, worst_w);
+                   "worst weight=%.2fx tol, blocked form bitwise\n", rows, K, worst_w);
             g_pass++;
         } else {
-            printf("  FAIL  router         index_sets=%s worst weight=%.2fx tol\n",
-                   set_ok ? "ok" : "MISMATCH", worst_w);
+            printf("  FAIL  router         index_sets=%s worst weight=%.2fx tol "
+                   "blocked=%s\n", set_ok ? "ok" : "MISMATCH", worst_w,
+                   bit_ok ? "bitwise" : "DIFFERS");
             g_fail++;
         }
         free(gi); free(gw);

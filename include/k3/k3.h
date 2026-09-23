@@ -563,6 +563,72 @@ size_t k3_kda_scratch(const K3Cfg *c, int T);
 void   k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                     int T, float *state, float *scratch);
 
+/* ---- tentative sweeps: speculative decode without a replay sweep --------------------
+ * Speculative decode feeds the pending token plus nd drafted tokens through the model in
+ * ONE batch, then keeps only the prefix the model itself would have emitted. Whatever
+ * absorbed the rejected tokens must end up as if they had never been fed.
+ *
+ * MLA needs nothing. Its KV cache is positional: every call writes all of its own rows
+ * before it reads any, and reads only rows at or below its own positions, so rows past the
+ * kept prefix are overwritten by the next call before anything can read them. That holds
+ * for both cache layouts, since the latent layout writes its rows in the same loop.
+ *
+ * KDA is not positional: k3_kda_layer folds every position into the recurrent matrix S
+ * and the ShortConv history in place. What makes it cheap anyway is that the state depends
+ * on each position only through a handful of per-position values:
+ *
+ *   S      k3_kda_step reads, per head, the post-conv L2-normalised k, the post-conv v,
+ *          alpha and beta. q feeds only the output, never S.
+ *   conv   the history is the last conv_k-1 PRE-conv q, k and v inputs; while fewer
+ *          positions than that have been fed, the older ones come from the history the
+ *          sweep started from.
+ *
+ * So a LOGGED call is tentative. It runs on log->work, a one-layer copy of `state`, and
+ * leaves `state` exactly as it found it, while recording those values for each position
+ * as one row of log->rows. Once the caller knows how many positions to keep, it commits
+ * them with k3_kda_advance, which applies the SAME k3_kda_step to the SAME operands in
+ * the SAME order, and copies the right inputs into the history. The committed state is
+ * therefore bit-identical to feeding the kept positions alone, and no weight is read: at
+ * K3 scale the alternative, replaying the accepted positions through a second forward,
+ * re-reads the 108.81 GB trunk and the routed experts. A commit costs O(n * H * D^2)
+ * arithmetic per layer.
+ *
+ * No copy of the whole carried state is ever taken; the recurrence is not invertible in
+ * floating point (undoing the decay would divide), which is why the sweep must not touch
+ * `state` in the first place. The work copy is one layer's state, and one buffer serves
+ * every layer because layers run one after another.
+ *
+ * Several calls can build one log, as a draft model proposing a token at a time does: a
+ * call with row0 > 0 starts from `state` advanced by rows 0..row0-1, replayed into the
+ * work copy, so it computes exactly what it would have computed had the earlier calls
+ * updated `state` in place.
+ *
+ * rows holds cap rows of k3_kda_log_row() floats, P = H*D:
+ *   [0,P) k after conv and L2 norm   [P,2P) v after conv   [2P,3P) alpha
+ *   [3P,3P+H) beta after its sigmoid   then q, k and v BEFORE conv, P each
+ * At K3 size a row is 295,296 bytes per KDA layer, 20.38 MB per position across the 69
+ * KDA layers; the work copy is 6.73 MB. */
+typedef struct {
+    float *rows;    /* cap * k3_kda_log_row() floats, for ONE KDA layer               */
+    float *work;    /* k3_kda_state_floats() floats, never `state` itself; one buffer
+                     * may serve every layer. Unused by k3_kda_advance.                */
+    int    cap;     /* rows `rows` holds; a call's positions past it are not recorded  */
+    int    row0;    /* row this call's first position lands in, 0 <= row0 <= cap      */
+} K3KdaLog;
+
+size_t k3_kda_log_row(const K3Cfg *c);       /* floats per position per KDA layer     */
+size_t k3_kda_state_floats(const K3Cfg *c);  /* floats of one KDA layer's `state`     */
+
+/* k3_kda_layer as a tentative call when log is non-NULL: same output bits, `state` left
+ * untouched, positions recorded from row log->row0. state may be NULL (zero history). */
+void   k3_kda_layer_log(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
+                        int T, float *state, float *scratch, const K3KdaLog *log);
+
+/* Commit the first n recorded rows: advance `state` in place exactly as feeding those n
+ * positions would have. 0 <= n <= log->cap, rows 0..n-1 must have been recorded by calls
+ * made while `state` held its current value, and log->work is not used. */
+void   k3_kda_advance(float *state, const K3KdaLog *log, int n, const K3Cfg *c);
+
 /* One decoder layer, reproducing _forward_attn_residual (modeling_kimi_linear.py
  * :984-1046) statement for statement.
  *
@@ -617,6 +683,15 @@ void   k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                             int T, float *state, float *scratch,
                             float *kvc, float *ropec, int cached, int cap,
                             int kv_latent);
+
+/* The same, with a KDA layer run as a tentative, logged call (see K3KdaLog): its carried
+ * state is left untouched until k3_kda_advance commits the positions kept. Ignored on an
+ * MLA layer, whose cache is positional. kda_log == NULL is exactly k3_decoder_layer_inc. */
+void   k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
+                                const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                                int T, float *state, float *scratch,
+                                float *kvc, float *ropec, int cached, int cap,
+                                int kv_latent, const K3KdaLog *kda_log);
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* Dequantise OCP MX FP4, the format Kimi K3 ships its routed experts in.

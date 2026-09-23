@@ -914,16 +914,48 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * Each iteration writes only its own score[e] and choice[e], and the ACCUMULATION
      * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
      * sequence into its own double. Splitting the outer loop therefore cannot change a
-     * single bit, which is why this needs no tolerance and no re-gating. */
+     * single bit, which is why this needs no tolerance and no re-gating.
+     *
+     * EIGHT EXPERTS PER PASS OVER x, for the same reason. One expert's sum is a single
+     * chain of 7168 dependent double adds, so a core running one expert at a time waits
+     * out the add latency on every element and leaves the rest of its pipeline idle.
+     * Walking K3_ROUTER_BLOCK experts side by side gives the core that many independent
+     * chains, each still receiving its terms i = 0..hidden-1 in order, one add per term,
+     * exactly as before: the interleaving changes WHEN each add issues, never which adds
+     * happen or in what order within an expert, so every score is bit-identical to the
+     * one-expert loop. The product needs no care either way: a float times a float fits
+     * in double's 53 bits, so it is exact whether or not the compiler fuses it. Measured
+     * single-threaded at the released shape (896 x 7168): 8.3 ms -> 4.0 ms per layer,
+     * about 0.39 s per token across the 92 MoE layers, with memcmp-equal scores. The
+     * tail block (n_experts % K3_ROUTER_BLOCK experts) runs the same per-expert loop. */
+    enum { K3_ROUTER_BLOCK = 8 };
+    const int nblk = (n_experts + K3_ROUTER_BLOCK - 1) / K3_ROUTER_BLOCK;
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
-    for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+    for (int b = 0; b < nblk; b++) {
+        const int e0 = b * K3_ROUTER_BLOCK;
+        const int n  = (n_experts - e0) < K3_ROUTER_BLOCK ? (n_experts - e0)
+                                                          : K3_ROUTER_BLOCK;
+        double acc[K3_ROUTER_BLOCK] = {0};
+        const float *row[K3_ROUTER_BLOCK];
+        for (int k = 0; k < n; k++) row[k] = W + (size_t)(e0 + k) * hidden;
+        if (n == K3_ROUTER_BLOCK) {
+            for (int i = 0; i < hidden; i++) {
+                const double xi = (double)x[i];
+                for (int k = 0; k < K3_ROUTER_BLOCK; k++)
+                    acc[k] += (double)row[k][i] * xi;
+            }
+        } else {
+            for (int k = 0; k < n; k++)
+                for (int i = 0; i < hidden; i++)
+                    acc[k] += (double)row[k][i] * (double)x[i];
+        }
+        for (int k = 0; k < n; k++) {
+            const int e = e0 + k;
+            score[e]  = 1.0f / (1.0f + expf(-(float)acc[k]));
+            choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        }
     }
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
@@ -1346,8 +1378,82 @@ size_t k3_kda_scratch(const K3Cfg *c, int T)
          + (size_t)T * c->kda_head_dim; /* f_a output, per position            */
 }
 
+/* Floats in one row of a K3KdaLog: k and v as the recurrence reads them, alpha, beta, and
+ * the three pre-conv inputs. See the layout in k3.h. */
+size_t k3_kda_log_row(const K3Cfg *c)
+{
+    const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+    return 6 * P + (size_t)c->kda_heads;
+}
+
+size_t k3_kda_state_floats(const K3Cfg *c)
+{
+    const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+    return P * (size_t)c->kda_head_dim + 3 * P * (size_t)(c->conv_k - 1);
+}
+
+/* A log row or commit past the recorded rows would replay whatever the buffer held last
+ * time: a fluent, wrong state. Refuse loudly, as the other kernels do. */
+static void kda_log_bound_(const char *what, int n, int cap)
+{
+    fprintf(stderr, "k3: FATAL, %s is %d, but the KDA log holds %d rows.\n", what, n, cap);
+    abort();
+}
+
+/* Apply log rows [0, n) to ONE head's block of S, in place. The heart of every commit and
+ * of every replay into a work copy.
+ *
+ * WHY THE RESULT IS BIT-IDENTICAL, not merely close, to the sweep that recorded the rows:
+ * this is k3_kda_step, the function the sweep called, on the same S bits, with the same
+ * k, v, alpha and beta bits, in the same t order. Its update of S reads nothing else: q
+ * enters only the output o, in both the scalar and the SIMD build (the SIMD path tests q
+ * only to skip a row whose k is also zero, and a zero k never writes S). So passing zeros
+ * for q, which also lets the step skip its output pass, cannot move a bit of S. Heads are
+ * independent, so the thread count cannot either. */
+static void kda_replay_head_(float *Sh, const float *rows, size_t lrow, int n, int h,
+                             int D, int P, const float *qz, float *oh)
+{
+    for (int t = 0; t < n; t++) {
+        const float *r = rows + (size_t)t * lrow;
+        k3_kda_step(Sh, oh, qz, r + (size_t)h * D, r + P + (size_t)h * D,
+                    r + 2 * (size_t)P + (size_t)h * D, r[3 * (size_t)P + h], D, D);
+    }
+}
+
+/* The ShortConv history after n logged rows. k3_shortconv keeps, per channel, the last
+ * conv_k-1 inputs, oldest first, out of [history it started with, x_0, x_1, ...]; after n
+ * inputs that is entries n .. n+conv_k-2 of that sequence, and the log holds each of them
+ * bit for bit. Pure data movement.
+ *
+ * dst may be src. Writing slot j reads slot n+j of the same channel, and for n >= 1 that
+ * slot lies AHEAD of every slot written so far, so ascending j never reads a slot it has
+ * already overwritten. src == NULL is the zero history of a fresh sequence. */
+static void kda_replay_conv_(float *dst, const float *src, const float *rows, size_t lrow,
+                             int n, const K3Cfg *c)
+{
+    const int P = c->kda_heads * c->kda_head_dim, H = c->kda_heads, hist = c->conv_k - 1;
+    for (int which = 0; which < 3; which++) {
+        const size_t blk = (size_t)which * P * hist;
+        const size_t pre = 3 * (size_t)P + H + (size_t)which * P;   /* pre-conv slice */
+        for (int ch = 0; ch < P; ch++) {
+            for (int j = 0; j < hist; j++) {
+                const int i = n + j;
+                const size_t at = blk + (size_t)ch * hist;
+                dst[at + j] = i < hist ? (src ? src[at + i] : 0.0f)
+                                       : rows[(size_t)(i - hist) * lrow + pre + ch];
+            }
+        }
+    }
+}
+
 void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                   int T, float *state, float *scratch)
+{
+    k3_kda_layer_log(out, x, w, c, T, state, scratch, NULL);
+}
+
+void k3_kda_layer_log(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
+                      int T, float *state, float *scratch, const K3KdaLog *log)
 {
     const int E = c->hidden, H = c->kda_heads, D = c->kda_head_dim;
     const int P = H * D, K = c->conv_k, hist = K - 1;
@@ -1369,8 +1475,39 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     k3_mmw_batch(fa, x,  w->f_a, w->wdt, E, D, T);
     k3_mmw_batch(z,  fa, w->f_b, w->wdt, D, P, T);
 
+    /* A logged call is tentative (see K3KdaLog): it computes on log->work and leaves
+     * `state` as it found it. `st` is the state this call actually carries forward. The
+     * work copy starts as `state` advanced by the rows earlier calls recorded, so the call
+     * computes exactly what it would have computed had those calls updated `state` in
+     * place. Everything the log adds is a copy either into the work state or out of
+     * buffers the layer computes anyway, so the arithmetic below is unchanged and the
+     * output is the same bits with or without a log. */
+    const size_t lrow = log ? k3_kda_log_row(c) : 0;
+    float *st = state;
+    int nrec = 0;
+    if (log) {
+        if (log->row0 < 0 || log->row0 > log->cap) kda_log_bound_("KDA log row0", log->row0,
+                                                                  log->cap);
+        st = log->work;
+        /* Positions past cap are computed but not recorded: the caller sizes the log for
+         * the longest prefix it can keep. */
+        nrec = log->cap - log->row0;
+        if (nrec > T) nrec = T;
+        kda_replay_conv_(st + (size_t)H * D * D,
+                         state ? state + (size_t)H * D * D : NULL,
+                         log->rows, lrow, log->row0, c);
+        /* The pre-conv inputs, before k3_shortconv overwrites them in place. They are all
+         * the ShortConv history is ever made of. */
+        for (int t = 0; t < nrec; t++) {
+            float *r = log->rows + (size_t)(log->row0 + t) * lrow + 3 * (size_t)P + H;
+            memcpy(r,                 q + (size_t)t * P, (size_t)P * sizeof(float));
+            memcpy(r + P,             k + (size_t)t * P, (size_t)P * sizeof(float));
+            memcpy(r + 2 * (size_t)P, v + (size_t)t * P, (size_t)P * sizeof(float));
+        }
+    }
+
     /* 2. ShortConv with fused SiLU, carrying state across calls */
-    float *cs = state ? state + (size_t)H * D * D : NULL;
+    float *cs = st ? st + (size_t)H * D * D : NULL;
     k3_shortconv(q, q, w->q_conv, cs ? cs : NULL, P, K, T);
     k3_shortconv(k, k, w->k_conv, cs ? cs + (size_t)P * hist : NULL, P, K, T);
     k3_shortconv(v, v, w->v_conv, cs ? cs + (size_t)2 * P * hist : NULL, P, K, T);
@@ -1389,8 +1526,19 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                      w->A_log, w->dt_bias, H, D, c->gate_lb);
     }
 
+    /* The recurrence operands, exactly as k3_kda_step is about to receive them below:
+     * k normalised, v raw, alpha, and beta after its sigmoid. Nothing between here and
+     * the step modifies them. */
+    if (log) for (int t = 0; t < nrec; t++) {
+        float *r = log->rows + (size_t)(log->row0 + t) * lrow;
+        memcpy(r,                 k  + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(r + P,             v  + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(r + 2 * (size_t)P, al + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(r + 3 * (size_t)P, bt + (size_t)t * H, (size_t)H * sizeof(float));
+    }
+
     /* 6. recurrence, per head, with q pre-scaled by d_k^-0.5 */
-    float *S = state;
+    float *S = st;
     float *Sown = NULL;
     if (!S) {
         /* Dereferenced at a computed offset immediately below; an unchecked NULL here
@@ -1398,6 +1546,13 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         Sown = (float *)calloc((size_t)H * D * D, sizeof(float));
         if (!Sown) k3_fatal_oom("KDA recurrent state", (size_t)H * D * D * sizeof(float));
         S = Sown;
+    }
+    /* Only a replay into the work copy needs these: a zero q and a throwaway output row
+     * per head for k3_kda_step, see kda_replay_head_. */
+    float *rtmp = NULL;
+    if (log && log->row0 > 0) {
+        rtmp = (float *)calloc((size_t)(H + 1) * D, sizeof(float));
+        if (!rtmp) k3_fatal_oom("KDA log replay", (size_t)(H + 1) * D * sizeof(float));
     }
     const float qscale = 1.0f / sqrtf((float)D);
     /* Heads are independent: each reads and writes only its own S block, its own D-wide
@@ -1413,6 +1568,17 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
 #endif
     for (int h = 0; h < H; h++) {
         float *wh = wr + (size_t)h * D;
+        /* The work copy of this head's block, taken here rather than by one big copy
+         * before the loop: the block is about to be streamed through the cache by the
+         * recurrence anyway, and every thread copies its own heads. */
+        if (log) {
+            float *Sh = S + (size_t)h * D * D;
+            if (state) memcpy(Sh, state + (size_t)h * D * D, (size_t)D * D * sizeof(float));
+            else       memset(Sh, 0, (size_t)D * D * sizeof(float));
+            if (log->row0 > 0)
+                kda_replay_head_(Sh, log->rows, lrow, log->row0, h, D, P, rtmp,
+                                 rtmp + (size_t)(h + 1) * D);
+        }
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
@@ -1420,6 +1586,7 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                         al + off, bt[(size_t)t * H + h], D, D);
         }
     }
+    free(rtmp);
 
     /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection. Each stage
      * covers every position before the next begins, so g_proj and o_proj are each one
@@ -1439,6 +1606,30 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     for (size_t i = 0; i < (size_t)T * P; i++) o[i] *= sigmoidf_(gt[i]);
     k3_mmw_batch(out, o, w->o, w->wdt, P, E, T);
     free(Sown);
+}
+
+/* Commit n recorded positions to the carried state. See K3KdaLog in k3.h, and
+ * kda_replay_head_ and kda_replay_conv_ for why the result is the state feeding exactly
+ * those positions would have left, to the bit. Nothing is read from the weights, which is
+ * why a streamed trunk costs no I/O here. */
+void k3_kda_advance(float *state, const K3KdaLog *log, int n, const K3Cfg *c)
+{
+    const int H = c->kda_heads, D = c->kda_head_dim, P = H * D;
+    if (n < 0 || n > log->cap) kda_log_bound_("KDA commit length", n, log->cap);
+    if (n == 0) return;
+    const size_t lrow = k3_kda_log_row(c);
+
+    float *tmp = (float *)calloc((size_t)(H + 1) * D, sizeof(float));
+    if (!tmp) k3_fatal_oom("KDA commit temporaries", (size_t)(H + 1) * D * sizeof(float));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int h = 0; h < H; h++)
+        kda_replay_head_(state + (size_t)h * D * D, log->rows, lrow, n, h, D, P, tmp,
+                         tmp + (size_t)(h + 1) * D);
+    free(tmp);
+    kda_replay_conv_(state + (size_t)H * D * D, state + (size_t)H * D * D, log->rows, lrow,
+                     n, c);
 }
 
 /* ----------------------------------------------------------- decoder layer ---- */
@@ -1493,6 +1684,19 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                           int T, float *state, float *scratch,
                           float *kvc, float *ropec, int cached, int cap, int kv_latent)
 {
+    k3_decoder_layer_inc_log(h, block_residual, n_blocks, w, c, layer_idx, T, state,
+                             scratch, kvc, ropec, cached, cap, kv_latent, NULL);
+}
+
+/* kda_log reaches only the KDA module; see K3KdaLog. Everything else in the layer is
+ * per token (norms, AttnRes, the MoE) or positional (the MLA cache), so the log is the
+ * only thing a speculative rollback needs from here. */
+void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
+                              const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                              int T, float *state, float *scratch,
+                              float *kvc, float *ropec, int cached, int cap, int kv_latent,
+                              const K3KdaLog *kda_log)
+{
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
 
@@ -1540,7 +1744,7 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     /* attention */
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
-    if (w->kda) k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
+    if (w->kda) k3_kda_layer_log(tmp, hin, w->kda, c, T, state, sub, kda_log);
     else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap,
                               kv_latent);
 
