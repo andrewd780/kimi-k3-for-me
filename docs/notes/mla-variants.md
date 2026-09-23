@@ -9,12 +9,13 @@ and measured by `benchmarks/bench_mla.c`. `benchmarks/mla-study.sh` reproduces e
 number below, and the raw JSON lines are in
 [`docs/measurements/mla-variants-x86_64.jsonl`](../measurements/mla-variants-x86_64.jsonl).
 
-This version of the note has the **exact half** of the study: the bitwise gates, the
-kv_b application counts and the numerics of the absorbed variant. None of those depend
-on machine load. **The wall-time tables are placeholders** (marked TIMING PENDING),
-because the only machine available so far was a shared 4-core VM whose other jobs, in
-an informal check, turned a 0.9 ms matmul into 25 ms. They are filled by the timing phase of the study script on a
-quiet machine; the exact commands are under [Reproducing](#reproducing).
+The study has two halves. The **exact half**, the bitwise gates, the kv_b application
+counts and the numerics of the absorbed variant, does not depend on machine load. The
+**wall times** do: the machine is a shared 4-core VM whose other jobs, in an informal
+check, turned a 0.9 ms matmul into 25 ms. They were taken by the timing phase of the
+study script with that VM otherwise idle, gated on load and CPU pressure run by run;
+the conditions are under [Timing](#timing) and the commands under
+[Reproducing](#reproducing).
 
 ## The variants
 
@@ -233,48 +234,165 @@ count, and it is the variant a follow-up would put into `k3_mla_cached`.
 
 ## Timing
 
-**TIMING PENDING.** Every table in this section is filled by the timing phase of
-`benchmarks/mla-study.sh` on a quiet machine. Until then no speed is claimed for any
-variant. The timed region is `mla_attend`: appending the T new tokens (a kv_b matmul each
-for the expanded layout, a copy for the latent one) plus the attention. Each (C, T)
-configuration interleaves the variants run by run, reports the median of 5 runs, records
-the Linux PSI CPU-stall share and the process CPU time of every run, repeats a short run
-whose stall share exceeds 10% (at most three times), and waits up to 120 s for the
-machine to go idle before each run. A run longer than `--max-run-s` is PROJECTED from the
-measured cost of one kv_b application scaled by the measured-to-modelled ratio of the
-runs that did complete, and labelled so; E and E+ at 65,536 positions (6.4 GB of cache
-for one layer) are NOT RUN.
+Measured on 2026-09-23 on the 4-core VM the rest of this note uses: Intel Xeon
+Processor @ 2.80GHz, 4 cores with one thread each, 33 MB L3, 16 GB RAM. The CPU has
+AVX-512; the kernels are the AVX2 ones, as `bench_mla` reports. gcc 13.3.0 with the
+Makefile's flags, `-O3 -std=gnu99 -march=native -fopenmp -ffp-contract=off`, at commit
+475a7a8. Nothing else ran. Each of the four arms (one and four threads, decode and
+prefill) waited for the 1-minute load average to fall under 1.0, and they started at
+0.33, 0.63, 0.81 and 0.90. Each run then waited for the machine to be 75% idle (one
+thread) or 90% idle (four threads); the least idle any kept run started on was 87% and
+95%. The largest PSI CPU-stall share of any kept run was
+3.6% on one thread and 7.4% on four. Of 455 kept runs, 3 were repeats of runs discarded
+for a stall share over 10%, all on four threads. Process CPU time was 0.94 to 1.00 of wall
+time in every one-thread run. The phase took 63 minutes.
+
+Method, as in `benchmarks/bench_mla.c`: the timed region is `mla_attend`, appending the
+T new tokens (a kv_b matmul each for the expanded layout, a copy for the latent one)
+plus the attention, for **one layer**. Each (C, T) configuration interleaves the
+variants run by run. A cell is the **median of 5 runs, in milliseconds per call, with
+the fastest run in brackets**. A configuration whose run would take longer than
+`--max-run-s` (70 s on one thread, 90 s on four) is PROJECTED from the unit cost of one
+kv_b application, scaled by the measured-to-modelled ratio of the latent runs already
+completed in the same process. E and E+ at 65,536 positions (6.4 GB of cache for one
+layer, over the 3 GB `--mem-mb`) are NOT RUN. The raw lines, with every run's time,
+stall share, idle fraction and CPU time, are the `time`, `kv_b` and `model` lines of
+[`docs/measurements/mla-variants-x86_64.jsonl`](../measurements/mla-variants-x86_64.jsonl).
 
 ### The unit: one kv_b application
 
-| threads | ms per application | GMAC/s |
-|---:|---:|---:|
-| 1 | TIMING PENDING | TIMING PENDING |
-| 4 | TIMING PENDING | TIMING PENDING |
+A 24,576 x 512 bf16 matmul, 12.58 M multiply-adds, median of 31. Each of the four
+bench processes measures it once, at startup. The last column checks the latent-path
+model: every measured L0 and L1 time divided by its counted applications times the unit.
+
+| threads | arm | ms per application | GMAC/s | measured / modelled, latent runs |
+|---:|---|---:|---:|---|
+| 1 | decode | 3.860 | 3.26 | 1.092 over 13 runs (1.02 to 1.14 each) |
+| 1 | prefill | 4.315 | 2.92 | 1.907 over 1 run, L1 at T = 256 |
+| 4 | decode | 0.929 | 13.54 | 1.037 over 17 runs (0.96 to 1.09 each) |
+| 4 | prefill | 1.066 | 11.80 | 1.421 over 2 runs, L0 and L1 at T = 256 |
+
+The same matmul varied by 12% (one thread) and 15% (four) between processes on the idle
+machine. Within a row of the tables below the variants are interleaved, so ratios in a
+row are tighter than absolute times from row to row.
 
 ### Decode, one thread
 
 | C | T | E | E+ | L0 | L1 | A |
 |---:|---:|---:|---:|---:|---:|---:|
-| 256 .. 65,536 | 1, 5 | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING |
+| 256 | 1 | 20.5 (18.2) | 13.2 (12.4) | 2,108 (2,041) | 1,013 (967) | 11.5 (11.3) |
+| 256 | 5 | 88.9 (86.6) | 43.4 (42.9) | 10,940 (10,322) | 1,135 (1,082) | 42.4 (40.9) |
+| 1,024 | 1 | 68.5 (66.6) | 43.6 (42.7) | 8,363 (8,158) | 4,205 (4,160) | 24.0 (23.8) |
+| 1,024 | 5 | 348 (339) | 120 (109) | 43,013 (42,323) | 4,471 (4,247) | 105 (104) |
+| 4,096 | 1 | 383 (354) | 252 (234) | 34,344 (33,416) | 17,192 (17,011) | 76.6 (72.8) |
+| 4,096 | 5 | 1,765 (1,704) | 421 (411) | ~171,900 projected | 18,047 (17,309) | 398 (396) |
+| 16,384 | 1 | 1,766 (1,502) | 1,119 (939) | ~137,600 projected | 69,862 (69,150) | 322 (319) |
+| 16,384 | 5 | 7,866 (7,257) | 1,962 (1,786) | ~690,700 projected | 72,295 (69,883) | 1,517 (1,470) |
+| 65,536 | 1 | not run | not run | ~552,500 projected | ~333,000 projected | 1,134 (1,107) |
+| 65,536 | 5 | not run | not run | ~2,763,000 projected | ~333,000 projected | 6,113 (5,929) |
 
 ### Decode, four threads
 
 | C | T | E | E+ | L0 | L1 | A |
 |---:|---:|---:|---:|---:|---:|---:|
-| 256 .. 65,536 | 1, 5 | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING |
+| 256 | 1 | 16.3 (14.3) | 4.21 (3.88) | 514 (443) | 230 (213) | 3.49 (3.18) |
+| 256 | 5 | 71.9 (68.9) | 11.2 (10.7) | 2,507 (2,344) | 261 (227) | 13.1 (12.2) |
+| 1,024 | 1 | 64.7 (62.8) | 13.8 (12.5) | 2,025 (1,809) | 989 (833) | 7.22 (6.77) |
+| 1,024 | 5 | 328 (322) | 32.3 (28.4) | 9,922 (9,762) | 1,013 (894) | 35.4 (29.1) |
+| 4,096 | 1 | 375 (359) | 74.5 (63.4) | 8,212 (7,847) | 3,931 (3,768) | 22.1 (20.7) |
+| 4,096 | 5 | 1,844 (1,742) | 137 (108) | 39,599 (38,031) | 4,146 (3,750) | 136 (112) |
+| 16,384 | 1 | 1,773 (1,704) | 303 (290) | 30,416 (29,243) | 14,829 (14,618) | 104 (93.0) |
+| 16,384 | 5 | 8,695 (8,248) | 534 (484) | ~158,600 projected | 16,065 (15,662) | 397 (378) |
+| 65,536 | 1 | not run | not run | ~126,500 projected | 72,631 (72,282) | 351 (327) |
+| 65,536 | 5 | not run | not run | ~631,200 projected | 74,053 (73,419) | 1,578 (1,560) |
 
 ### Prefill, C = 0 and T = 256
 
 | threads | E | E+ | L0 | L1 | A |
 |---:|---:|---:|---:|---:|---:|
-| 1 | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING |
-| 4 | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING | TIMING PENDING |
+| 1 | 2,668 (2,439) | 1,565 (1,377) | ~541,400 projected; about 270,000 to 310,000, see below | 2,107 (2,094) | 2,116 (2,069) |
+| 4 | 1,892 (1,711) | 375 (323) | 60,360 (59,501) | 541 (531) | 570 (537) |
 
 ### The work every variant shares
 
-The projections, the output gate and o_proj, per token per layer (`--common`):
-TIMING PENDING.
+The projections, the output gate and o_proj, per token per layer (`--common`, timed in
+the four-thread arm only): **27.7 ms** on four threads, median of 5, for 219.6 M
+multiply-adds (7.9 GMAC/s); 0.665 s per token over the 24 MLA layers. Every variant adds
+this to the times above.
+
+### Per token, all 24 MLA layers, four threads
+
+The four-thread tables divided by T and multiplied by 24, in seconds per token, against
+the ~16 s per token the rest of the model takes on this VM (`NONATTN_SECONDS`) and the
+0.665 s of shared work above.
+
+| C | T | E | E+ | L0 | L1 | A |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 (prefill) | 256 | 0.177 | 0.035 | 5.66 | 0.051 | 0.053 |
+| 256 | 1 | 0.392 | 0.101 | 12.3 | 5.52 | 0.084 |
+| 256 | 5 | 0.345 | 0.054 | 12.0 | 1.25 | 0.063 |
+| 1,024 | 1 | 1.55 | 0.330 | 48.6 | 23.7 | 0.173 |
+| 1,024 | 5 | 1.57 | 0.155 | 47.6 | 4.86 | 0.170 |
+| 4,096 | 1 | 9.00 | 1.79 | 197 | 94.3 | 0.532 |
+| 4,096 | 5 | 8.85 | 0.659 | 190 | 19.9 | 0.654 |
+| 16,384 | 1 | 42.5 | 7.28 | 730 | 356 | 2.50 |
+| 16,384 | 5 | 41.7 | 2.56 | ~761 projected | 77.1 | 1.91 |
+| 65,536 | 1 | not run | not run | ~3,035 projected | 1,743 | 8.43 |
+| 65,536 | 5 | not run | not run | ~3,030 projected | 355 | 7.57 |
+
+### What the timing says
+
+- **E leaves three cores idle; E+ does not, and is the same floats.** Only E's kv_b
+  append is threaded, as in the engine, so from C = 4,096 up its four-thread time is its
+  one-thread time (process CPU time equals wall time). E+ splits heads across threads
+  and reads each cached row once per call instead of once per query token. It is 1.5 to
+  1.6 times faster than E on one thread at T = 1 and 2.1 to 4.2 times at T = 5. On four
+  threads it is 3.9 to 5.9 times faster at T = 1 and 6.4 to 16 times at T = 5. At 16,384
+  positions and T = 1 that is 7.3 s per token over 24 layers instead of 42.5 s.
+- **A is the fastest variant at long contexts, and E+ matches it when verifying five
+  tokens.** On four threads at T = 1, A is 1.2 times faster than E+ at 256 positions,
+  1.9 times at 1,024, 3.4 at 4,096 and 2.9 at 16,384. At T = 5, E+ is faster at 256 and
+  1,024 (11.2 against 13.1 ms, 32.3 against 35.4), equal at 4,096 (137 against 136)
+  and 1.3 times slower at 16,384. A does up to 3.4 times E's multiply-adds but reads
+  2,304 cached bytes per position instead of 98,560. At 16,384 positions E+ moves 1.6 GB
+  per call, 5.3 GB/s in 303 ms. A is not exact (see
+  [Numerics](#numerics-of-the-absorbed-variant)), so under this project's contract its
+  speed is not on offer beside E.
+- **Rebuilding the cache costs what the counts say, and that is far too much for
+  decode.** L1 is 1.97 to 2.24 times faster than L0 at T = 1 and 9.6 to 9.8 times at
+  T = 5 where both ran; the counts give 2.0 and 9.9 to 10.0. Every latent decode run
+  took 0.96 to 1.14 times its applications times the unit cost. But each rebuilt
+  position is a 12.6 M multiply-add matmul, and L1 is 49 to 72 times slower than E+ at
+  T = 1 on four threads (23 to 31 times at T = 5). At 4,096 positions that is 94 s per
+  token over 24 layers, against E+'s 1.8 s and the ~16 s of the rest of the model. The
+  engine's `--kv-latent` path, L0, takes 197 s per token there.
+- **At prefill, L1 is on par with the expanded cache.** At C = 0 and T = 256, L1 makes
+  as many kv_b applications as E. On four threads it takes 541 ms, against E+'s 375,
+  A's 570 and E's 1,892. L0 at the same point was measured on four threads at 60.4 s
+  for one layer, 112 times L1. That is roughly what `--kv-latent` pays for a 256-token
+  prompt today: 24 minutes over 24 layers. L0 / L1 is 112 rather than the counted 257
+  because half of L1's time at T = 256 is the attention itself, not kv_b.
+- **Beside a fast variant the shared work is not small.** At 27.7 ms per token per
+  layer it is more than A's attention at 4,096 positions (22.1 ms) and 0.37 of E+'s
+  (74.5 ms).
+
+Three cautions about individual cells:
+
+- **L0's one-thread prefill projection overstates.** The bench calibrates a projection
+  on the latent runs already completed in the same process. In the one-thread prefill
+  process the only one is L1 at T = 256, whose ratio is 1.91 because half its time is
+  attention. L0's own ratio on one thread was 1.06 to 1.09 at the five decode points it
+  ran. On four threads its measured prefill was 0.86 to 0.99 times its count times the
+  unit. Scaled by its own ratio, the one-thread L0 prefill is about 270 to 310 s (65,792
+  applications x 3.86 to 4.32 ms x 1.06 to 1.09), not the 541 s in the JSON. The decode
+  projections are calibrated on runs whose ratios are 0.96 to 1.14, and the four-thread
+  prefill needed no projection.
+- **E and E+ at 65,536 positions are not measured.** The JSON's `seconds_per_call` for
+  those lines (status `not_run_memory`) is the bench's linear extrapolation from 16,384.
+  At T = 1 it gives E 6.3 s per call on one thread and 7.0 s on four, and E+ 1.57 s and
+  0.43 s.
+- **One synthetic layer on one VM.** The per-token columns multiply one layer by 24.
+  They are not a model measurement.
 
 ### Apple Silicon
 
@@ -290,7 +408,7 @@ make -j2 bin/test_mla_variants bin/bench_mla
 ./bin/bench_mla counts                                    # prefill counts, < 1 s
 ./bin/bench_mla counts --C 256,1024,4096,16384,65536 --T 1,5
 benchmarks/mla-study.sh <out_dir> 4 exact                 # test, counts, numerics: ~10 min
-benchmarks/mla-study.sh <out_dir> 4 timing                # quiet machine: ~1.5 h
+benchmarks/mla-study.sh <out_dir> 4 timing                # quiet machine: 63 min here
 ```
 
 The numerics are deterministic: the JSON committed here was produced on two threads,
@@ -304,4 +422,6 @@ shared machine, kept only because the JSON format has them; they are not results
   the stress run, and its value rows differently scaled.
 - More than one layer. How A's per-layer difference compounds through the model's 24
   MLA and 69 KDA layers into the logits is not measured.
-- Any speed. See [Timing](#timing).
+- Speed anywhere else. The times are one synthetic layer on one 4-core x86-64 VM with
+  the AVX2 kernels; the per-token figures multiply that layer by 24, and no arm64 timing
+  has run yet.
