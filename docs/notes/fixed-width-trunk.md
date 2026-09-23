@@ -65,8 +65,10 @@ The benchmark reports only public model identifiers, byte counts, dictionaries,
 hashes, timings and hosted-runner metadata. Artifact paths are explicit; raw
 model ranges and unrelated workspace files are not uploaded. No user secrets
 or personal files are inputs. Standard GitHub logs retain the public repository
-identity. Gates 2 and 3 passed in hosted CI at head `9f0c07f`, recorded below;
-gates 4 and 5 and the deployment gates remain.
+identity. Gates 2 and 3 passed in hosted CI at head `9f0c07f`, recorded below.
+Gate 4 (the bit-width curve) and gate 5 (row-boundary cost) now have results from
+committed counts and exact shapes; the every-family samples, decode under matmul
+contention and the deployment gates remain ([status](#remaining-gates)).
 
 ## Gates 2 and 3: passed in CI run 35498176696
 
@@ -113,15 +115,20 @@ pooled case is the less cache-resident of the two and is the figure to quote.
 
 ## Remaining gates
 
-The three gates listed here on 2026-09-20 now have tooling and first numbers,
-recorded in the sections below with their provenance: the bit-width curve
-(computed from committed counts; the eight-range and whole-BF16 figures await
-CI), the row-boundary cost (exact, from the released shapes) and decode under
-matmul contention (measured on a shared x86 VM; hosted x86 and arm64 legs await
-CI). Two gates remain open after them: every tensor family of the trunk (gate 1
-sampled two of 23; the `families` CI job now covers all of them) and a supported
-container/reader in the engine. Kernel speed alone still does not make deployment
-profitable, as the Huffman note already says.
+The gates listed here on 2026-09-20, and the two the family and contention
+questions added, stand as follows on 2026-09-23. Each has a section below with
+its provenance.
+
+| Gate | Status | What is known | What is pending |
+|---|---|---|---|
+| 4. Bit-width curve | **Result on committed counts** | On the four committed `f_a_proj` ranges (CI run 35462000448): 3 bits retains 0.704128, 4 bits 0.750153, 5 bits 0.8125; 3 bits gains 4.60 points over 4, above the 1.5-point prototype bar. FD3B built, byte-exact under local ASan/UBSan (scalar, SSSE3, AVX2). | Eight-range and whole-BF16 figures (histogram CI job); FD3B hosted rates |
+| 5. Row-boundary cost | **Exact, from released shapes** | FDRX: zero padding at every K3 width; 0.0340 points per-row index, 0.0148 grouped; three range reads per chunk | Nothing for the cost; a container still needs a per-chunk checksum |
+| Every tensor family | **Tooling and CI job built** | Gate 1 sampled 2 of 23 families, 4.00% of trunk bytes; inventory exact | The `families` CI job's samples and the [per-family plan](#per-family-plan) decisions |
+| Decode under matmul contention | **Benchmark and model built; not measured** | Byte-exact benchmark on the engine's `k3_matmul_bf16`, break-even arithmetic unit-tested | The quiet-machine measurement ([placeholder](#decode-under-matmul-contention)); hosted x86 and arm64 legs |
+| Supported container/reader | Not started | | Everything |
+
+Kernel speed alone still does not make deployment profitable, as the Huffman
+note already says.
 
 For escape fraction `p`, `r = .75 + .5*p` before dictionary/framing/row costs.
 For disk bandwidth `B=3 GB/s`, decode must exceed 3 GB/s to beat raw reads under
@@ -256,6 +263,48 @@ takes a committed record of them and then requires the same bytes. Results
 await CI; unit tests cover the classification (MLA versus KDA `o_proj`/`g_proj`
 by layer), the plan, the exact weighting and the per-family STOP.
 
+### Per-family plan
+
+The rules for reading the `families` run are fixed here, before its data exist,
+so the result cannot pick its own test. In order:
+
+1. **Inventory first.** `config_check` compares every family's header bytes with
+   the config-derived bytes in the table above. Any mismatch corrects this table
+   (and the shares quoted from it) before any ratio is read.
+2. **Coverage gate, per family.** PASS needs at least 99% of each sampled
+   family's high bytes inside the one byte-weighted pooled 15-entry table, by
+   integer counts (`gate.status`). The gate-1 table is scored on every family as
+   well (`gate1_15`): fitted on 4.00% of the bytes and scored on the rest, it is
+   the generalization test gate 1 could not make, and it is reported whether it
+   passes or not.
+3. **A STOP names families, not the campaign.** Every FD stream carries its own
+   magic, length and table, so each matrix is encoded on its own. A family in
+   `gate.failed_families` gets its own table if its `best_local_15` coverage is at
+   least 99% (15 bytes per matrix), and otherwise stays raw BF16. The ratio is
+   then restated over all 108.76 GB of matrices with raw families at r = 1, never
+   over the passing families alone.
+4. **Width, per family.** The 1.5-point rule decides whether FD3B is worth
+   carrying at all, on the byte-weighted curve (`byte_weighted_pooled.decision`).
+   If it is, each family takes the smaller of its own 3- and 4-bit payloads; the
+   magic selects the decoder, so mixing widths costs no format change. The
+   byte-weighted ratio of that per-family choice is the figure to quote.
+5. **Bounds, per family.** The Huffman and order-0 bounds per family and for one
+   shared code state the fixed-width premium family by family; the whole-BF16
+   bound says how much any model of the low byte could still add.
+6. **Provenance.** Record the run ID, head and artifact ID; commit the report as
+   `docs/measurements/trunk-family-gate.json` with every derived field recomputed
+   from the committed histograms and matched before writing (the gate 2/3
+   procedure); commit the observed sample identities (`shard`, `offset`, `bytes`,
+   `sha256` from each family's `samples`) as `{"samples": [...]}` so a rerun with
+   `--pins` must read the same bytes.
+
+Limits of the sample: four 1 MiB ranges per family are systematic, not a census,
+and the table is fitted and scored on the same bytes. The deployment decision does
+not rest on the sample, though. A container writer sees every value of every
+matrix, knows each matrix's exact escape count before it writes, and can write any
+matrix raw whose FD payload would not be smaller; that choice is exact and costs
+nothing at decode time.
+
 ## FD3B: the 3-bit prototype
 
 On the committed counts the curve clears the 1.5-point bar at 3 bits, so
@@ -337,3 +386,113 @@ empty ranges, reversed and out-of-range bounds; structural corruption refused at
 parse; an off-by-one checkpoint caught. The contention benchmark below also
 decodes a whole 12288 x 7168 matrix through a per-row FDRX index in 22 chunks of
 up to 585 rows, byte-exact before and after timing.
+
+## Decode under matmul contention
+
+> **PLACEHOLDER: this measurement has not been taken.** The benchmark, the
+> break-even arithmetic and the protocol below are committed and tested; the
+> tables are empty until the run on a quiet machine fills them. No contention
+> number in this note is a result.
+
+Kernel rates alone (gate 3) had the decoder to themselves. In a streamed trunk the
+decoder shares the machine with the matmuls it feeds.
+`benchmarks/bench_decode_contention.c` puts both on one machine at once: one
+decoder thread reconstructs a 12288 x 7168 BF16 matrix (the KDA `q_proj` shape) in
+22 chunks of up to 585 rows, the most whole rows that fit the row pipeline's 8 MiB
+buffer, each chunk located through a per-row FDRX index and written into two
+alternating 8 MiB buffers, while the engine's own `k3_matmul_bf16` multiplies the
+same shape on the remaining OpenMP threads. Four arms, repeated in interleaved
+order: decode alone, the matmul on all T threads (the uncompressed baseline), the
+matmul on T - 1 threads, and decoder plus matmul at once. In the concurrent arm
+only work finished before the deadline counts, and each side keeps running until
+the other has finished, so every counted unit ran against a live competitor. The
+input is either `stream` (all 22 chunks in turn, so the decoder reads DRAM like a
+cold row pipeline) or `hot` (one cache-resident chunk, as right behind the read
+that landed it). Every chunk is compared byte for byte with the raw matrix through
+the scalar and native decoders before timing, and through the native one after.
+
+Exactness is not at stake here: the decoder reproduces the BF16 bytes exactly, so
+the matmul sees the same operands in the same partition and reduction order, and
+logits are unchanged by construction. Only time is measured.
+
+Setup, exact and deterministic (fixed seed, not timings): high bytes are drawn
+from the committed four-range histogram, low bytes uniform; FD4B uses the gate-1
+table and FD3B its first seven entries. Of 88,080,384 values, FD4B escapes 44,671
+(0.0507%, against 0.0514% for the same table on the real four ranges) and FD3B
+2,927,952 (3.324%, against 3.326%). Payload plus framing gives r = 0.750254 (FD4B)
+and 0.704121 (FD3B); the FDRX index is 49,168 bytes, 0.028 points, small enough to
+keep resident rather than stream.
+
+**Model** (`tools/bench_decode_contention.py`, unit-tested on hand-checkable
+rates). Per GB of raw weights, with SSD rate B, contended decode rate D_c and
+matmul rates M_all (all threads) and M_c (the rest, against the decoder):
+
+- uncompressed, streamed: `max(1/B, 1/M_all)`
+- compressed, streamed: `max(r/B, 1/D_c, 1/M_c)`, and the largest term names the
+  limiting stage
+- resident: `1/M_all` against `max(1/D_c, 1/M_c)`
+
+Decoding is hidden when `1/D_c <= max(r/B, 1/M_c)`. The CPU cost of decoding the
+whole trunk is `108.81 / D_c` core-seconds per token.
+
+**Decision rules, fixed before the data.** A streamed deployment at SSD rate B is
+worth building only if the contended **minimum** speedup at that B exceeds 1; the
+median is reported beside it. The resident slowdown is expected to exceed 1: a
+pinned trunk layer is read once, so it should be decoded once when pinned and
+kept raw, and this measurement prices that choice rather than gating it. The
+machine here has 4 cores, where the decoder's core is a quarter of the matmul's;
+the 2-thread run bounds a smaller machine, and larger machines lose a smaller
+share.
+
+**Protocol.** Build with the engine's flags, as the `contention` CI job does:
+
+```sh
+flags='-O3 -std=gnu99 -Wall -Wextra -Wpointer-arith -Wshadow -Wvla -Wno-unused-parameter -pthread -ffp-contract=off'
+inc='-Iinclude -Iinclude/k3 -Ithird_party -Isrc/core -Ibenchmarks'
+mkdir -p build/contention
+cc $flags -march=native -fopenmp $inc -c src/core/k3_ops.c -o build/contention/k3_ops.o
+cc $flags -Werror -march=native -fopenmp $inc -c benchmarks/bench_decode_contention.c -o build/contention/contention.o
+cc build/contention/contention.o build/contention/k3_ops.o -o build/contention/bench-decode-contention -lm -pthread -fopenmp
+```
+
+Then, with no other build or benchmark running and a one-minute load average
+below 0.5 (the report records it before and after), run all four
+format x placement cases with 2 s per arm and 9 repeats, first on every core and
+then on two:
+
+```sh
+RESEARCH_COMMIT=$(git rev-parse HEAD) python3 tools/bench_decode_contention.py \
+  --binary build/contention/bench-decode-contention --threads 4 --seconds 2 --repeats 9 \
+  --out docs/measurements/decode-contention-x86_64-t4.json
+RESEARCH_COMMIT=$(git rev-parse HEAD) python3 tools/bench_decode_contention.py \
+  --binary build/contention/bench-decode-contention --threads 2 --seconds 2 --repeats 9 \
+  --out docs/measurements/decode-contention-x86_64-t2.json
+```
+
+The driver prints the three tables below in this form; paste them with the CPU
+model, load averages and head from the report's `execution` field. The hosted
+x86_64 and arm64 legs come from the `contention` CI job (`decode-contention-*`
+artifacts, 1 s per arm, 5 repeats) and are recorded the same way.
+
+**Rates, reconstructed or consumed BF16 GB/s (PLACEHOLDER, not measured):**
+
+| Format | Input | Stat | Decode alone | Decode + matmul | Matmul all | Matmul rest | Matmul + decode | Core-s/token (contended) |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| FD4B `ssse3_pshufb` | stream | median / min | pending | pending | pending | pending | pending | pending |
+| FD3B `avx2_vpshufb` | stream | median / min | pending | pending | pending | pending | pending | pending |
+| FD4B `ssse3_pshufb` | hot | median / min | pending | pending | pending | pending | pending | pending |
+| FD3B `avx2_vpshufb` | hot | median / min | pending | pending | pending | pending | pending | pending |
+
+**Streamed speedup over raw reads, contended rates, limiting stage in brackets;
+resident slowdown (PLACEHOLDER, not measured):**
+
+| Format | Input | Stat | r | B = 2.5 GB/s | B = 3 GB/s | B = 4 GB/s | B = 5 GB/s | B = 6 GB/s | Resident slowdown |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| FD4B | stream, hot | median, min | 0.7503 | pending | pending | pending | pending | pending | pending |
+| FD3B | stream, hot | median, min | 0.7041 | pending | pending | pending | pending | pending | pending |
+
+For orientation only, and **not admissible as a result**: one FD4B `stream` run
+on 2026-09-22, on this 4-vCPU VM while another agent's builds held the load
+average near 5 (no report file kept), gave decode 6.48 GB/s alone and 6.46 with
+the matmul running; the matmul gave 19.6 on four threads, 15.1 on three and 14.8
+on three against the decoder. The quiet run replaces these.

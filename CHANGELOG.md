@@ -17,8 +17,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with entropy bounds (3 bits beats 4 by 4.60 points on the committed `f_a_proj`
   counts), an FD3B 3-bit decoder, the FDRX row index for whole-row seeking
   (0.034 points per row, zero padding), a per-family CI sample of all 23 trunk
-  matrix families, and a decode-under-matmul-contention benchmark. A supported
-  reader remains. See [the note](docs/notes/fixed-width-trunk.md) and
+  matrix families, and a decode-under-matmul-contention benchmark whose
+  measurement is still to be taken. A supported reader remains. See [the note](docs/notes/fixed-width-trunk.md) and
   [results](docs/notes/research-results.md).
 - **Bounded trunk row streaming**, opt-in `--trunk-rows`: two small read/compute
   buffers, unchanged per-row arithmetic, and an explicitly sized current-layer

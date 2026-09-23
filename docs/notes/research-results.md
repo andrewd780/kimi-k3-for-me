@@ -169,9 +169,12 @@ on 8 MiB against FD4B's 12.6, on a shared VM. *Row index:* FDRX makes any
 whole-row range decodable for 0.0340 points of matrix bytes per row, or 0.0148
 grouped, with zero padding at K3 widths. *Families:* gate 1 sampled two of 23
 matrix families (4.00% of trunk bytes); the `families` CI job samples all of
-them. *Contention:* a benchmark runs one decoder thread against
-`k3_matmul_bf16` on the other cores; results and the break-even are in the note.
-Hosted numbers for all of these await CI. No full-model speedup is claimed.
+them, under per-family decision rules fixed in the note before the data.
+*Contention:* a byte-exact benchmark runs one decoder thread against
+`k3_matmul_bf16` on the other cores, and the break-even model is unit-tested; the
+measurement is **not yet taken** (it needs a quiet machine) and the note holds a
+marked placeholder for it. Hosted numbers for all of these await CI. No
+full-model speedup is claimed.
 
 ## 3. Predictive expert reads: closed
 
