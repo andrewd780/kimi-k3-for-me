@@ -96,6 +96,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Speculative decode never replays.** A partially accepted `--spec` sweep used to
+  restore a copy of the whole carried state and replay the accepted prefix through a
+  second forward, re-reading the trunk and the prefix's experts (at K3 scale 108.81 GB
+  plus the routed experts, per rejection). Verify sweeps are now tentative: each KDA
+  layer runs on a one-layer work copy and records its recurrence inputs
+  (`K3KdaLog`, `k3_kda_layer_log`), and only the positions behind emitted ids are
+  committed with `k3_kda_advance`, bit-identical to serial decode and reading no
+  weights. MLA needs nothing: its KV rows are positional. The 626 MB state snapshot
+  (all 93 layers at K3 size, 69 of which carry state) is gone; `--spec 4` now holds a
+  102 MB per-position log plus one 6.7 MB work layer, counted in the memory plan. The
+  hybrid `--draft-trunk` path commits the same way and folds its catch-up into the
+  next round's first call, so it runs no replay, catch-up or lockstep sweeps either.
+  The run report and `--out` JSON count verify sweeps, acceptances and forward sweeps
+  per decode step; the new `--dump-all-logits` writes the logits behind every token.
+  Gated by `test_kda_exact`, oracle GATE 4 and CLI parity tests across memory modes.
 - **Trunk layers are read in parallel chunks.** `load_run()` streamed each layer with
   one sequential `pread` loop, so the device saw queue depth 1. It now splits the layer
   into 64 MiB chunks (a multiple of `K3_TRUNK_ALIGN`, so every chunk stays aligned for
@@ -106,6 +121,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`--spec` saved a state ahead of its sequence** when a `--stop-id` cut a verify
+  sweep short: the carried state kept every accepted position, so `--save-state` wrote
+  a state that had consumed ids the saved sequence did not contain and a resumed run
+  continued from the wrong context. The sweep now commits exactly the positions behind
+  the ids it emits, and the saved file is byte-identical to serial decode's.
+- **`--dump-logits` with `--draft-trunk` recorded the draft model's logits**: the draft
+  wrote its prefill logits into the exact model's buffer. The draft has its own now.
 - **`k3_run.json` was not valid JSON after a run that generated nothing.** With
   `nout == 0` the `seconds_per_token` field computed `t_total / nout` and emitted a
   bare `inf`, so a harness driving `--gen 0 --save-state` failed on the one run it
