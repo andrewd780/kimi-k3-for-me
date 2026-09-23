@@ -323,6 +323,25 @@ static void fd3_suite(void)
     }
     memcpy(copy, packed, length); copy[17] = copy[16];
     CHECK(!exact3(copy, length, raw, sizeof raw));
+    /* A repeated table value must be refused by the parser itself. The case above is
+     * also caught by the byte comparison, since code 1 then decodes to the wrong value;
+     * here no code points at the repeated slot (only codes 0-5 occur), every byte would
+     * still decode right, and only fwd3_parse's distinctness check can reject it. */
+    {
+        uint8_t spare[8193], spare_packed[17000];
+        for (size_t j = 0; j < sizeof spare/2; j++) {
+            spare[2*j] = (uint8_t)(j*13); spare[2*j+1] = TABLE3[j % 6];
+        }
+        spare[sizeof spare - 1] = 0x5a;
+        const size_t spare_length = encode3(spare_packed, spare, sizeof spare);
+        CHECK(exact3(spare_packed, spare_length, spare, sizeof spare));
+        spare_packed[16 + 6] = spare_packed[16];
+        CHECK(!exact3(spare_packed, spare_length, spare, sizeof spare));
+        FwdView repeated_view;
+        uint8_t *repeated = heap_copy(spare_packed, spare_length);
+        CHECK(fwd3_parse(&repeated_view, repeated, spare_length));
+        free(repeated);
+    }
     for (size_t at = 23; at < 32; at++) {
         memcpy(copy, packed, length); copy[at] = 1;
         CHECK(!exact3(copy, length, raw, sizeof raw));
@@ -409,6 +428,23 @@ int main(int argc, char **argv)
     }
     memcpy(copy, packed, length); copy[17] = copy[16];
     CHECK(!exact(copy, length, raw, sizeof raw));
+    /* As for FD3B: a repeat in a slot no code uses (only codes 0-13 occur here) decodes
+     * every byte right, so only fwd_parse's distinctness check can refuse it. */
+    {
+        uint8_t spare[8193], spare_packed[17000];
+        for (size_t j = 0; j < sizeof spare/2; j++) {
+            spare[2*j] = (uint8_t)(j*13); spare[2*j+1] = (uint8_t)(17*(j%14)+3);
+        }
+        spare[sizeof spare - 1] = 0x5a;
+        const size_t spare_length = encode(spare_packed, spare, sizeof spare);
+        CHECK(exact(spare_packed, spare_length, spare, sizeof spare));
+        spare_packed[16 + 14] = spare_packed[16];
+        CHECK(!exact(spare_packed, spare_length, spare, sizeof spare));
+        FwdView repeated_view;
+        uint8_t *repeated = heap_copy(spare_packed, spare_length);
+        CHECK(fwd_parse(&repeated_view, repeated, spare_length));
+        free(repeated);
+    }
     memcpy(copy, packed, length); copy[31] = 1;
     CHECK(!exact(copy, length, raw, sizeof raw));
     FwdView v;
