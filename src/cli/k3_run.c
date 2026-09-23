@@ -329,13 +329,18 @@ static int spec_draft(const int *seq, int T, int cap, int *out)
 {
     /* Evidence-gated: a draft only fires when the suffix n-gram's occurrences AGREE on
      * what follows. Measured on the released checkpoint, an eager most-recent-match
-     * drafter went 0.91x on code, back when every partial acceptance paid a replay
-     * sweep, so weak drafts were worse than no drafts. Verify sweeps are tentative now
-     * (see the speculative step in main): a rejected draft costs only the extra
-     * positions of the one sweep it rode in, so this gate is conservative for the
-     * current engine and has not been re-measured. Rules: match length 4 (then 3); if the
-     * n-gram occurred more than once, every occurrence must propose the same next id,
-     * and the draft stops at the first position where historical continuations diverge. */
+     * drafter went 0.91x on code, when every partial acceptance also paid a replay sweep.
+     * The replay was not the whole cost. Verify sweeps are tentative now (see the
+     * speculative step in main), yet the teacher-forced replay of this rule and of an
+     * eager drafter (docs/notes/spec-replay.md, a proxy, not K3) still has eager drafts of
+     * up to 8 ids losing on every non-edit corpus without any replay: 0.93x to 0.95x at
+     * 8 GB and 0.57x to 0.68x with the trunk resident, against 1.07x to 1.13x and 0.87x
+     * to 0.92x for this rule (which at --spec 8 loses there too). A rejected draft still
+     * costs its position's experts and arithmetic in the sweep. So the gate stays; the
+     * study's cost-aware stop rule is the candidate to replace it, not yet measured on
+     * K3. Rules: match length 4 (then 3); if the n-gram occurred more than once, every
+     * occurrence must propose the same next id, and the draft stops at the first
+     * position where historical continuations diverge. */
     if (cap > K3_SPEC_MAX) cap = K3_SPEC_MAX;
     for (int n = 4; n >= 3; n--) {
         if (T < n + 1) continue;
@@ -392,7 +397,10 @@ static void usage(FILE *f)
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
 "  --trunk-rows          exact double-buffered matrix rows; needs --trunk\n"
 "                        bounded buffers, no pins; a batch of positions reads each\n"
-"                        matrix once (--kv-latent still rereads kv_b per position)\n"
+"                        matrix once (--kv-latent still rereads kv_b per position).\n"
+"                        --trunk-gb (default 16) then caps two row buffers of at most\n"
+"                        8 MiB each plus the current layer's vectors, and the memory\n"
+"                        plan charges the whole budget; pass a small one\n"
 "  --cache-gb X          routed-expert cache budget\n"
 "  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
 "                        recurrent-state slot during full recompute; needs --trunk\n"
@@ -432,8 +440,10 @@ static void usage(FILE *f)
 "  --spec N              speculative decode: draft up to N tokens by n-gram lookup and\n"
 "                        verify them in ONE batched sweep. Output is identical to\n"
 "                        serial decode by construction; needs --incremental. A sweep\n"
-"                        reads the trunk and lm_head once for all its positions; each\n"
-"                        extra position still costs its own experts and arithmetic.\n"
+"                        reads the trunk and lm_head once for all its positions (but\n"
+"                        --kv-latent with --trunk-rows rereads kv_b for every cached\n"
+"                        position it rebuilds); each extra position still costs its\n"
+"                        own experts and arithmetic.\n"
 "                        No full-checkpoint speedup has been measured.\n"
 "                        A rejected draft costs no second sweep: the sweep is tentative\n"
 "                        and only the accepted positions are committed\n"
@@ -890,7 +900,7 @@ int main(int argc, char **argv)
      * past the end-of-message marker that a caller will only throw away. */
     int stop_id[8]; int n_stop = 0, hit_stop = 0, stopped_at = -1;
     double cache_gb = 64.0, trunk_gb = 16.0;
-    double memory_plan_bytes = 0.0;
+    double memory_plan_bytes = 0.0, all_logits_bytes = 0.0;
     int budget_auto = 0;
     int spec_n = 0;
     int tf_check = 0;
@@ -1016,8 +1026,12 @@ int main(int argc, char **argv)
         return 2;
     }
     const int head_streamed = ultra || stream_lm_head;
+    /* An omitted --trunk-gb is not refused: the 16 GB default becomes the row budget,
+     * which the row pipeline caps at two 8 MiB buffers plus the current layer's vectors,
+     * and which the memory plan below charges in full. Only a computed (auto) budget and
+     * a draft trunk are refused. */
     if (trunk_rows && (!trunk_dir || draft_dir || budget_auto)) {
-        fprintf(stderr, "--trunk-rows needs --trunk and an explicit --trunk-gb; "
+        fprintf(stderr, "--trunk-rows needs --trunk; --trunk-gb auto, --preset auto and "
                         "draft trunks are unsupported\n");
         return 2;
     }
@@ -1433,8 +1447,15 @@ int main(int argc, char **argv)
             ? 4.0 * ((double)n_kda * (spec_n + 1) * (draft_dir ? 2.0 : 1.0)
                      * (double)k3_kda_log_row(&c) + (double)k3_kda_state_floats(&c))
             : 0.0;
-        const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv + w_spec;
+        /* --dump-all-logits under --spec (or a draft trunk) keeps every position of a verify
+         * sweep's logits until the kept ones are written: K3_SPEC_MAX + 1 vectors, the
+         * allocation made with the dump file below. */
+        const double w_dump = (all_logits_path && spec_n > 0)
+            ? (double)(K3_SPEC_MAX + 1) * c.vocab * sizeof(float) : 0.0;
+        const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv + w_spec
+                            + w_dump;
         memory_plan_bytes = need_b;
+        all_logits_bytes = w_dump;
         const double have = mem_available_bytes();
 
         char b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
@@ -1445,12 +1466,22 @@ int main(int argc, char **argv)
         printf("\nmemory plan\n");
         printf("  trunk %-10s %s\n  embed + lm_head  %s %s\n  expert cache     %s\n"
                "  recurrent state  %s\n  buffers          %s\n  KV cache         %s%s\n",
-               trunk_dir ? "(STREAMED)" : "(resident)", b1, b2,
+               trunk_rows ? "(ROWS)" : trunk_dir ? "(STREAMED)" : "(resident)", b1, b2,
                ultra ? "(STREAMED)" : (head_streamed ? "(lm_head streamed)" : "(resident)"),
                b3, b4, b5, b7, kv_latent ? "  (latent layout)" : "");
+        /* The plan charges a row budget as given; say so, since the row pipeline itself
+         * never holds more than two 8 MiB buffers and one layer's vectors. */
+        if (trunk_rows)
+            printf("                   (the whole --trunk-gb budget is charged; rows allocate "
+                   "at most two 8 MiB buffers\n                    and the current layer's "
+                   "vectors, reported once the trunk is open)\n");
         if (w_spec > 0.0) {
             human(w_spec, b7, sizeof b7);
             printf("  spec log         %s  (KDA recurrence inputs per position)\n", b7);
+        }
+        if (w_dump > 0.0) {
+            human(w_dump, b7, sizeof b7);
+            printf("  all-logits dump  %s  (every position of one verify sweep)\n", b7);
         }
         printf("  TOTAL            %s\n", b6);
         if (have > 0.0) {
@@ -1674,8 +1705,8 @@ int main(int argc, char **argv)
      * read). KDA layers fold every position into their state in place, so the old scheme
      * copied the whole carried state before each sweep, restored it on a rejection and
      * replayed the accepted prefix through a SECOND forward: at K3 scale that re-reads the
-     * 108.81 GB trunk and the prefix's experts, which is why an eager drafter measured
-     * 0.91x on code.
+     * 108.81 GB trunk and the prefix's experts, part of why an eager drafter measured
+     * 0.91x on code (spec_draft says what the rest was).
      *
      * Instead the sweep is tentative. Each KDA layer runs on a one-layer work copy and
      * leaves its carried state alone, recording its recurrence inputs per position; once
@@ -2188,7 +2219,7 @@ int main(int argc, char **argv)
                 "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
                 "\"spec_full_accepts\":%ld,\"spec_partial_accepts\":%ld,"
                 "\"spec_cut_by_stop\":%ld,\"spec_dropped_positions\":%ld,"
-                "\"spec_log_bytes\":%.0f,\"logit_block_bytes\":%.0f,"
+                "\"spec_log_bytes\":%.0f,\"logit_block_bytes\":%.0f,\"all_logits_bytes\":%.0f,"
                 "\"draft_forward_sweeps\":%ld,"
                 "\"draft_accepted\":%ld,\"draft_dropped_positions\":%ld,"
                 "\"spec_trace\":[",
@@ -2212,6 +2243,7 @@ int main(int argc, char **argv)
                 spec_full, spec_partial, spec_cut, spec_dropped,
                 spec_log_bytes,
                 (double)sizeof(float) * (w.logit_block ? (double)w.logit_rows * c.vocab : 0.0),
+                w.all_logits ? all_logits_bytes : 0.0,
                 dw.forwards, hyb_accepted, draft_dropped);
         for (long i = 0; i < spec_sweeps && i < gen + 1; i++)
             fprintf(f, "%s[%d,%d,%d]", i ? "," : "", spec_trace[3 * i],

@@ -216,7 +216,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hybrid `--draft-trunk` path commits the same way and folds its catch-up into the
   next round's first call, so it runs no replay, catch-up or lockstep sweeps either.
   The run report and `--out` JSON count verify sweeps, acceptances and forward sweeps
-  per decode step; the new `--dump-all-logits` writes the logits behind every token.
+  per decode step; the new `--dump-all-logits` writes the logits behind every token,
+  and under `--spec` the memory plan counts the sweep's worth of logits it holds
+  (`K3_SPEC_MAX + 1` vocabulary rows, `all_logits_bytes` in `k3_run.json`).
   Gated by `test_kda_exact`, oracle GATE 4 and CLI parity tests across memory modes.
 - **Trunk layers are read in parallel chunks.** `load_run()` streamed each layer with
   one sequential `pread` loop, so the device saw queue depth 1. It now splits the layer

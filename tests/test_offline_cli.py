@@ -921,13 +921,18 @@ class OfflineCliTests(unittest.TestCase):
                 self.assertEqual(serial[0]["decode_steps"], 12)
                 self.assertEqual(serial[0]["spec_log_bytes"], 0)
                 # The plan counts exactly what --spec allocates, and nothing more: the
-                # rollback log, and the block a verify sweep's SPEC + 1 logit vectors are
-                # projected into with one pass over lm_head.
+                # rollback log, the block a verify sweep's SPEC + 1 logit vectors are
+                # projected into with one pass over lm_head, and, because run_logits passes
+                # --dump-all-logits, the K3_SPEC_MAX + 1 = 9 vectors a sweep's logits are
+                # kept in until the kept ones are written.
                 self.assertGreater(report["spec_log_bytes"], 0)
                 self.assertEqual(serial[0]["logit_block_bytes"], 0)
                 self.assertEqual(report["logit_block_bytes"], (self.SPEC + 1) * 256 * 4)
+                self.assertEqual(serial[0]["all_logits_bytes"], 0)
+                self.assertEqual(report["all_logits_bytes"], 9 * 256 * 4)
                 self.assertEqual(report["memory_plan_bytes"] - serial[0]["memory_plan_bytes"],
-                                 report["spec_log_bytes"] + report["logit_block_bytes"])
+                                 report["spec_log_bytes"] + report["logit_block_bytes"]
+                                 + report["all_logits_bytes"])
                 seen.update("full" if s[1] == s[0] else "partial%d" % s[1]
                             for s in report["spec_trace"])
         self.assertTrue({"partial0", "partial1", "partial2", "partial3", "full"} <= seen, seen)
