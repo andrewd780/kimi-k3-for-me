@@ -107,3 +107,5 @@
 {"type":"failed","key":"v2:fb2384209301706ea072159ffcdb2785626b2b6be121edb20ec99f8aa2efd391","agentId":"a8b2e9653808d5fca"}
 {"type":"started","key":"v2:786818f941c4a3fc6627355ea66774ffd164dc1628716185f06f05eda1eae6af","agentId":"a3bd978e6ec13d404","label":"recheck","phase":"Recheck"}
 {"type":"failed","key":"v2:786818f941c4a3fc6627355ea66774ffd164dc1628716185f06f05eda1eae6af","agentId":"a3bd978e6ec13d404"}
+{"type":"started","key":"v2:70884e869370c7747090bb7d98c95e6dfa794d2035ceda8ed1c68f8ae2190131","agentId":"a8997c744599f46ce","label":"verify:#14:Contention and MLA timings were measured:0","phase":"Verify"}
+{"type":"started","key":"v2:cf4491c7b0b702744c8fe393cf4397552e71f21b38c527ec43e4552c05e83933","agentId":"adbb44f72667072c7","label":"verify:#14:Contention and MLA timings were measured:1","phase":"Verify"}
