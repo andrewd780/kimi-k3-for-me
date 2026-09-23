@@ -1,9 +1,10 @@
 # Five proposals: code, experiments and unresolved gates
 
-Updated 2026-09-20. Follow-up to [the research queue](research-queue.md), in
-[PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12). All native runs are
-hosted CI. Andrew's machines were not used. There is no full-checkpoint host and
-no new full-model seconds/token result.
+Updated 2026-09-23. Follow-up to [the research queue](research-queue.md), in
+[PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12). Native runs are
+hosted CI, except the batched-kernel timings in section 1, taken on a cloud
+development VM. Andrew's machines were not used. There is no full-checkpoint host
+and no new full-model seconds/token result.
 
 ## 1. Bounded trunk rows: implemented, opt-in
 
@@ -57,6 +58,113 @@ swap disabled. These prove synthetic mechanism/exactness, not full-model speed.
 Sanitizers also exposed the old reader's leaked parsed JSON tree. Tensor names
 now keep an explicit owner freed on close/error. The old parallel read loop's
 shared error flag now uses an OpenMP reduction.
+
+### Batched kernel timing
+
+The batched matmul is measured on its own with `bench_batch`: weights resident in
+RAM (176 MB and 2.35 GB, far beyond cache), no SSD reads, the same bf16 inputs
+through `k3_matmul_bf16_batch` and through a loop of one-position `k3_matmul_bf16`
+calls. What it shows is compute: the loop widens every weight once per position,
+the batch once per register block of positions.
+
+Conditions, 2026-09-23, commit 9ca67f5: a shared cloud development VM with 4 vCPUs
+reported as "Intel(R) Xeon(R) Processor @ 2.80GHz" (AVX-512F/BW/DQ/VL/VNNI), 15 GB
+RAM, Linux 6.18, gcc 13.3.0, the Makefile's `-O3 -march=native -ffp-contract=off
+-fopenmp` unless stated, `OMP_NUM_THREADS=4 OMP_PROC_BIND=close`. Each run times one
+thread, then four. Three runs per arm, interleaved (trunk shape, trunk shape on the
+AVX2 baseline, lm_head shape, three times over); within a run, 15 calls per cell (7 at
+lm_head's shape) after one untimed call. Cells give the median of the three run
+medians and, in parentheses, the fastest call of all runs; speedup is loop median
+over batched median. Before every run the runner waited for the 1-minute load to
+fall below 1.0; it read 0.12 to 0.99, and `ps` showed no other process using CPU,
+so that load was the decay of the previous arm. **In all nine runs every batched
+output was bit-identical to the per-position loop, at every T and both thread
+counts.** Across the 56 cells, the largest of a cell's three run medians exceeded
+the smallest by 4.3% at the median and by 32% at worst, in one of the shortest cells
+(four threads, T = 2, AVX2 baseline: 8.8 to 11.6 ms); read differences under about
+10% as noise.
+
+Trunk shape, 12288 x 7168 (a KDA q/k/v/g projection), `-march=native`: AVX-512VL,
+so positions share a widened weight in register blocks of 8 (`bench_batch 15`).
+
+| Threads | T | Per-position loop, ms | Batched, ms | Batched ms/position | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 31.2 (29.3) | 30.7 (29.3) | 30.74 | 1.01x |
+| 1 | 2 | 61.9 (58.0) | 35.3 (34.1) | 17.64 | 1.76x |
+| 1 | 4 | 126.0 (117.0) | 47.4 (46.5) | 11.84 | 2.66x |
+| 1 | 8 | 248.3 (236.6) | 81.7 (80.5) | 10.21 | 3.04x |
+| 4 | 1 | 8.1 (7.6) | 8.1 (7.5) | 8.08 | 1.00x |
+| 4 | 2 | 16.3 (15.3) | 9.3 (8.7) | 4.66 | 1.75x |
+| 4 | 4 | 32.8 (31.0) | 12.4 (11.9) | 3.09 | 2.65x |
+| 4 | 8 | 64.9 (61.9) | 20.7 (20.2) | 2.58 | 3.14x |
+
+The same shape on the shipping AVX2 baseline, `ARCH='-mavx2 -mfma'`: blocks of 4.
+
+| Threads | T | Per-position loop, ms | Batched, ms | Batched ms/position | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 30.2 (28.9) | 30.1 (29.0) | 30.12 | 1.00x |
+| 1 | 2 | 61.4 (58.8) | 35.8 (34.2) | 17.88 | 1.72x |
+| 1 | 4 | 123.0 (117.2) | 49.6 (48.7) | 12.40 | 2.48x |
+| 1 | 8 | 244.4 (237.1) | 95.0 (92.8) | 11.87 | 2.57x |
+| 4 | 1 | 8.2 (7.6) | 8.0 (7.5) | 7.99 | 1.03x |
+| 4 | 2 | 15.8 (15.0) | 9.4 (8.6) | 4.71 | 1.68x |
+| 4 | 4 | 32.1 (29.8) | 12.7 (12.1) | 3.19 | 2.52x |
+| 4 | 8 | 65.7 (59.4) | 24.7 (23.5) | 3.08 | 2.67x |
+
+lm_head shape, 163840 x 7168, `-march=native` (`bench_batch 7 163840 16`). T = 9 is
+a `--spec 8` verify sweep, T = 16 one `--score-prompt` / `--tf-check` block.
+
+| Threads | T | Per-position loop, ms | Batched, ms | Batched ms/position | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 391 (375) | 384 (367) | 384.3 | 1.02x |
+| 1 | 2 | 808 (744) | 469 (447) | 234.7 | 1.72x |
+| 1 | 4 | 1,584 (1,494) | 646 (620) | 161.4 | 2.45x |
+| 1 | 8 | 3,172 (3,082) | 1,099 (1,075) | 137.4 | 2.89x |
+| 1 | 9 | 3,679 (3,356) | 1,359 (1,311) | 151.0 | 2.71x |
+| 1 | 16 | 6,450 (6,188) | 2,196 (2,133) | 137.3 | 2.94x |
+| 4 | 1 | 106 (99) | 105 (99) | 105.4 | 1.00x |
+| 4 | 2 | 206 (197) | 124 (116) | 62.0 | 1.66x |
+| 4 | 4 | 424 (400) | 167 (158) | 41.7 | 2.54x |
+| 4 | 8 | 852 (809) | 306 (273) | 38.2 | 2.78x |
+| 4 | 9 | 983 (951) | 354 (334) | 39.3 | 2.78x |
+| 4 | 16 | 1,747 (1,629) | 565 (543) | 35.3 | 3.09x |
+
+Reading them:
+
+- At T = 1 the batch hands the position to the existing kernel, so its 1.00x to
+  1.03x is the noise floor.
+- The kernel is compute-bound. The loop runs at 5.7 GFLOP/s on one thread and
+  about 21.7 on four (3.8x), and batched T = 8 scales 3.95x from one thread to four,
+  while its weight traffic falls to about 8.5 GB/s. The gain is widening each
+  weight once per block, not bandwidth.
+- At T = 8 on the trunk shape a position costs 2.58 ms instead of 8.1 ms on four
+  threads (3.14x). The `-march=native` build's batched call takes 14% less time
+  than the AVX2 baseline's on one thread (81.7 vs 95.0 ms) and 16% less on four
+  (20.7 vs 24.7 ms), 3% to 5% less at T = 4, the same at T = 1. The builds differ in instruction set as
+  well as block width, so this does not isolate the block width; the forced
+  `K3_MM_TB` comparison in the CHANGELOG does.
+- At lm_head's shape, a `--spec 8` sweep (T = 9) takes 354 ms on four threads instead
+  of 983 ms (2.78x). It costs 39.3 ms per position against 38.2 at T = 8 because
+  9 positions are a block of 8 plus a block of 1. A 16-position block takes 565 ms
+  instead of 1,747 (3.09x).
+- Arithmetic from these cells, not a model measurement: with the head resident,
+  the projection of a 512-position `--score-prompt` would be 32 blocks x 0.565 s,
+  about 18 s, instead of 512 x 0.106 s, about 54 s, on four threads. Under
+  `--stream-lm-head` the block also reads the 2.35 GB head once instead of 16 times;
+  that I/O is not timed here.
+
+The header line prints `built AVX2` for both x86 builds; it names the vector
+kernel, not the register block, which comes from `__AVX512VL__`.
+
+**Not run: full-checkpoint A/B.** The planned comparisons of the pre-batching
+build (b0c8b74) against this one, a 64-token `--trunk-rows` prefill (`wall_seconds`,
+`trunk_bytes_read`, `trunk_matrix_calls`), `--incremental --spec 8 --gen 64
+--stream-lm-head` (`seconds_per_token`, `lm_head_bytes_read`, `spec_accepted`,
+identical ids) and a 512-token `--score-prompt` with and without
+`--stream-lm-head` (wall time, lm_head bytes, identical `token_nll`), all at
+`--trunk-gb 8 --cache-gb 4`, need the packed checkpoint. This VM has none: the BF16
+trunk alone is 108.81 GB against 20 GB of free disk. They remain for a host that
+holds it.
 
 ## 2. Compact Huffman decoder: research prototype
 

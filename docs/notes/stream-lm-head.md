@@ -12,7 +12,11 @@ per `--spec` verify sweep, whose positions are projected together from each chun
 (`k3_model_stream_project_batch`), and once per block of up to 16 positions for
 `--tf-check` and `--score-prompt`, which need every position's logits. Each position's
 logits are bit-identical to projecting it alone. Those are geometry and mechanism
-calculations, not measured full-model memory or throughput results.
+calculations, not measured full-model memory or throughput results. The batched
+projection's compute alone, with the head resident and no reads, is timed at the
+head's shape in [the batched kernel timing](research-results.md#batched-kernel-timing):
+on four threads a `--spec 8` sweep takes 354 ms instead of 983 ms and a 16-position
+block 565 ms instead of 1,747 ms.
 
 Fixed presets and explicit `--trunk-gb` values stay explicit. The flag alone frees
 memory; to fund the second trunk slot, give that memory to the trunk budget. For
