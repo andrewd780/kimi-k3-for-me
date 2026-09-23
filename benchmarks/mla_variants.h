@@ -203,6 +203,20 @@ static void mla_project_kv(float *ct, const float *x, const K3MlaW *w, const K3C
     }
 }
 
+/* ONE application of kv_b: one position's latent in, all H heads' k_nope and v out.
+ * Every full-matrix kv_b call in this file goes through here, so mla_kvb_calls is an
+ * exact count of them. The test holds that count to mla_rebuilds() for every variant,
+ * and bench_mla's `counts` mode reports it; counts, unlike timings, do not move with
+ * machine load. The calls are all made from serial code (k3_mmw threads INSIDE the
+ * kernel), so a plain counter is race-free. */
+static unsigned long long mla_kvb_calls;
+
+static inline void mla_kvb(float *out, const float *lat, const K3MlaW *w, const K3Cfg *c)
+{
+    mla_kvb_calls++;
+    k3_mmw(out, lat, w->kv_b, w->wdt, c->kv_lora, c->n_heads * (c->qk_nope + c->v_head));
+}
+
 /* Store the T new tokens at positions C..C+T-1: the latent layout keeps the kv_b INPUT,
  * the expanded layout the kv_b OUTPUT, and both keep the rope row. */
 static void mla_append(MlaCache *k, int latent, const float *ct, int T, int C,
@@ -215,7 +229,7 @@ static void mla_append(MlaCache *k, int latent, const float *ct, int T, int C,
         const float *ctt = ct + (size_t)t * kvw;
         memcpy(k->rope + (size_t)p * qr, ctt + kvl, (size_t)qr * sizeof(float));
         if (latent) memcpy(k->kv + (size_t)p * kvl, ctt, (size_t)kvl * sizeof(float));
-        else        k3_mmw(k->kv + (size_t)p * H * kvd, ctt, w->kv_b, w->wdt, kvl, H * kvd);
+        else        mla_kvb(k->kv + (size_t)p * H * kvd, ctt, w, c);
     }
 }
 
@@ -244,15 +258,28 @@ static inline void mla_probe_row(float *probe, const float *row, int t, int h, i
         memcpy(probe + ((size_t)t * H + h) * N, row, (size_t)(p + 1) * sizeof(float));
 }
 
+/* The softmax normaliser z of row (t, h), for the test: mla_zprobe[t*H + h]. z is a
+ * double sum of positive terms that only ever reaches the output as p = (float)(e / z),
+ * where a reordered sum would round to the same float almost surely; recording z itself
+ * is what lets the test hold its ORDER to E's bit for bit. NULL (no recording) except in
+ * tests/unit/test_mla_variants.c. Each (t, h) is written by one thread. */
+static double *mla_zprobe;
+
+static inline void mla_probe_z(int t, int h, int H, double z)
+{
+    if (mla_zprobe) mla_zprobe[(size_t)t * H + h] = z;
+}
+
 /* The engine's softmax form, in place over row[0..p]: max ascending, expf(x - m) and a
- * double sum ascending, then p = (float)(e / z) folded back into the row. */
-static inline void mla_softmax_row(float *row, int p)
+ * double sum ascending, then p = (float)(e / z) folded back into the row. Returns z. */
+static inline double mla_softmax_row(float *row, int p)
 {
     float m = -INFINITY;
     for (int s = 0; s <= p; s++) if (row[s] > m) m = row[s];
     double z = 0.0;
     for (int s = 0; s <= p; s++) { row[s] = expf(row[s] - m); z += row[s]; }
     for (int s = 0; s <= p; s++) row[s] = (float)(row[s] / z);
+    return z;
 }
 
 /* -------------------------------------------------------------------- E ---- */
@@ -282,6 +309,7 @@ static void mla_attend_E(float *acc, const float *q, int T, int C, const MlaCach
             mla_probe_row(probe, sc, t, h, H, N, p);
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            mla_probe_z(t, h, H, z);
 
             float *o = acc + ((size_t)t * H + h) * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
@@ -365,7 +393,7 @@ static void mla_attend_EP(float *acc, const float *q, int T, int C, const MlaCac
         for (int t = 0; t < T; t++) {
             float *r = sh + (size_t)t * N;
             mla_probe_row(probe, r, t, h, H, N, C + t);
-            mla_softmax_row(r, C + t);
+            mla_probe_z(t, h, H, mla_softmax_row(r, C + t));
             float *o = acc + ((size_t)t * H + h) * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
         }
@@ -396,7 +424,7 @@ static void mla_attend_L0(float *acc, const float *q, int T, int C, const MlaCac
     for (int t = 0; t < T; t++) {
         const int p = C + t;
         for (int s = 0; s <= p; s++) {
-            k3_mmw(kb, k->kv + (size_t)s * kvl, w->kv_b, w->wdt, kvl, H * kvd);
+            mla_kvb(kb, k->kv + (size_t)s * kvl, w, c);
             const float *kr = k->rope + (size_t)s * qr;
             for (int h = 0; h < H; h++) {
                 const float *qt = q + ((size_t)t * H + h) * qh;
@@ -414,12 +442,13 @@ static void mla_attend_L0(float *acc, const float *q, int T, int C, const MlaCac
             for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
+            mla_probe_z(t, h, H, z);
             for (int s = 0; s <= p; s++) sh[s] = (float)(sh[s] / z);
             float *o = acc + ((size_t)t * H + h) * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
         }
         for (int s = 0; s <= p; s++) {
-            k3_mmw(kb, k->kv + (size_t)s * kvl, w->kv_b, w->wdt, kvl, H * kvd);
+            mla_kvb(kb, k->kv + (size_t)s * kvl, w, c);
             for (int h = 0; h < H; h++) {
                 const float pr = sc[(size_t)h * N + s];
                 float *o = acc + ((size_t)t * H + h) * vh;
@@ -451,8 +480,7 @@ static void mla_attend_L1(float *acc, const float *q, int T, int C, const MlaCac
     for (int s0 = 0; s0 < N; s0 += MLA_BLOCK) {
         const int nb = N - s0 < MLA_BLOCK ? N - s0 : MLA_BLOCK;
         for (int b = 0; b < nb; b++)
-            k3_mmw(kbuf + (size_t)b * H * kvd, k->kv + (size_t)(s0 + b) * kvl, w->kv_b,
-                   w->wdt, kvl, H * kvd);
+            mla_kvb(kbuf + (size_t)b * H * kvd, k->kv + (size_t)(s0 + b) * kvl, w, c);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -481,7 +509,7 @@ static void mla_attend_L1(float *acc, const float *q, int T, int C, const MlaCac
         const int t = th / H, h = th % H;
         float *r = sc + (size_t)th * N;
         mla_probe_row(probe, r, t, h, H, N, C + t);
-        mla_softmax_row(r, C + t);
+        mla_probe_z(t, h, H, mla_softmax_row(r, C + t));
         float *o = acc + (size_t)th * vh;
         for (int j = 0; j < vh; j++) o[j] = 0.0f;
     }
@@ -491,8 +519,7 @@ static void mla_attend_L1(float *acc, const float *q, int T, int C, const MlaCac
         const int nb = N - s0 < MLA_BLOCK ? N - s0 : MLA_BLOCK;
         for (int b = 0; b < nb; b++)
             if (s0 + b >= vcap)
-                k3_mmw(kbuf + (size_t)b * H * kvd, k->kv + (size_t)(s0 + b) * kvl,
-                       w->kv_b, w->wdt, kvl, H * kvd);
+                mla_kvb(kbuf + (size_t)b * H * kvd, k->kv + (size_t)(s0 + b) * kvl, w, c);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -607,7 +634,7 @@ static int mla_attend_A(float *acc, const float *q, int T, int C, const MlaCache
         const int t = th / H, h = th % H;
         float *r = sc + (size_t)th * N;
         mla_probe_row(probe, r, t, h, H, N, C + t);
-        mla_softmax_row(r, C + t);
+        mla_probe_z(t, h, H, mla_softmax_row(r, C + t));
         float *ut = u + (size_t)th * kvl;
         for (int j = 0; j < kvl; j++) ut[j] = 0.0f;
     }
@@ -673,8 +700,18 @@ static int mla_attend(int v, float *acc, const float *q, const float *ct, int T,
     return -1;
 }
 
-/* kv_b applications per call, the unit of latent-path cost (and, under --trunk-rows,
- * of 25 MB kv_b re-reads from disk at K3 dimensions). */
+/* Full kv_b applications (mla_kvb calls) per call, the unit of latent-path cost (and,
+ * under --trunk-rows, of 25 MB kv_b re-reads from disk at K3 dimensions). They depend
+ * only on (C, T, vcap), never on the geometry, which is why the test and bench_mla's
+ * `counts` mode can count them on the fixture geometry and quote them for K3's.
+ *   E, E+  T: each new token's k and v are built once, when it is appended.
+ *   L0     2 * sum_t (C + t + 1) = 2T(C + 1) + T(T - 1): every visible position, twice,
+ *          per query token. At C = 0 (a prefill) that is T(T + 1), QUADRATIC in T.
+ *   L1     N + (N - vcap) with N = C + T: once per position per call, plus a second
+ *          time for the positions beyond the value-row budget. LINEAR in T.
+ *   A      0: A never applies the whole of kv_b to anything. Its absorption (W_uk^T q)
+ *          and output (W_uv u) are per-head slices, T kv_b's worth of multiply-adds in
+ *          all, which mla_macs counts. */
 static inline double mla_rebuilds(int v, int T, int C, int vcap)
 {
     const double t = T, n = (double)C + T;
@@ -684,7 +721,7 @@ static inline double mla_rebuilds(int v, int T, int C, int vcap)
     case MLA_E: case MLA_EP: return t;                        /* appending new tokens */
     case MLA_L0: return 2.0 * (t * ((double)C + 1.0) + t * (t - 1.0) / 2.0);
     case MLA_L1: return n + (n - (double)vcap);
-    case MLA_A:  return t;   /* W_uk once and W_uv once per query token: one kv_b's MACs */
+    case MLA_A:  return 0.0;
     }
     return 0.0;
 }
