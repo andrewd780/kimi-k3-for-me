@@ -344,10 +344,15 @@ static void t_recur(const char *dir, const char *file)
 }
 
 /* The router as it was written before experts were interleaved: one expert at a time,
- * one double chain over i = 0..hidden-1. Kept verbatim as the bitwise reference. */
+ * one double chain over i = 0..hidden-1. The R_RIGHT branch is kept verbatim as the
+ * bitwise reference; the other two are WRONG orders, computed on the same data only to
+ * prove that data can tell them from the right one (see router_matches_plain_form). */
+enum { R_RIGHT, R_REVERSED, R_TWO_CHAINS, R_COUNT };
+static const char *RNAME[R_COUNT] = { "right", "reversed chain", "even/odd chains" };
+
 static void router_plain(int *idx, float *w, const float *x, const float *W,
                          const float *bias, int hidden, int n_experts, int topk,
-                         int renorm, float routed_scale)
+                         int renorm, float routed_scale, int mut)
 {
     float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
     float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
@@ -355,7 +360,18 @@ static void router_plain(int *idx, float *w, const float *x, const float *W,
     for (int e = 0; e < n_experts; e++) {
         const float *row = W + (size_t)e * hidden;
         double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
+        if (mut == R_REVERSED) {
+            for (int i = hidden - 1; i >= 0; i--) acc += (double)row[i] * (double)x[i];
+        } else if (mut == R_TWO_CHAINS) {
+            double a0 = 0.0, a1 = 0.0;
+            for (int i = 0; i < hidden; i++) {
+                if (i & 1) a1 += (double)row[i] * (double)x[i];
+                else       a0 += (double)row[i] * (double)x[i];
+            }
+            acc = a0 + a1;
+        } else {
+            for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
+        }
         score[e]  = 1.0f / (1.0f + expf(-(float)acc));
         choice[e] = score[e] + (bias ? bias[e] : 0.0f);
     }
@@ -376,41 +392,158 @@ static void router_plain(int *idx, float *w, const float *x, const float *W,
     free(score); free(choice);
 }
 
-static int router_matches_plain_form(void)
+/* xorshift32, for the generated tests below that carry their own seed. */
+static unsigned xs32(unsigned *s)
+{
+    *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5;
+    return *s;
+}
+
+/* Uniform in [-a, a). */
+static float xs_unit(unsigned *s, float a)
+{
+    return ((float)(xs32(s) >> 8) / 8388608.0f - 1.0f) * a;
+}
+
+/* Router inputs. ORDINARY: W in +-0.05, x in +-1, bias in +-0.01, the distribution a
+ * router sees. CANCELLING, what makes a wrong summation order VISIBLE: each expert's row
+ * also carries +2^40 and -2^40 on two of four slots shared by the matrix, where x holds
+ * one value v. The exact logit is still just the ordinary terms, but in double every
+ * ordinary term added while the +-2^40 partial sum is live is rounded to its grid of
+ * 2^-12, and which terms those are, and what the running sum is at each rounding, is
+ * fixed by the order of the chain. So a reordered or split chain moves the logit by
+ * 3e-7 to 2.4e-4 (measured for a reversed chain over these shapes), where the float
+ * spacing of these logits, all below 5 in magnitude, is 5e-7 or finer, not by a last
+ * double bit that the narrowing to float erases; the sigmoid carries it into the score. 2^40 and not larger: at 2^60 the grid is 256, every term that meets
+ * the big sum is lost outright, and two wrong orders could lose the same terms and
+ * agree. A float times a float is exact in double and the pair cancels exactly, so
+ * nothing overflows and the exact logit is unchanged. */
+static void router_fill(float *W, float *x, float *b, int E, int H, int cancel,
+                        unsigned *s)
+{
+    for (size_t i = 0; i < (size_t)E * H; i++)
+        W[i] = xs_unit(s, 0.05f);
+    for (int i = 0; i < H; i++)
+        x[i] = xs_unit(s, 1.0f);
+    for (int e = 0; e < E; e++)
+        b[e] = xs_unit(s, 0.01f);
+    if (!cancel || H < 4) return;
+    int big[4];
+    for (int k = 0; k < 4; k++) {
+        int dup;
+        do {
+            big[k] = (int)(xs32(s) % (unsigned)H);
+            dup = 0;
+            for (int m = 0; m < k; m++) if (big[m] == big[k]) dup = 1;
+        } while (dup);
+    }
+    const float v = ((xs32(s) & 1u) ? -1.0f : 1.0f)
+                  * (1.0f + (float)(xs32(s) & 0xFFu) / 256.0f);
+    for (int k = 0; k < 4; k++) x[big[k]] = v;
+    for (int e = 0; e < E; e++) {
+        float *row = W + (size_t)e * H;
+        for (int k = 0; k < 4; k++) row[big[k]] = 0.0f;
+        const int p = (int)(xs32(s) % 4u);
+        int q = (int)(xs32(s) % 3u);
+        if (q >= p) q++;
+        row[big[p]] =  1099511627776.0f;   /* +2^40 */
+        row[big[q]] = -1099511627776.0f;   /* -2^40 */
+    }
+}
+
+/* Every expert's score back in expert order: with topk == n_experts, renorm off and a
+ * routed_scale of 1, w[j] IS score[idx[j]]. */
+static void router_scores(float *sc, const int *idx, const float *w, int E)
+{
+    for (int j = 0; j < E; j++) sc[idx[j]] = w[j];
+}
+
+/* k3_router held BITWISE to router_plain, which it replaced, over expert counts that fill
+ * whole blocks, leave a tail, or are smaller than one block, including the released
+ * 896 x 7168. Two legs per shape:
+ *
+ *   ordinary data with the released settings (renorm, routed_scale, top-k), which is
+ *   what the kernel sees; and cancelling data with topk == n_experts, renorm off and a
+ *   routed_scale of 1, so every expert's score is compared, not only the top-k.
+ *
+ * The cancelling leg is what gives this teeth. On ordinary data a reordered double chain
+ * does not reach the float logit: measured on this distribution at 896 x 7168 over 100
+ * inputs, a reversed or an even/odd split chain changed the double in about 97% of the
+ * 89,600 logits and the float logit, and so the score, in none. So every shape also computes two WRONG orders on the cancelling data
+ * -- the chain reversed, and split into even and odd chains added at the end -- and each
+ * must change the scores of at least one expert in every shape and of most experts
+ * overall; if the data ever stops telling orders apart, this fails instead of passing
+ * vacuously. The full-block and tail paths each have shapes of their own here. */
+static int router_matches_plain_form(long teeth[R_COUNT], long *scored)
 {
     const int shapes[][3] = {           /* n_experts, hidden, topk */
         {1, 33, 1}, {7, 64, 3}, {8, 130, 2}, {9, 257, 4}, {17, 1000, 16}, {896, 7168, 16}
     };
+    const int nshape = (int)(sizeof shapes / sizeof *shapes);
     int ok = 1;
     unsigned s = 20260922u;
-    for (size_t c = 0; c < sizeof shapes / sizeof *shapes; c++) {
+    for (int c = 0; c < nshape; c++) {
         const int E = shapes[c][0], H = shapes[c][1], K = shapes[c][2];
-        float *W = (float *)malloc((size_t)E * H * sizeof(float));
-        float *x = (float *)malloc((size_t)H * sizeof(float));
-        float *b = (float *)malloc((size_t)E * sizeof(float));
-        int   ia[64], ib[64];
-        float wa[64], wb[64];
-        if (!W || !x || !b) { free(W); free(x); free(b); return 0; }
-        for (size_t i = 0; i < (size_t)E * H; i++) {
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-            W[i] = ((float)(s >> 8) / 8388608.0f - 1.0f) * 0.05f;
+        float *W  = (float *)malloc((size_t)E * H * sizeof(float));
+        float *x  = (float *)malloc((size_t)H * sizeof(float));
+        float *b  = (float *)malloc((size_t)E * sizeof(float));
+        int   *ia = (int *)malloc((size_t)E * sizeof(int));
+        int   *ib = (int *)malloc((size_t)E * sizeof(int));
+        float *wa = (float *)malloc((size_t)E * sizeof(float));
+        float *wb = (float *)malloc((size_t)E * sizeof(float));
+        float *sr = (float *)malloc((size_t)E * sizeof(float));
+        float *sm = (float *)malloc((size_t)E * sizeof(float));
+        if (!W || !x || !b || !ia || !ib || !wa || !wb || !sr || !sm) {
+            free(W); free(x); free(b); free(ia); free(ib); free(wa); free(wb);
+            free(sr); free(sm);
+            return 0;
         }
-        for (int i = 0; i < H; i++) {
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-            x[i] = (float)(s >> 8) / 8388608.0f - 1.0f;
-        }
-        for (int e = 0; e < E; e++) {
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-            b[e] = ((float)(s >> 8) / 8388608.0f - 1.0f) * 0.01f;
-        }
-        router_plain(ia, wa, x, W, b, H, E, K, 1, 2.5f);
+
+        /* ordinary data, released settings */
+        router_fill(W, x, b, E, H, 0, &s);
+        router_plain(ia, wa, x, W, b, H, E, K, 1, 2.5f, R_RIGHT);
         k3_router(ib, wb, x, W, b, H, E, K, 1, 2.5f);
         if (memcmp(ia, ib, (size_t)K * sizeof(int)) != 0 ||
             memcmp(wa, wb, (size_t)K * sizeof(float)) != 0) {
-            printf("        router blocked form differs at n_experts=%d hidden=%d\n", E, H);
+            printf("        router blocked form differs at n_experts=%d hidden=%d "
+                   "(ordinary data)\n", E, H);
             ok = 0;
         }
-        free(W); free(x); free(b);
+
+        /* cancelling data, every expert's score */
+        router_fill(W, x, b, E, H, 1, &s);
+        router_plain(ia, wa, x, W, b, H, E, E, 0, 1.0f, R_RIGHT);
+        k3_router(ib, wb, x, W, b, H, E, E, 0, 1.0f);
+        if (memcmp(ia, ib, (size_t)E * sizeof(int)) != 0 ||
+            memcmp(wa, wb, (size_t)E * sizeof(float)) != 0) {
+            printf("        router blocked form differs at n_experts=%d hidden=%d "
+                   "(cancelling data)\n", E, H);
+            ok = 0;
+        }
+        router_scores(sr, ia, wa, E);
+        for (int m = R_REVERSED; m < R_COUNT; m++) {
+            router_plain(ib, wb, x, W, b, H, E, E, 0, 1.0f, m);
+            router_scores(sm, ib, wb, E);
+            int differ = 0;
+            for (int e = 0; e < E; e++)
+                differ += memcmp(&sr[e], &sm[e], sizeof(float)) != 0;
+            teeth[m] += differ;
+            if (differ == 0) {
+                printf("        cancelling data cannot see a %s at n_experts=%d "
+                       "hidden=%d\n", RNAME[m], E, H);
+                ok = 0;
+            }
+        }
+        *scored += E;
+        free(W); free(x); free(b); free(ia); free(ib); free(wa); free(wb);
+        free(sr); free(sm);
+    }
+    for (int m = R_REVERSED; m < R_COUNT; m++) {
+        if (2 * teeth[m] < *scored) {
+            printf("        cancelling data sees a %s in only %ld of %ld scores\n",
+                   RNAME[m], teeth[m], *scored);
+            ok = 0;
+        }
     }
     return ok;
 }
@@ -461,17 +594,16 @@ static void t_router(const char *dir)
         /* k3_router walks experts in interleaved blocks; the fixture's handful of experts
          * cannot tell that apart from a one-expert-at-a-time loop, and neither can a
          * tolerance. So the blocked kernel is also held BITWISE to the plain form it
-         * replaced, over expert counts that fill whole blocks, leave a tail, or are
-         * smaller than one block, including the released 896 x 7168.
+         * replaced, on cancelling data that makes a wrong chain order change the scores
+         * (see router_matches_plain_form).
          *
-         * What this can and cannot see, from mutants run against it: a block reading the
-         * wrong expert's row FAILS, a tail block that drops its last expert FAILS, and an
-         * accumulator rounded to float per term FAILS. Reversing the order of the double
-         * sum PASSES: a few ulps of double difference almost never cross a float
-         * rounding boundary once the logit is narrowed, which is also why the logit is
-         * robust to it. The claim rests on the per-expert order being unchanged, which
-         * is argued at the kernel, not on this check detecting every reordering. */
-        const int bit_ok = router_matches_plain_form();
+         * Mutants run against it, each FAILING: the full-block chain reversed, the tail
+         * block's chain reversed, the full block summed as even and odd chains added at
+         * the end, a block reading the wrong expert's row, a tail block that drops its
+         * last expert, and an accumulator rounded to float per term. Before the
+         * cancelling leg existed the three reorderings all PASSED. */
+        long teeth[R_COUNT] = {0}, scored = 0;
+        const int bit_ok = router_matches_plain_form(teeth, &scored);
         if (set_ok && worst_w <= 1.0 && bit_ok) {
             printf("  PASS  router         rows=%-4d k=%d  index sets match, "
                    "worst weight=%.2fx tol, blocked form bitwise\n", rows, K, worst_w);
@@ -482,6 +614,9 @@ static void t_router(const char *dir)
                    bit_ok ? "bitwise" : "DIFFERS");
             g_fail++;
         }
+        printf("        wrong orders on cancelling data change: %s %ld/%ld, "
+               "%s %ld/%ld scores\n", RNAME[R_REVERSED], teeth[R_REVERSED], scored,
+               RNAME[R_TWO_CHAINS], teeth[R_TWO_CHAINS], scored);
         free(gi); free(gw);
     }
     free(W); free(bias); free(x); free(eidx); free(ewt); free(txt); free(ar);
