@@ -13,12 +13,15 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   falsifier passes (99.95% coverage, r = 0.7502); byte-exact round trips pass on
   x86/ARM under sanitizers; the rate gate passes with every SIMD run at
   14.8–26.7 reconstructed BF16 GB/s against a 4 GB/s target, 13x–15x the compact
-  Huffman kernel at a 6.1-point ratio premium. Follow-up gates: a bit-width curve
-  with entropy bounds (3 bits beats 4 by 4.60 points on the committed `f_a_proj`
-  counts), an FD3B 3-bit decoder, the FDRX row index for whole-row seeking
-  (0.034 points per row, zero padding), a per-family CI sample of all 23 trunk
-  matrix families, and a decode-under-matmul-contention benchmark whose
-  measurement is still to be taken. A supported reader remains. See [the note](docs/notes/fixed-width-trunk.md) and
+  Huffman kernel at a 6.1-point ratio premium. Follow-up gate tooling, most of it
+  awaiting hosted CI: a bit-width curve with entropy bounds (on the four committed
+  `f_a_proj` ranges only, 3 bits beats 4 by 4.60 points; eight-range figures
+  pending), an FD3B 3-bit decoder (byte-exact in local sanitizer runs; hosted
+  exactness and rate jobs pending), the FDRX row index for whole-row seeking
+  (0.034 points per row, zero padding, exact from the released shapes), a CI job
+  that samples all 23 trunk matrix families (not yet run), and a
+  decode-under-matmul-contention benchmark (not yet measured). A supported reader
+  remains. See [the note](docs/notes/fixed-width-trunk.md) and
   [results](docs/notes/research-results.md).
 - **Bounded trunk row streaming**, opt-in `--trunk-rows`: two small read/compute
   buffers, unchanged per-row arithmetic, and an explicitly sized current-layer

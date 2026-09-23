@@ -121,7 +121,7 @@ its provenance.
 
 | Gate | Status | What is known | What is pending |
 |---|---|---|---|
-| 4. Bit-width curve | **Result on committed counts** | On the four committed `f_a_proj` ranges (CI run 35462000448): 3 bits retains 0.704128, 4 bits 0.750153, 5 bits 0.8125; 3 bits gains 4.60 points over 4, above the 1.5-point prototype bar. FD3B built, byte-exact under local ASan/UBSan (scalar, SSSE3, AVX2). | Eight-range and whole-BF16 figures (histogram CI job); FD3B hosted rates |
+| 4. Bit-width curve | **Result on committed counts** | On the four committed `f_a_proj` ranges (CI run 35462000448): 3 bits retains 0.704128, 4 bits 0.750153, 5 bits 0.8125; 3 bits gains 4.60 points over 4, above the 1.5-point prototype bar. FD3B built, byte-exact under local ASan/UBSan (scalar, SSSE3, AVX2; NEON under qemu without ASan). | Eight-range and whole-BF16 figures (histogram CI job); FD3B hosted rates |
 | 5. Row-boundary cost | **Exact, from released shapes** | FDRX: zero padding at every K3 width; 0.0340 points per-row index, 0.0148 grouped; three range reads per chunk | Nothing for the cost; a container still needs a per-chunk checksum |
 | Every tensor family | **Tooling and CI job built** | Gate 1 sampled 2 of 23 families, 4.00% of trunk bytes; inventory exact | The `families` CI job's samples and the [per-family plan](#per-family-plan) decisions |
 | Decode under matmul contention | **Benchmark and model built; not measured** | Byte-exact benchmark on the engine's `k3_matmul_bf16`, break-even arithmetic unit-tested | The quiet-machine measurement ([placeholder](#decode-under-matmul-contention)); hosted x86 and arm64 legs |
@@ -322,17 +322,28 @@ both ISAs, all eight ranges, golden bytes and negative controls) and rate jobs
 as FD4B.
 
 Tests: every length 0..131 and 8193, an independently hand-packed golden stream,
-all byte values, no and all escapes, escape rates 0.1% to 90% and bursts of 1
-to 40, truncation at every length, header, table, padding-bit and slack
-corruption, escape underflow and surplus, and payload corruption caught by the
-byte comparison. They pass here for the scalar, SSSE3 and AVX2 paths under
-ASan/UBSan with gcc 13.3 and at -O3 with clang 18. The NEON path is only
-compile-checked here (clang, aarch64 target); it runs in the macos-14 jobs.
+all byte values, no and all escapes, escape rates 0.1% to 90% and bursts of 1 to
+40, truncation at every length, header, table, padding-bit and slack corruption,
+escape underflow and surplus, and payload corruption caught by the byte
+comparison. Every stream, and every row index a range is decoded through, is
+parsed and decoded from an exact-size heap copy, so ASan sees any read past its
+end. That matters for escape codes that outnumber the header's count: an FD3B
+vector step may consume up to 32 escapes and so end past the count, and only the
+check after each step keeps the scalar tail from reading on past the slack. The
+tests lower the count by 1 to 200 (both sides of `FWD3_SLACK`) with every value an
+escape or escapes only in the last 300 values, at four lengths in both formats;
+with FD3B's three per-step checks removed they fail with a heap over-read under
+ASan (SSSE3, AVX2) and on a guard page (NEON). They pass here for the scalar,
+SSSE3 and AVX2 paths under ASan/UBSan with gcc 13.3 and at -O3 with clang 18, and
+for NEON under qemu-aarch64 (gcc 13.3 cross, -O3 and UBSan; ASan does not run
+under qemu user mode, so the NEON ASan run is the macos-14 job's).
 
-Kernel rates here (Intel Xeon 2.8 GHz Cascade Lake VM, 4 vCPU, shared with other
-builds; synthetic bytes drawn from the committed four-range histogram; `bench_huf4`
-units, reconstructed GB/s, median and minimum of 15 runs interleaved with the
-other arms, load average 5.7):
+Kernel rates, **for orientation only and not admissible as a result**: they were
+taken on this VM under another agent's builds (load average 5.7) and no report
+file was kept. The hosted FD3B rate reports (`dictionary-rate-fd3b*.json`) replace
+them. (Intel Xeon 2.8 GHz Cascade Lake VM, 4 vCPU; synthetic bytes drawn from the
+committed four-range histogram; `bench_huf4` units, reconstructed GB/s, median and
+minimum of 15 runs interleaved with the other arms.)
 
 | Input | FD4B `ssse3_pshufb` | FD3B `ssse3_pshufb` | FD3B `avx2_vpshufb` |
 |---|---:|---:|---:|
@@ -340,9 +351,9 @@ other arms, load average 5.7):
 | 8 MiB | 12.61 (min 10.09) | 5.86 (min 5.26) | 8.49 (min 7.45) |
 
 With the escape patch removed (wrong output, timing only), the SSSE3 FD3B loop
-runs at FD4B's speed (about 12 GB/s on 8 MiB): the escape expansion costs it half
-its rate, which is what the AVX2 path wins back in part.
-The hosted rates and the arm64 NEON rate await CI.
+ran at FD4B's speed (about 12 GB/s on 8 MiB), which suggests the escape expansion
+costs it about half its rate and the AVX2 path wins part of it back; the same
+caveat applies. The hosted rates and the arm64 NEON rate await CI.
 
 ## Row-seekable layout: FDRX
 
@@ -377,15 +388,19 @@ are 6 MiB (FD4B) or 5.5 MiB (FD3B) plus escapes, about 0.13 MiB at 3.3%.
 exceed the group's value count; `fwd_rows_view` returns rows `[a, b)` as a view
 that both decoders accept. The index is not self-authenticating: a checkpoint off
 by one inside a group can shift escapes without a count mismatch, and the tests
-show only the independent byte comparison catches it. A deployment container
-needs a checksum per chunk. Tests (all under ASan/UBSan): every `[a, b)` of a 13 x
-64 matrix in FD4B and FD3B and an 11 x 128 FD3B matrix, G = 1, 2, 3, 7, R and
-R + 5; 40 x 512 (both widths) and 6 x 7168 (both widths) matrices with ranges
-starting and ending inside groups mid-matrix;
+show only the independent byte comparison catches it. A deployment container needs
+a checksum per chunk. The entry count is `ceil(R/G)` computed as `R/G + (R%G !=
+0)`: the usual `(R + G - 1)/G` wraps with a 32-bit `size_t` at `G` near 2^32, and
+an index with no checkpoints then parsed and had one read from past its end (shown
+with a freestanding i386 build under qemu; the hosted jobs are 64-bit). Tests (all
+under ASan/UBSan): every `[a, b)` of a 13 x 64 matrix in FD4B and FD3B and an 11 x
+128 FD3B matrix, G = 1, 2, 3, 7, R and R + 5; 40 x 512 (both widths) and 6 x 7168
+(both widths) matrices with ranges starting and ending inside groups mid-matrix;
 empty ranges, reversed and out-of-range bounds; structural corruption refused at
-parse; an off-by-one checkpoint caught. The contention benchmark below also
-decodes a whole 12288 x 7168 matrix through a per-row FDRX index in 22 chunks of
-up to 585 rows, byte-exact before and after timing.
+parse; an off-by-one checkpoint caught; G = 2^32 - 1 needing exactly one entry.
+The contention benchmark below also decodes a whole 12288 x 7168 matrix through a
+per-row FDRX index in 22 chunks of up to 585 rows, byte-exact before and after
+timing.
 
 ## Decode under matmul contention
 
@@ -435,14 +450,24 @@ matmul rates M_all (all threads) and M_c (the rest, against the decoder):
 Decoding is hidden when `1/D_c <= max(r/B, 1/M_c)`. The CPU cost of decoding the
 whole trunk is `108.81 / D_c` core-seconds per token.
 
+Each figure is derived twice: from every arm's median, and as the **worst case**,
+from every arm at its run least favourable to compression. The speedup falls as
+M_all rises and rises with D_c and M_c, so the worst case pairs M_all's fastest
+run with the slowest D_c and M_c; it is at or below the speedup of every repeat,
+however the runs pair up, and the worst resident slowdown at or above every
+repeat's (unit-tested on random arms).
+
 **Decision rules, fixed before the data.** A streamed deployment at SSD rate B is
-worth building only if the contended **minimum** speedup at that B exceeds 1; the
-median is reported beside it. The resident slowdown is expected to exceed 1: a
-pinned trunk layer is read once, so it should be decoded once when pinned and
-kept raw, and this measurement prices that choice rather than gating it. The
-machine here has 4 cores, where the decoder's core is a quarter of the matmul's;
-the 2-thread run bounds a smaller machine, and larger machines lose a smaller
-share.
+worth building only if the contended **worst-case** speedup at that B exceeds 1;
+the median is reported beside it. (Amended on 2026-09-23, before any measurement:
+the rule first named the per-arm minimum, which also takes M_all's slowest run, so
+one disturbed run of the uncompressed baseline could pass the gate while the
+median failed, and would report the most favourable resident slowdown.) The
+resident slowdown is expected to exceed 1: a pinned trunk layer is read once, so
+it should be decoded once when pinned and kept raw, and this measurement prices
+that choice rather than gating it. The machine here has 4 cores, where the
+decoder's core is a quarter of the matmul's; the 2-thread run bounds a smaller
+machine, and larger machines lose a smaller share.
 
 **Protocol.** Build with the engine's flags, as the `contention` CI job does:
 
@@ -478,18 +503,18 @@ artifacts, 1 s per arm, 5 repeats) and are recorded the same way.
 
 | Format | Input | Stat | Decode alone | Decode + matmul | Matmul all | Matmul rest | Matmul + decode | Core-s/token (contended) |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| FD4B `ssse3_pshufb` | stream | median / min | pending | pending | pending | pending | pending | pending |
-| FD3B `avx2_vpshufb` | stream | median / min | pending | pending | pending | pending | pending | pending |
-| FD4B `ssse3_pshufb` | hot | median / min | pending | pending | pending | pending | pending | pending |
-| FD3B `avx2_vpshufb` | hot | median / min | pending | pending | pending | pending | pending | pending |
+| FD4B `ssse3_pshufb` | stream | median / min / max | pending | pending | pending | pending | pending | pending |
+| FD3B `avx2_vpshufb` | stream | median / min / max | pending | pending | pending | pending | pending | pending |
+| FD4B `ssse3_pshufb` | hot | median / min / max | pending | pending | pending | pending | pending | pending |
+| FD3B `avx2_vpshufb` | hot | median / min / max | pending | pending | pending | pending | pending | pending |
 
 **Streamed speedup over raw reads, contended rates, limiting stage in brackets;
 resident slowdown (PLACEHOLDER, not measured):**
 
 | Format | Input | Stat | r | B = 2.5 GB/s | B = 3 GB/s | B = 4 GB/s | B = 5 GB/s | B = 6 GB/s | Resident slowdown |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| FD4B | stream, hot | median, min | 0.7503 | pending | pending | pending | pending | pending | pending |
-| FD3B | stream, hot | median, min | 0.7041 | pending | pending | pending | pending | pending | pending |
+| FD4B | stream, hot | median, worst | 0.7503 | pending | pending | pending | pending | pending | pending |
+| FD3B | stream, hot | median, worst | 0.7041 | pending | pending | pending | pending | pending | pending |
 
 For orientation only, and **not admissible as a result**: one FD4B `stream` run
 on 2026-09-22, on this 4-vCPU VM while another agent's builds held the load

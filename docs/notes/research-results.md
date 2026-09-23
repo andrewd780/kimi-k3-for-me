@@ -164,8 +164,9 @@ the gate-1 `f_a_proj` ranges) 3 bits retains 0.704128 against 0.750153 for 4 bit
 (+4.60 points), 5 bits 0.8125, Huffman 0.672050, high-byte entropy 0.670303; the
 sample-matched FD4B premium over the four-stream Huffman payload is 7.80 points.
 *FD3B:* a 3-bit decoder with branch-free escape expansion (scalar, SSSE3, AVX2,
-NEON) passes byte-exact tests; here it runs about 5.9 (SSSE3) and 8.5 (AVX2) GB/s
-on 8 MiB against FD4B's 12.6, on a shared VM. *Row index:* FDRX makes any
+NEON) passes byte-exact tests locally; its rates await the hosted rate job (a
+reading on this VM under another agent's load, with no report kept, is orientation
+only). *Row index:* FDRX makes any
 whole-row range decodable for 0.0340 points of matrix bytes per row, or 0.0148
 grouped, with zero padding at K3 widths. *Families:* gate 1 sampled two of 23
 matrix families (4.00% of trunk bytes); the `families` CI job samples all of
