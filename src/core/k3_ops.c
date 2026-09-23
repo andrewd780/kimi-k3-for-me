@@ -545,6 +545,10 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *       (b0 + b1) + (b2 + b3), per position.
  *     - same tail: the elements past the last full 16 are fma'd into the reduced sum in
  *       ascending order, and the final (float) rounding is the same.
+ *     - same store: k3_out_f32, so a NaN output is the one quiet NaN here too. The tiles
+ *       are other instruction sequences than the single-position kernels and may pass
+ *       on a different input NaN; without it a NaN's sign and payload would depend on
+ *       whether its position was prefilled in a batch or decoded alone.
  *   OpenMP splits OUTPUT ROWS across threads, as the single-position kernels do, so each
  *   output is still summed by one thread in the order above, at any thread count.
  *   test_ops compares every output bitwise against the per-position kernels over many
@@ -631,7 +635,7 @@ K3_ALWAYS_INLINE void k3_mm_f32_tile(float *y, int ldy, const float *X, int ldx,
         const double wi = (double)row[i];
         for (int t = 0; t < nb; t++) acc[t] = fma(wi, (double)X[(size_t)t * ldx + i], acc[t]);
     }
-    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = (float)acc[t];
+    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = k3_out_f32(acc[t]);
 }
 
 /* One output row for nb positions, bf16 weights, k3_matmul_bf16's arithmetic in each of
@@ -738,7 +742,7 @@ K3_ALWAYS_INLINE void k3_mm_bf16_tile(float *y, int ldy, const float *X, int ldx
         const double wi = (double)k3_bf16f(row[i]);
         for (int t = 0; t < nb; t++) acc[t] = fma(wi, (double)X[(size_t)t * ldx + i], acc[t]);
     }
-    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = (float)acc[t];
+    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = k3_out_f32(acc[t]);
 }
 
 /* One pass: every row, positions in register blocks of K3_MM_TB, the remainder in at

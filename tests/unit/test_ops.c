@@ -1162,6 +1162,80 @@ static void t_matmul_batch(void)
         }
     }
 
+    /* NaN OUTPUTS. The per-position kernels store every NaN as the one quiet NaN
+     * 0x7FC00000 (k3_out_f32 in k3_ops.c), because which input NaN an operation passes
+     * on is not fixed by IEEE 754 and differs between instruction sequences. The
+     * batched tiles are other instruction sequences again, so a NaN they produce must be
+     * stored the same way or a prefill and a decode of the same position disagree in
+     * the NaN's sign and payload. The finite draws above cannot see this, so here each
+     * position's x and each row's weights carry NaNs of random sign and payload, in the
+     * whole chunks and in the tail, plus an infinite x beside a zero weight (0 * inf is
+     * the default NaN), and positions differ in which rows go NaN. */
+    {
+        static const int nins[] = {17, 33, 100};
+        static const int nouts[] = {3, 65};
+        static const int nTs[] = {2, 3, 5, 8, 9, 17};
+        long nan_outputs = 0;
+        for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 2; b++)
+                for (int c = 0; c < 6; c++) {
+                    const int in = nins[a], out = nouts[b], T = nTs[c];
+                    const size_t nw = (size_t)in * out;
+                    uint16_t *Wb = (uint16_t *)malloc(nw * sizeof(uint16_t));
+                    float *Wf = (float *)malloc(nw * sizeof(float));
+                    float *X  = (float *)malloc((size_t)T * in * sizeof(float));
+                    float *Yr = (float *)malloc((size_t)T * out * sizeof(float));
+                    float *Yb = (float *)malloc((size_t)T * out * sizeof(float));
+                    if (!Wb || !Wf || !X || !Yr || !Yb) {
+                        bad++; snprintf(where, sizeof where, "nan allocation");
+                        free(Wb); free(Wf); free(X); free(Yr); free(Yb); continue;
+                    }
+                    for (size_t i = 0; i < nw; i++) { Wb[i] = rnd_bf16(); Wf[i] = rnd_x(); }
+                    for (size_t i = 0; i < (size_t)T * in; i++) X[i] = rnd_x();
+                    for (int o = 0; o < out; o++) {
+                        if (rnd() % 3u == 0) continue;                  /* some rows stay finite */
+                        for (int k = 1 + (int)(rnd() % 3u); k > 0; k--) {
+                            const int at = (int)(rnd() % (unsigned)in);
+                            const uint32_t u = 0x7FC00000u | (rnd() & 0x803FFFFFu);
+                            float f; memcpy(&f, &u, 4);
+                            Wf[(size_t)o * in + at] = f;
+                            Wb[(size_t)o * in + at] = (uint16_t)(u >> 16);
+                        }
+                    }
+                    for (int t = 0; t < T; t++) {
+                        if (rnd() % 4u == 0) {                          /* one NaN x: all rows */
+                            const uint32_t u = 0x7FC00000u | (rnd() & 0x803FFFFFu);
+                            memcpy(&X[(size_t)t * in + rnd() % (unsigned)in], &u, 4);
+                        } else if (rnd() % 3u == 0) {                   /* 0 * inf in row 0 */
+                            const int at = (int)(rnd() % (unsigned)in);
+                            X[(size_t)t * in + at] = (rnd() & 1u) ? INFINITY : -INFINITY;
+                            Wb[at] = 0; Wf[at] = 0.0f;
+                        }
+                    }
+                    for (int dt = 0; dt < 2; dt++) {
+                        for (int t = 0; t < T; t++) {
+                            if (dt) k3_matmul_bf16(Yr + (size_t)t * out, X + (size_t)t * in,
+                                                   Wb, in, out);
+                            else    k3_matmul(Yr + (size_t)t * out, X + (size_t)t * in,
+                                              Wf, in, out);
+                        }
+                        if (dt) k3_matmul_bf16_batch(Yb, X, Wb, in, out, T);
+                        else    k3_matmul_batch(Yb, X, Wf, in, out, T);
+                        cases++;
+                        for (size_t i = 0; i < (size_t)T * out; i++) nan_outputs += Yr[i] != Yr[i];
+                        if (!same_bits(Yr, Yb, (size_t)T * out)) {
+                            bad++;
+                            snprintf(where, sizeof where, "%s NaN in=%d out=%d T=%d",
+                                     dt ? "bf16" : "fp32", in, out, T);
+                        }
+                    }
+                    free(Wb); free(Wf); free(X); free(Yr); free(Yb);
+                }
+        if (nan_outputs == 0) {                           /* the check must see some NaN */
+            bad++; snprintf(where, sizeof where, "NaN cases produced no NaN output");
+        }
+    }
+
     /* K3_WI8 carries no exactness contract; the dispatcher must simply be the per-position
      * draft kernel, so it is compared to exactly that. */
     {
