@@ -54,8 +54,10 @@
 #define MAX_RUNS 64
 #define MAX_LIST 16
 /* Model-level context the note uses: 24 MLA layers, and the non-attention per-token
- * work of the whole model, ~103 GMAC (trunk 54.4 + routed experts 48.6), which runs at
- * roughly 16 s per token on the 4-core VM these numbers come from. */
+ * work of the whole model, ~103 GMAC (trunk 54.4 + routed experts 48.6). NONATTN_SECONDS
+ * is an ASSUMED round figure for how long that work takes per token, there only to give
+ * the per-token columns a scale: no full model has been timed on the VM these numbers
+ * come from, so it is not a measurement. */
 #define N_MLA_LAYERS    24
 #define NONATTN_GMAC    103.0
 #define NONATTN_SECONDS 16.0
@@ -234,9 +236,14 @@ static int variant_of(const char *s)
     return -1;
 }
 
+/* The engine kernels timed here (k3_mmw, k3_matmul_bf16) take their AVX-512 paths
+ * whenever __AVX512F__ is defined, so a -march=native build on an AVX-512 machine is
+ * labelled by that, not by the AVX2 it also has. */
 static const char *isa(void)
 {
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+    return "AVX-512";
+#elif defined(__AVX2__)
     return "AVX2";
 #elif defined(__ARM_NEON) && defined(__aarch64__)
     return "NEON";
