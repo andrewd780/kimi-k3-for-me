@@ -115,8 +115,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with a group that is a multiple of 16 (K3's is 32) aborts if it cannot allocate its
   copy of x, instead of falling back to the grouped path, whose different order would
   have changed the bits. `bench_kernels` reports the median and best call
-  (`K3_BENCH_REPS`) and the machine's streaming read bandwidth beside the bf16 rate. No
-  speedup figure is claimed here until quiet-machine timings are recorded.
+  (`K3_BENCH_REPS`) and the machine's streaming read bandwidth beside the bf16 rate.
+  Quiet-machine timings, old kernels against new in one harness on a 4-vCPU AVX-512
+  Xeon guest, are in [docs/notes/decode-kernels.md](docs/notes/decode-kernels.md): bf16
+  12288 x 7168 is 1.50x faster at 1 thread with AVX-512 and 1.34x with AVX2 (1.44x and
+  1.27x at 4 threads), now 82% to 93% of the machine's plain read rate; MXFP4 is 2.4x to
+  2.9x faster on AVX-512 and unchanged on AVX2. Kernel figures only, no s/token claim.
 - **Speculative decode never replays.** A partially accepted `--spec` sweep used to
   restore a copy of the whole carried state and replay the accepted prefix through a
   second forward, re-reading the trunk and the prefix's experts (at K3 scale 108.81 GB
