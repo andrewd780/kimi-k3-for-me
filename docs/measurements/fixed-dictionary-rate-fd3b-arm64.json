@@ -1,0 +1,407 @@
+{
+  "schema": "fixed-dictionary-v1",
+  "mode": "rate",
+  "index_bits": 3,
+  "dictionary": [
+    188,
+    60,
+    61,
+    189,
+    59,
+    187,
+    58
+  ],
+  "cases": [
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 738204,
+      "escape_values": 17244,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.569536582,
+            1.438483488,
+            1.485902103
+          ],
+          "mean": 1.4979740576666667,
+          "median": 1.485902103,
+          "minimum": 1.438483488
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            10.980923655,
+            12.466945293,
+            11.169449834
+          ],
+          "mean": 11.539106260666667,
+          "median": 11.169449834,
+          "minimum": 10.980923655
+        }
+      ],
+      "sample": {
+        "shard": "model-00002-of-000096.safetensors",
+        "tensor": "language_model.model.layers.1.self_attn.f_a_proj.weight",
+        "offset": 383171600,
+        "bytes": 1048576,
+        "sha256": "af6149644f8c98ac0b68d95e7758fe9adf5f3b7cda3c9f299293428cb0b10f41"
+      },
+      "sha256": "af6149644f8c98ac0b68d95e7758fe9adf5f3b7cda3c9f299293428cb0b10f41",
+      "payload_ratio": 0.7039451599121094,
+      "framed_ratio": 0.7040061950683594
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 740829,
+      "escape_values": 19869,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.513278023,
+            1.387580159,
+            1.470888504
+          ],
+          "mean": 1.4572488953333333,
+          "median": 1.470888504,
+          "minimum": 1.387580159
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            12.846316522,
+            10.44084132,
+            9.888716307
+          ],
+          "mean": 11.058624716333334,
+          "median": 10.44084132,
+          "minimum": 9.888716307
+        }
+      ],
+      "sample": {
+        "shard": "model-00013-of-000096.safetensors",
+        "tensor": "language_model.model.layers.12.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "eaa7a075045667f284be1cd50a85094f8cab21c1d7130cf19a10af32eb654c46"
+      },
+      "sha256": "eaa7a075045667f284be1cd50a85094f8cab21c1d7130cf19a10af32eb654c46",
+      "payload_ratio": 0.7064485549926758,
+      "framed_ratio": 0.7065095901489258
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 737928,
+      "escape_values": 16968,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.573104408,
+            1.52395601,
+            1.45736033
+          ],
+          "mean": 1.5181402493333334,
+          "median": 1.52395601,
+          "minimum": 1.45736033
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            10.699166701,
+            11.973480705,
+            11.918018633
+          ],
+          "mean": 11.530222013,
+          "median": 11.918018633,
+          "minimum": 10.699166701
+        }
+      ],
+      "sample": {
+        "shard": "model-00025-of-000096.safetensors",
+        "tensor": "language_model.model.layers.24.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "7e7062fa555acdf8b1fd5be5c0d834034a6077be38f418462292ab31d5a3ca22"
+      },
+      "sha256": "7e7062fa555acdf8b1fd5be5c0d834034a6077be38f418462292ab31d5a3ca22",
+      "payload_ratio": 0.7036819458007812,
+      "framed_ratio": 0.7037429809570312
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 736637,
+      "escape_values": 15677,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.661585871,
+            1.443332732,
+            1.458591947
+          ],
+          "mean": 1.5211701833333333,
+          "median": 1.458591947,
+          "minimum": 1.443332732
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            13.618823228,
+            12.305742055,
+            6.274315639
+          ],
+          "mean": 10.732960307333332,
+          "median": 12.305742055,
+          "minimum": 6.274315639
+        }
+      ],
+      "sample": {
+        "shard": "model-00037-of-000096.safetensors",
+        "tensor": "language_model.model.layers.36.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "c2b8c94f6568817f5b1ed008658d2e59125f30f7d4e83ccfa8a284de48c06efe"
+      },
+      "sha256": "c2b8c94f6568817f5b1ed008658d2e59125f30f7d4e83ccfa8a284de48c06efe",
+      "payload_ratio": 0.7024507522583008,
+      "framed_ratio": 0.7025117874145508
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 736098,
+      "escape_values": 15138,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.141253079,
+            1.555307873,
+            1.224201886
+          ],
+          "mean": 1.306920946,
+          "median": 1.224201886,
+          "minimum": 1.141253079
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            9.515684465,
+            12.044886121,
+            13.435351784
+          ],
+          "mean": 11.665307456666666,
+          "median": 12.044886121,
+          "minimum": 9.515684465
+        }
+      ],
+      "sample": {
+        "shard": "model-00049-of-000096.safetensors",
+        "tensor": "language_model.model.layers.48.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "7a852464cb2a6656703f2ab9ca7eb4cb7517217c2165c9905dcff13f306ff397"
+      },
+      "sha256": "7a852464cb2a6656703f2ab9ca7eb4cb7517217c2165c9905dcff13f306ff397",
+      "payload_ratio": 0.7019367218017578,
+      "framed_ratio": 0.7019977569580078
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 735229,
+      "escape_values": 14269,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.455948216,
+            1.769324447,
+            1.775915588
+          ],
+          "mean": 1.6670627503333333,
+          "median": 1.769324447,
+          "minimum": 1.455948216
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            12.723848255,
+            9.3831015,
+            9.499243628
+          ],
+          "mean": 10.535397794333333,
+          "median": 9.499243628,
+          "minimum": 9.3831015
+        }
+      ],
+      "sample": {
+        "shard": "model-00061-of-000096.safetensors",
+        "tensor": "language_model.model.layers.60.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "41d82ccae961b673e1749cfc5f3f2f88fb4c789b25083e8b255ffa8328b6fa81"
+      },
+      "sha256": "41d82ccae961b673e1749cfc5f3f2f88fb4c789b25083e8b255ffa8328b6fa81",
+      "payload_ratio": 0.7011079788208008,
+      "framed_ratio": 0.7011690139770508
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 736028,
+      "escape_values": 15068,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.612278736,
+            1.712204455,
+            1.74020111
+          ],
+          "mean": 1.6882281003333333,
+          "median": 1.712204455,
+          "minimum": 1.612278736
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            10.925397142,
+            10.268594172,
+            11.696046557
+          ],
+          "mean": 10.963345957,
+          "median": 10.925397142,
+          "minimum": 10.268594172
+        }
+      ],
+      "sample": {
+        "shard": "model-00073-of-000096.safetensors",
+        "tensor": "language_model.model.layers.72.self_attn.f_a_proj.weight",
+        "offset": 383177008,
+        "bytes": 1048576,
+        "sha256": "40af77a82237fbd6e2bdf3edfe47e8cedb4f8b2342936f17e1ccc85d07422378"
+      },
+      "sha256": "40af77a82237fbd6e2bdf3edfe47e8cedb4f8b2342936f17e1ccc85d07422378",
+      "payload_ratio": 0.7018699645996094,
+      "framed_ratio": 0.7019309997558594
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 1048576,
+      "packed_bytes": 740131,
+      "escape_values": 19171,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.679689086,
+            1.685535786,
+            1.682232709
+          ],
+          "mean": 1.6824858603333332,
+          "median": 1.682232709,
+          "minimum": 1.679689086
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            12.982589157,
+            13.249760717,
+            13.467746623
+          ],
+          "mean": 13.233365499,
+          "median": 13.249760717,
+          "minimum": 12.982589157
+        }
+      ],
+      "sample": {
+        "shard": "model-00093-of-000096.safetensors",
+        "tensor": "language_model.model.layers.92.self_attn.g_proj.weight",
+        "offset": 468322536,
+        "bytes": 1048576,
+        "sha256": "03391ddc641d2ad60ad362550f865ed73d0ae714a552bd773942b383d2e45927"
+      },
+      "sha256": "03391ddc641d2ad60ad362550f865ed73d0ae714a552bd773942b383d2e45927",
+      "payload_ratio": 0.7057828903198242,
+      "framed_ratio": 0.7058439254760742
+    },
+    {
+      "native": "neon_tbl",
+      "index_bits": 3,
+      "raw_bytes": 8388608,
+      "packed_bytes": 5900636,
+      "escape_values": 133404,
+      "byte_exact": true,
+      "arms": [
+        {
+          "name": "scalar_reference",
+          "decoded_BF16_GBps_runs": [
+            1.482202607,
+            1.356063369,
+            1.418509795
+          ],
+          "mean": 1.418925257,
+          "median": 1.418509795,
+          "minimum": 1.356063369
+        },
+        {
+          "name": "neon_tbl",
+          "decoded_BF16_GBps_runs": [
+            11.029144565,
+            11.544474014,
+            13.46445764
+          ],
+          "mean": 12.012692073,
+          "median": 11.544474014,
+          "minimum": 11.029144565
+        }
+      ],
+      "sample": {
+        "tensor": "pooled_eight_ranges"
+      },
+      "sha256": "ab4a5b943da9c1ea128aa4b59ed61759bbd3982012a906e141f150dd79145f4b",
+      "payload_ratio": 0.7034029960632324,
+      "framed_ratio": 0.7034106254577637
+    }
+  ],
+  "controls": null,
+  "execution": {
+    "machine": "arm64",
+    "system": "macOS-14.8.9-arm64-arm-64bit",
+    "cpu": "arm",
+    "cpu_count": 3,
+    "compiler_flags": "-O3 -std=c99 -Wall -Wextra -Werror",
+    "head_sha": "cb4ab387016b2fd923aa6f93b37cfd8bf656f36c",
+    "checkout_sha": "444345f8627caa9962b5c4125e25781cf37e2a99",
+    "run_id": "35845709912"
+  },
+  "scope": "repeated 1 MiB and pooled 8 MiB buffers, cache-friendly single-thread kernel; all escape handling and BF16 assembly timed, parse/allocation/I/O/encoding excluded; no competing model compute, storage or speedup claim",
+  "rate_gate": {
+    "status": "PASS",
+    "rule": "SIMD >=3 reconstructed BF16 GB/s in every one of 27 runs; scalar is a reference, not the proposed SIMD decoder",
+    "target_4_GBps_all_runs": true
+  }
+}
