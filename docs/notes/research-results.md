@@ -37,7 +37,9 @@ The existing whole-layer reader remains the default.
 **Tradeoff:** every trunk matrix is applied to all positions of a forward in one
 pass (`k3_mmw_batch`, through `K3WeightStream.apply_batch`), so multi-token prefill
 and speculative verification read each matrix once per batch, as whole-layer
-streaming does; `test_offline_cli.py` checks that a 1-, 3- and 8-token forward read
+streaming does. That holds at any prompt length: the MoE deduplicates routed experts
+over sub-chunks of 64 positions, but its five trunk matrices span the whole batch.
+`test_offline_cli.py` checks that 1-, 3-, 8-, 65-, 129- and 130-token forwards read
 identical bytes. Before that change prefill reread each matrix for every token.
 `--kv-latent` still rereads `kv_b` for every cached position it rebuilds.
 Inspect `trunk_matrix_calls` and `trunk_bytes_read`; lower memory does not prove

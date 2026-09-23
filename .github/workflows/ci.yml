@@ -281,18 +281,27 @@ jobs:
       # undefined -- the `ARCH=` above is already a no-op for that reason. That leaves
       # every _mm256_* path in k3_ops.c uninstrumented, and those are the ones that ship
       # and the ones doing the unaligned loads and hand-computed offsets worth checking.
-      # Rebuilding just bench_kernels with the documented baseline covers both vector
-      # kernels for the cost of one more compile.
+      # Rebuilding bench_kernels with the documented baseline covers both vector kernels
+      # at full width; test_ops adds the batched matmul tiles at every block size and
+      # remainder, strided and streamed, which bench_kernels' three positions do not reach.
+      # The second build forces the 8-position block that AVX-512VL builds pick onto
+      # plain AVX2, so its loop shapes are instrumented on any runner.
       - name: Re-run the vector paths under sanitizers
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           make clean
-          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer" \
+          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -ffp-contract=off -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer" \
                LDFLAGS="-lm -fsanitize=address,undefined" \
-               bin/bench_kernels -j"$(nproc)"
+               bin/bench_kernels bin/test_ops -j"$(nproc)"
           ./bin/bench_kernels
+          ./bin/test_ops tests/fixtures/ops
+          make clean
+          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -ffp-contract=off -mavx2 -mfma -DK3_MM_TB=8 -fsanitize=address,undefined -fno-omit-frame-pointer" \
+               LDFLAGS="-lm -fsanitize=address,undefined" \
+               bin/test_ops -j"$(nproc)"
+          ./bin/test_ops tests/fixtures/ops
 
   # The tokenizer is portable C99 and must agree with the reference implementation
   # token-for-token. A tokenizer that is merely "close" corrupts every prompt silently.

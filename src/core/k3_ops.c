@@ -26,6 +26,16 @@
  *
  * Matmul accumulators are double; the KDA recurrence retains float sums. Hidden size is 7168 and expert rows are 2048
  * wide; a float32 accumulator loses precision the reference comparisons can see.
+ *
+ * Bit-identity covers every result that is not a NaN. When two NaNs meet in one
+ * operation, which payload and sign survive is left open by C and IEEE 754 and is
+ * decided by the compiler's instruction selection (vfmadd132/213/231, the operand order
+ * of a commutative add): measured, the same fma(w, x, acc) tail keeps the weight's NaN
+ * in the scalar build and the activation's in the AVX2 build, and the batched tile can
+ * differ from the single-position kernel the same way. So a NaN is reproduced as a NaN,
+ * not as a particular NaN. A NaN logit means the weights or the state are already
+ * corrupt, and greedy selection (v[i] > v[best]) reads no payload bits. test_ops draws
+ * finite weights for that reason.
  */
 #include "k3.h"
 
@@ -418,8 +428,19 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   the per-position f32 -> f64 conversion of x, and the wider form does not remove it.
  *   Widening X to double once per call instead turns the loop into an L2 stream of
  *   doubles, and that measured slower still, including with the tile packed for L1.
- *   Position blocks of 4 were fastest on both 16- and 32-register x86 builds; NEON keeps
- *   2, since each position needs eight of its 32 registers for accumulators. */
+ *
+ * POSITIONS PER REGISTER BLOCK (K3_MM_TB)
+ *   Each position in a block holds four __m256d accumulators on AVX2, so the block size
+ *   is set by the vector register file. With 16 ymm registers (plain AVX2) a block of 4
+ *   fills them, and 8 spills: bench_batch at 12288 x 7168, one thread, -march=haswell on
+ *   the reference VM, measured blocks of 8 about 8% SLOWER than 4 at T = 8 and 16. With
+ *   AVX-512VL the compiler may use ymm16-31 for the same 256-bit code, and there a block
+ *   of 8 measured about 10% faster than 4 at T = 8, 9 and 16, at one thread and at four.
+ *   So 8 when __AVX512VL__ is defined, else 4; NEON keeps 2, since each position needs
+ *   eight of its 32 registers for accumulators. The block size is a loop shape only:
+ *   each position keeps its own accumulators whatever the block, so no output can
+ *   depend on it, and test_ops checks every block size and remainder bitwise. It may be
+ *   forced with -DK3_MM_TB=1, 2, 4 or 8 to compare them. */
 
 /* Force inlining so that each call below, made with a literal block size, gets its own
  * copy with the position loops unrolled and the accumulators held in registers. */
@@ -429,10 +450,17 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 #define K3_ALWAYS_INLINE static inline
 #endif
 
+#ifndef K3_MM_TB
 #if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
 #define K3_MM_TB 2
+#elif defined(__AVX2__) && defined(__AVX512VL__)
+#define K3_MM_TB 8
 #else
 #define K3_MM_TB 4
+#endif
+#endif
+#if K3_MM_TB != 1 && K3_MM_TB != 2 && K3_MM_TB != 4 && K3_MM_TB != 8
+#error "K3_MM_TB must be 1, 2, 4 or 8: the remainder dispatch below covers those"
 #endif
 
 /* Positions per pass over the matrix. Every row reads the X rows of all positions in the
@@ -585,8 +613,9 @@ K3_ALWAYS_INLINE void k3_mm_bf16_tile(float *y, int ldy, const float *X, int ldx
     for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = (float)acc[t];
 }
 
-/* One pass: every row, positions in register blocks of K3_MM_TB, the remainder in one
- * smaller block. Each literal block size below is its own inlined copy of the tile. */
+/* One pass: every row, positions in register blocks of K3_MM_TB, the remainder in at
+ * most two smaller blocks (a block of 4 first when K3_MM_TB is 8). Each literal block
+ * size below is its own inlined copy of the tile. */
 static void k3_mm_f32_pass(float *Y, int ldy, const float *X, int ldx,
                            const float *W, int in, int out, int T)
 {
@@ -599,6 +628,13 @@ static void k3_mm_f32_pass(float *Y, int ldy, const float *X, int ldx,
         for (; t + K3_MM_TB <= T; t += K3_MM_TB)
             k3_mm_f32_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
                            row, in, K3_MM_TB);
+#if K3_MM_TB > 4
+        if (T - t >= 4) {
+            k3_mm_f32_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                           row, in, 4);
+            t += 4;
+        }
+#endif
         float *yt = Y + (size_t)t * ldy + o;
         const float *xt = X + (size_t)t * ldx;
         switch (T - t) {
@@ -626,6 +662,13 @@ static void k3_mm_bf16_pass(float *Y, int ldy, const float *X, int ldx,
         for (; t + K3_MM_TB <= T; t += K3_MM_TB)
             k3_mm_bf16_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
                             row, in, K3_MM_TB);
+#if K3_MM_TB > 4
+        if (T - t >= 4) {
+            k3_mm_bf16_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                            row, in, 4);
+            t += 4;
+        }
+#endif
         float *yt = Y + (size_t)t * ldy + o;
         const float *xt = X + (size_t)t * ldx;
         switch (T - t) {
@@ -1066,7 +1109,7 @@ size_t k3_mla_scratch(const K3Cfg *c, int T)
  * numbers rather than an invariant, and it is the same class of hazard documented at
  * the scratch layout in k3_mla_cached. Size with k3_moe_scratch().
  */
-/* The MoE scratch, laid out in ONE place so k3_moe, moe_prefill_chunk and
+/* The MoE scratch, laid out in ONE place so k3_moe, k3_moe_prefill and
  * k3_moe_scratch cannot disagree. The [T] regions hold one row per position, so each
  * trunk matrix -- down, up and the shared expert's three -- is applied to every position
  * in one pass (k3_mmw_batch) instead of once per position; the three per-expert buffers
@@ -1220,7 +1263,7 @@ size_t k3_moe_scratch(const K3Cfg *c, int T)
          + (size_t)c->latent;             /* edn                 */
 }
 
-/* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
+/* Batched MoE for PREFILL over T tokens, streamed experts only.
  *
  * k3_moe walks the top-k for each token independently, so across a T-token chunk it
  * fetches an expert once per token that routes to it. Under near-uniform routing that is
@@ -1235,14 +1278,32 @@ size_t k3_moe_scratch(const K3Cfg *c, int T)
  * the shared expert exactly as before. Only the ORDER in which experts are fetched from
  * disk changes, and that touches no floating-point result.
  *
- * The trunk matrices go the same way the experts do: down, up and the shared expert are
- * each applied to the whole chunk in one pass (k3_mmw_batch), per-position bit-identical.
+ * Two widths, deliberately different. The trunk matrices -- down, up and the shared
+ * expert's three -- are each applied to ALL T positions in one pass (k3_mmw_batch), so
+ * under --trunk-rows a forward reads each of them once however long the prompt is; their
+ * [T] scratch rows are already sized by k3_moe_scratch(c, T). Only the routed-expert
+ * dedup runs in sub-chunks of MOE_DEDUP_CHUNK positions, because its contribution buffer
+ * is [n][K][L] and would otherwise grow with the prompt. Neither width reaches a
+ * floating-point result: k3_mmw_batch is per-position bit-identical to k3_mmw at any T,
+ * and a token's routed sum reads only its own contribution rows.
  *
  * out/x are [T][E], idx/wt scratch are topk-wide (reused per token), scratch holds
  * k3_moe_scratch(c, T) floats. This path requires w->src (streamed); the resident path
  * stays on k3_moe, which is what the oracle gates exercise. */
-static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
-                              const K3Cfg *c, int T, float *scratch);
+#define MOE_DEDUP_CHUNK 64
+
+/* Per-sub-chunk buffers of the routed dedup, allocated once per k3_moe_prefill call and
+ * reused by every sub-chunk; each is sized for MOE_DEDUP_CHUNK positions at most. */
+typedef struct {
+    int   *ridx;     /* [n][K]    routing decisions; -1 marks a dropped expert */
+    float *rwt;      /* [n][K]    routing weights                             */
+    float *contrib;  /* [n][K][L] every routed expert's latent output         */
+    int   *uniq;     /* [n*K]     the sub-chunk's unique experts, first-seen  */
+    char  *seen;     /* [n_experts]                                           */
+} K3MoeDedup;
+
+static void moe_prefill_routed(const K3MoeScratch *s, const float *x, const K3MoeW *w,
+                               const K3Cfg *c, int t0, int T, const K3MoeDedup *d);
 
 void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                     int T, int *idx, float *wt, float *scratch)
@@ -1258,59 +1319,70 @@ void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         k3_moe(out, x, w, c, T, idx, wt, scratch);
         return;
     }
+    const int E = c->hidden, Ll = c->latent, K = c->topk;
+    const K3MoeScratch s = moe_layout(scratch, c, T);
+
     /* Fixed sub-chunks bound the contribution buffer (14.7 MB at 64 tokens) no matter
      * how long the prompt is; a 32k prefill would otherwise want 7.3 GB of it. Most of
      * the dedup is already captured at this width: the unique-expert count grows far
      * slower than the request count under near-uniform routing. */
-    const int CHUNK = 64;
-    for (int t0 = 0; t0 < T; t0 += CHUNK) {
-        const int n = (T - t0) < CHUNK ? (T - t0) : CHUNK;
-        if (n == 1) { k3_moe(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
-                             w, c, 1, idx, wt, scratch); continue; }
-        moe_prefill_chunk(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
-                          w, c, n, scratch);
+    const int nmax = T < MOE_DEDUP_CHUNK ? T : MOE_DEDUP_CHUNK;
+    K3MoeDedup d;
+    d.ridx    = (int *)  malloc((size_t)nmax * K * sizeof(int));
+    d.rwt     = (float *)malloc((size_t)nmax * K * sizeof(float));
+    d.contrib = (float *)malloc((size_t)nmax * K * Ll * sizeof(float));
+    d.uniq    = (int *)  malloc((size_t)nmax * K * sizeof(int));
+    d.seen    = (char *) malloc((size_t)c->n_experts);
+    if (!d.ridx || !d.rwt || !d.contrib || !d.uniq || !d.seen)
+        k3_fatal_oom("MoE prefill batch", (size_t)nmax * K * Ll * sizeof(float));
+
+    /* 2. down-project every position in one pass over `down`. Routing (step 1) reads x,
+     * not z, so hoisting this above it changes nothing, as in k3_moe. */
+    k3_mmw_batch(s.z, x, w->down, w->wdt, E, Ll, T);
+    /* 1, 3, 4. route, run the unique experts and aggregate, one sub-chunk at a time; each
+     * leaves its positions' normalised aggregates in s.accL. */
+    for (int t0 = 0; t0 < T; t0 += MOE_DEDUP_CHUNK) {
+        const int n = (T - t0) < MOE_DEDUP_CHUNK ? (T - t0) : MOE_DEDUP_CHUNK;
+        moe_prefill_routed(&s, x, w, c, t0, n, &d);
     }
+    /* 5, 6. up-project every position and add the shared expert: one pass per matrix. */
+    k3_mmw_batch(out, s.accL, w->up, w->wdt, Ll, E, T);
+    moe_shared(out, x, w, c, T, &s);
+
+    free(d.ridx); free(d.rwt); free(d.contrib); free(d.uniq); free(d.seen);
 }
 
-static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
-                              const K3Cfg *c, int T, float *scratch)
+/* The routed half of the batched MoE for positions [t0, t0 + T), T <= MOE_DEDUP_CHUNK:
+ * route each position, fetch each unique expert once, and leave each position's
+ * normalised aggregate in its s->accL row. Reads x and s->z rows t0.. only. */
+static void moe_prefill_routed(const K3MoeScratch *s, const float *x, const K3MoeW *w,
+                               const K3Cfg *c, int t0, int T, const K3MoeDedup *d)
 {
     const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
     const int K = c->topk;
-    const K3MoeScratch s = moe_layout(scratch, c, T);
+    int   *ridx = d->ridx, *uniq = d->uniq;
+    float *rwt = d->rwt, *contrib = d->contrib;
+    const float *z = s->z + (size_t)t0 * Ll;
 
-    /* Per-token routing decisions, plus a contribution buffer holding every routed
-     * expert's latent output for every token: [T][K][Ll]. At T=32, K=16, Ll=3584 that is
-     * ~7.3 MB, trivial beside the tens of GB already reserved. The latent inputs live in
-     * the scratch's z rows. */
-    int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
-    float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
-    if (!ridx || !rwt || !contrib)
-        k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
-
-    /* 1. down-project the whole chunk in one pass, then route every token and collect
-     * the batch's unique experts. */
-    k3_mmw_batch(s.z, x, w->down, w->wdt, E, Ll, T);
-    int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
-    char *seen = (char *)calloc((size_t)c->n_experts, 1);
-    if (!uniq || !seen) k3_fatal_oom("MoE prefill index", (size_t)c->n_experts);
+    /* 1. route every token on the FULL width x and collect the sub-chunk's unique
+     * experts in first-seen order. */
+    memset(d->seen, 0, (size_t)c->n_experts);
     int nu = 0;
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
+        const float *xt = x + (size_t)(t0 + t) * E;
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
-            if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
+            if (e >= 0 && e < c->n_experts && !d->seen[e]) { d->seen[e] = 1; uniq[nu++] = e; }
         }
     }
 
-    /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
+    /* 3. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
      * that selected it. gu/act/edn are reused per (expert, token). */
-    float *gu = s.gu, *act = s.act, *edn = s.edn;
+    float *gu = s->gu, *act = s->act, *edn = s->edn;
     if (w->src->getmany) w->src->getmany(w->src, w->layer, uniq, nu);
     for (int u = 0; u < nu; u++) {
         const int e = uniq[u];
@@ -1319,11 +1391,14 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             k3_expert_drops++;
             fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
                             "this chunk is CORRUPT\n", w->layer, e);
+            /* k3_moe skips a dropped expert's term; mark its slots so the sum below
+             * does the same instead of reading a contribution row never written. */
+            for (int i = 0; i < T * K; i++) if (ridx[i] == e) ridx[i] = -1;
             continue;
         }
         for (int t = 0; t < T; t++) {
             const int   *it = ridx + (size_t)t * K;
-            const float *zt = s.z + (size_t)t * Ll;
+            const float *zt = z + (size_t)t * Ll;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
                 k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
@@ -1335,24 +1410,21 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
     }
 
-    /* 3. per token, sum contributions in the ORIGINAL top-k order and normalise, exactly
-     * as k3_moe does it, so every float matches the per-token path. Then the tail of the
-     * MoE for the whole chunk: up and the shared expert, one pass per matrix. */
+    /* 4. per token, sum contributions in the ORIGINAL top-k order and normalise, exactly
+     * as k3_moe does it, so every float matches the per-token path. */
     for (int t = 0; t < T; t++) {
+        const int   *it  = ridx + (size_t)t * K;
         const float *wtt = rwt + (size_t)t * K;
-        float *acc = s.accL + (size_t)t * Ll;
+        float *acc = s->accL + (size_t)(t0 + t) * Ll;
         for (int i = 0; i < Ll; i++) acc[i] = 0.0f;
         for (int j = 0; j < K; j++) {
+            if (it[j] < 0) continue;
             const float wj = wtt[j];
             const float *cb = contrib + ((size_t)t * K + j) * Ll;
             for (int i = 0; i < Ll; i++) acc[i] += wj * cb[i];
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
     }
-    k3_mmw_batch(out, s.accL, w->up, w->wdt, Ll, E, T);
-    moe_shared(out, x, w, c, T, &s);
-
-    free(ridx); free(rwt); free(contrib); free(uniq); free(seen);
 }
 
 /* --------------------------------------------------------- KDA full layer ---- */

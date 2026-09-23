@@ -942,9 +942,11 @@ static void t_matmul_bf16(void)
  * fma order, reduction tree and tail as k3_matmul_bf16 / k3_matmul on one position. So the
  * comparison is on bits, over shapes chosen to reach every branch -- in below, at and
  * above one 16-element chunk and every in % 16 remainder that matters, out below and
- * above the OpenMP threshold, position counts that fill 1, 2 and 3 register blocks with
- * every remainder, and an `in` wide enough that the positions are split into several
- * passes over the matrix, including a final pass of one. Weights are arbitrary finite
+ * above the OpenMP threshold, position counts that fill 1, 2 and 3 register blocks of
+ * every width the build may pick (K3_MM_TB: 2 on NEON, 4 on AVX2, 8 with AVX-512VL) and
+ * leave every remainder after them -- 1 to 7 for a block of 8, which takes a block of 4
+ * before its last 1 to 3 -- and an `in` wide enough that the positions are split into
+ * several passes over the matrix, including a final pass of one. Weights are arbitrary finite
  * bf16 bit patterns (denormals and huge exponents included); activations mix signs,
  * zeros, denormals and wide magnitudes. The strided forms are checked to write exactly
  * their rows and nothing between them, and k3_mmw_batch is checked through every weight
@@ -1045,7 +1047,7 @@ static void t_matmul_batch(void)
 {
     static const int ins[]  = {1, 5, 15, 16, 17, 31, 32, 33, 47, 100, 257, 1000};
     static const int outs[] = {1, 3, 64, 65, 129, 300};
-    static const int Ts[]   = {1, 2, 3, 4, 5, 8, 17};
+    static const int Ts[]   = {1, 2, 3, 4, 5, 6, 7, 8, 15, 17, 26};
     const int nin = (int)(sizeof ins / sizeof *ins), nout = (int)(sizeof outs / sizeof *outs);
     const int nT = (int)(sizeof Ts / sizeof *Ts);
     long cases = 0, bad = 0;
@@ -1188,7 +1190,7 @@ static void t_matmul_batch(void)
                "e.g. %s\n", bad, cases, where);
         g_fail++;
     } else {
-        printf("  PASS  matmul_batch   %ld cases, T in {1,2,3,4,5,8,17}, bit-identical to "
+        printf("  PASS  matmul_batch   %ld cases, T in {1..8,15,17,26}, bit-identical to "
                "per-position k3_matmul_bf16 / k3_matmul\n", cases);
         g_pass++;
     }

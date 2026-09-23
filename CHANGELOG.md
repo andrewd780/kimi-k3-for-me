@@ -13,10 +13,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   weight once per block of positions, with every output bit-identical to the
   single-position kernel (same partition, fma order, reduction tree and tail; scalar,
   AVX2 and NEON). KDA, MLA, the MoE trunk and the dense layer use it; under
-  `--trunk-rows` a batch reads each matrix once instead of once per position.
+  `--trunk-rows` a batch reads each matrix once instead of once per position, at any
+  prompt length: the streamed MoE prefill deduplicates routed experts over 64-position
+  sub-chunks but applies its five trunk matrices to the whole batch.
   T == 1 takes the existing kernel. `k3_moe_scratch` now takes T. Gated bitwise by
   `test_ops` on cancelling inputs that expose a wrong summation order, by the oracle's
-  GATE 3c, and by a rows-mode byte-count check in `test_offline_cli.py`.
+  GATE 3c, by a rows-mode byte-count check in `test_offline_cli.py` at 1 to 130
+  positions, and by 65-, 129- and 130-token prompts matched against the per-token MoE
+  (`K3_NO_BATCH_PREFILL`). Positions share a widened weight in register blocks of 4 on
+  AVX2, 8 when AVX-512VL gives the compiler 32 vector registers, and 2 on NEON. On the
+  reference VM a block of 8 is about 10% faster than 4 with AVX-512VL and about 8%
+  slower on plain AVX2 (`bench_batch`, 8 to 16 positions); the block is a loop shape
+  only and cannot move an output.
+  **Public API:** `K3WeightStream` (include/k3/k3.h), the streamed-matrix descriptor
+  that `--trunk-rows` introduces, carries an optional `apply_batch` callback besides
+  `apply`. `k3_mmw_batch` calls it for a `K3_WSTREAM` matrix, so every layer op reaches
+  it on a multi-position forward; each output must be bit-identical to `apply` on that
+  position alone. NULL falls back to one `apply` per position, so a stream built on the
+  stack must zero the field.
 - **lm_head batched over positions** where a forward needs every position's logits:
   a `--spec` verify sweep projects its positions in one pass over the head, and
   `--tf-check` / `--score-prompt` in blocks of up to 16, through `k3_mmw_batch`, or

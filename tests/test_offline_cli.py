@@ -63,7 +63,7 @@ class OfflineCliTests(unittest.TestCase):
         self.path = Path(self.tmp.name)
         self.counter = 0
 
-    def run_cli(self, model, args, ok=True):
+    def run_cli(self, model, args, ok=True, env=None):
         self.counter += 1
         out = self.path / (str(self.counter) + ".json")
         logits = self.path / (str(self.counter) + ".f32")
@@ -71,7 +71,7 @@ class OfflineCliTests(unittest.TestCase):
                                  "--cache-gb", "0.0001", "--out", str(out),
                                  "--dump-logits", str(logits), *map(str, args)],
                                 text=True, errors="replace", capture_output=True,
-                                env=self.env, timeout=60)
+                                env={**self.env, **(env or {})}, timeout=60)
         if not ok:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("AddressSanitizer", result.stderr)
@@ -154,7 +154,10 @@ class OfflineCliTests(unittest.TestCase):
         # must read exactly what a one-position forward reads: the same matrix passes and
         # the same bytes. Before batching, each position reread every matrix from disk,
         # so an 8-token prompt cost about eight passes. --gen 1 makes each run a single
-        # forward; the prompt is the only thing that varies.
+        # forward; the prompt is the only thing that varies. The MoE deduplicates routed
+        # experts over sub-chunks of 64 positions; 65, 129 and 130 positions cross that
+        # width, with a one-position remainder at 65 and 129, and must still read each
+        # trunk matrix once.
         for trunk in (self.trunk, self.ztrunk):
             for mode in ([], ["--incremental"]):
                 with self.subTest(trunk=trunk.name, mode=mode):
@@ -163,7 +166,8 @@ class OfflineCliTests(unittest.TestCase):
                     one = self.run_cli(self.selective, ["--ids", "3", *common])[0]
                     self.assertGreater(one["trunk_matrix_calls"], 0)
                     self.assertGreater(one["trunk_bytes_read"], 0)
-                    for ids in ("3,7,11", "3,7,11,5,2,8,1,4"):
+                    for ids in ("3,7,11", "3,7,11,5,2,8,1,4", self.long_ids(65),
+                                self.long_ids(129), self.long_ids(130)):
                         many = self.run_cli(self.selective, ["--ids", ids, *common])[0]
                         self.assertEqual(many["trunk_matrix_calls"], one["trunk_matrix_calls"])
                         self.assertEqual(many["trunk_bytes_read"], one["trunk_bytes_read"])
@@ -172,6 +176,25 @@ class OfflineCliTests(unittest.TestCase):
                                                         *common, "--gen", "2"])[0]
                     self.assertEqual(two["trunk_matrix_calls"], 2 * one["trunk_matrix_calls"])
                     self.assertEqual(two["trunk_bytes_read"], 2 * one["trunk_bytes_read"])
+
+    @staticmethod
+    def long_ids(n):
+        return ",".join(str((7 * i + 3) % 256) for i in range(n))
+
+    def test_moe_prefill_sub_chunks_match_per_token_path(self):
+        # With streamed experts a multi-token forward takes k3_moe_prefill, which runs
+        # the trunk matrices over every position at once and fetches routed experts per
+        # 64-position sub-chunk; K3_NO_BATCH_PREFILL sends the same binary down the
+        # per-token k3_moe instead. Every logit must match across the sub-chunk
+        # boundaries, including a one-position remainder (65, 129) and two (130).
+        for n in (65, 129, 130):
+            for mode in ([], ["--incremental"]):
+                with self.subTest(n=n, mode=mode):
+                    args = ["--ids", self.long_ids(n), *mode]
+                    batched = self.run_cli(self.selective, args)
+                    serial = self.run_cli(self.selective, args,
+                                          env={"K3_NO_BATCH_PREFILL": "1"})
+                    self.assert_same(batched, serial)
 
     def test_trunk_rows_invalid_mode_is_refused_before_loading(self):
         result = self.run_cli("absent", ["--ids", "1", "--trunk-rows"], ok=False)
