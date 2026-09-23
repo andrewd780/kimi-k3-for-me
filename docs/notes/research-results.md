@@ -1,10 +1,11 @@
 # Five proposals: code, experiments and unresolved gates
 
-Updated 2026-09-23. Follow-up to [the research queue](research-queue.md), in
-[PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12). Native runs are
-hosted CI, except the batched-kernel timings in section 1, taken on a cloud
-development VM. Andrew's machines were not used. There is no full-checkpoint host
-and no new full-model seconds/token result.
+Updated 2026-09-23. Follow-up to [the research queue](research-queue.md), written in
+[#12](https://github.com/andrewd780/kimi-k3-for-me/pull/12) and extended in #13 and
+#14, all merged. Native gates run in hosted CI. The batched-kernel timings in
+section 1 and the decode-under-contention measurements in section 2b were taken on a
+4-vCPU cloud development VM, with conditions beside each. Andrew's machines were not
+used. There is no full-checkpoint host and no new full-model seconds/token result.
 
 ## 1. Bounded trunk rows: implemented, opt-in
 
@@ -32,8 +33,10 @@ On a host already holding the packed checkpoint, add to an existing command:
 --trunk /path/to/packed-trunk --trunk-rows --trunk-gb 0.05
 ```
 
-Use an explicit budget; auto selection and draft trunks are rejected for this mode.
-The existing whole-layer reader remains the default.
+Use an explicit budget: without one the default `--trunk-gb` of 16 applies, which the
+row buffers never approach but the memory plan charges in full. Auto selection and
+draft trunks are rejected for this mode. The existing whole-layer reader remains the
+default.
 
 **Tradeoff:** every trunk matrix is applied to all positions of a forward in one
 pass (`k3_mmw_batch`, through `K3WeightStream.apply_batch`), so multi-token prefill
@@ -49,11 +52,15 @@ Compressed archives may decode a block repeatedly across small reads. The byte
 counter is logical/requested traffic, not a physical-device measurement.
 
 Tests cover two full 93-layer walks, unaligned row starts, ragged row/tile tails,
-wraparound, insufficient budget and truncation. ThreadSanitizer and ASan/UBSan
-run the lifetime test without OpenMP. CLI checks compare all dumped vocabulary
-logits and generated IDs across plain/compressed trunk, full-recompute/incremental/
-latent-cache modes, and expert pipelining. A Linux check uses a 64 MiB cgroup with
-swap disabled. These prove synthetic mechanism/exactness, not full-model speed.
+wraparound, insufficient budget and truncation. The fixture's bytes differ at every
+position, so a tile read from the wrong offset, applied to the wrong rows or shifted by
+a wrong O_DIRECT prefix changes the products the test compares; the 93-layer build,
+whose 257-row matrices span several tiles, runs in `make test` as `test_trunk_rows`.
+ThreadSanitizer and ASan/UBSan run it without OpenMP in the research workflow. CLI
+checks compare all dumped vocabulary logits and generated IDs across plain/compressed
+trunk, full-recompute/incremental/latent-cache modes, and expert pipelining. A Linux
+check uses a 64 MiB cgroup with swap disabled. These prove synthetic
+mechanism/exactness, not full-model speed.
 
 Sanitizers also exposed the old reader's leaked parsed JSON tree. Tensor names
 now keep an explicit owner freed on close/error. The old parallel read loop's
@@ -90,7 +97,7 @@ An earlier version of these tables was taken at 9ca67f5, before the exact decode
 kernels were merged. Its per-position loop ran the older one-position kernel, 31.2 ms
 per call at one thread against 20.9 ms here, so its speedups (1.76x, 2.66x and 3.04x
 at T = 2, 4 and 8 on one thread; 3.14x at T = 8 on four; 2.78x and 3.09x for lm_head
-blocks of 9 and 16) measured batching against a kernel this branch no longer ships.
+blocks of 9 and 16) measured batching against a kernel the engine no longer ships.
 The batched calls themselves take the same time as then (81.7 ms at T = 8 on one
 thread then, 82.6 now); what shrank is the alternative.
 
@@ -207,9 +214,9 @@ build (b0c8b74) against this one, a 64-token `--trunk-rows` prefill (`wall_secon
 --stream-lm-head` (`seconds_per_token`, `lm_head_bytes_read`, `spec_accepted`,
 identical ids) and a 512-token `--score-prompt` with and without
 `--stream-lm-head` (wall time, lm_head bytes, identical `token_nll`), all at
-`--trunk-gb 8 --cache-gb 4`, need the packed checkpoint. This VM has none: the BF16
-trunk alone is 108.81 GB against 20 GB of free disk. They remain for a host that
-holds it.
+`--trunk-gb 8 --cache-gb 4`, need the packed checkpoint. The VM these timings come
+from has none: the BF16 trunk alone is 108.81 GB against 20 GB of free disk. They
+remain for a host that holds it.
 
 ## 2. Compact Huffman decoder: research prototype
 
@@ -226,10 +233,15 @@ code space and single/pair lookup paths. The transport is benchmark-only, not a
 supported archive format.
 
 Inputs are explicitly synthetic bytes and four 1 MiB BF16 ranges identified by
-immutable revision, offset and SHA in the committed sample manifest. No model
-weights are committed. The real-range payload retains **0.672227** of the original
-bytes, excluding archive framing/indexes. This is a sample result, not a full
-checkpoint-size guarantee.
+immutable revision, offset and SHA in the committed sample manifest. All four are
+slices of one small tensor family, KDA `self_attn.f_a_proj.weight` at layers 1, 12, 24
+and 36: 128 x 7168 per KDA layer, 0.127 GB over the 69 KDA layers, 0.12% of the
+108.81 GB trunk. Both the ratio and the decode speed depend on the high-byte
+distribution, so they describe that family, not the trunk; the fixed-width
+[per-family run](fixed-width-trunk.md#per-family-result) shows how much families
+differ. No model weights are committed. The real-range payload retains **0.672227**
+of the original bytes, excluding archive framing/indexes. This is a sample result, not
+a full checkpoint-size guarantee.
 
 Earlier word-refill results are preserved in
 [research-word-refill.json](../measurements/research-word-refill.json): real-range
@@ -241,7 +253,7 @@ The [two-symbol results](../measurements/research-two-symbol.json), from
 [CI run 35462000448](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/35462000448),
 are:
 
-| Hosted CI ISA, real K3 ranges | Original, three GB/s runs | Four streams + pairs, three GB/s runs | Median kernel ratio | Every run >=1 GB/s |
+| Hosted CI ISA, the four `f_a_proj` ranges | Original, three GB/s runs | Four streams + pairs, three GB/s runs | Median kernel ratio | Every run >=1 GB/s |
 |---|---|---|---:|---|
 | x86_64 | 0.41880, 0.41934, 0.41816 | 1.10005, 1.09141, 1.09938 | 2.63x | yes |
 | arm64 | 0.38270, 0.35989, 0.36222 | 1.35033, 1.21364, 0.94272 | 3.35x | no |
@@ -266,7 +278,7 @@ time and reach `B/r = 4.35 GB/s` to feed a saturated compressed stream. Sharing
 cores with matmuls changes this again. The format/reader, bounded workspace,
 parallel decode and concurrent-compute gates remain before engine integration.
 
-## 2b. Fixed-width high-byte dictionary: gates 1–3 passed
+## 2b. Fixed-width high-byte dictionary: gates 1–3 passed, per-family STOP on two families
 
 Follow-up to the entropy decoder above, as the [fixed-width note](fixed-width-trunk.md)
 specifies: a 4-bit index per BF16 high byte into one pooled 15-entry table plus
@@ -274,7 +286,9 @@ an escape code, the low byte raw. `benchmarks/fixed_dictionary.h` decodes with a
 scalar reference, SSSE3 `pshufb` and AArch64 NEON `tbl`; `tools/bench_fixed_dictionary.py`
 independently encodes. Benchmark-only; not an archive format and not in inference.
 
-Gate 1, the histogram falsifier, ran on all eight dense 1 MiB ranges: one pooled
+Gate 1, the histogram falsifier, ran on all eight dense 1 MiB ranges (seven KDA
+`f_a_proj`, one MLA `g_proj`; the job's full report is
+[trunk-dictionary-gate1.json](../measurements/trunk-dictionary-gate1.json)): one pooled
 dictionary covers **99.954653%** of high bytes, 1,902 escapes in 4,194,304, worst
 range 99.941254% (layer 12), payload r = **0.7502** before framing. Gate 2, byte-exact
 scalar and SIMD round trips under ASan/UBSan on both ISAs with five negative
@@ -285,15 +299,21 @@ units, recorded in
 [fixed-dictionary-rate-x86_64.json](../measurements/fixed-dictionary-rate-x86_64.json) and
 [fixed-dictionary-rate-arm64.json](../measurements/fixed-dictionary-rate-arm64.json):
 
-| Hosted CI ISA, real K3 ranges | Scalar reference | SIMD, eight 1 MiB ranges, 24 runs | SIMD, pooled 8 MiB, 3 runs | Every run >=3 GB/s | Every run >=4 GB/s |
+| Hosted CI ISA, the eight gate-1 ranges | Scalar reference | SIMD, eight 1 MiB ranges, 24 runs | SIMD, pooled 8 MiB, 3 runs | Every run >=3 GB/s | Every run >=4 GB/s |
 |---|---:|---:|---:|---|---|
 | x86_64 `ssse3_pshufb` | 1.50–1.58 | min 24.274, median 25.302, max 25.705 | 16.220, 16.263, 16.332 | yes | yes |
 | arm64 `neon_tbl` | 1.20–2.38 | min 16.361, median 19.764, max 26.662 | 14.844, 17.473, 19.071 | yes | yes |
 
 `rate_gate.status = PASS` on both ISAs. The slowest of the 54 SIMD runs is
-14.844 GB/s, against the compact Huffman decoder's best real-range runs of
-1.100 (x86_64) and 1.350 (arm64) in §2: a 13x–15x kernel-rate difference bought
-with a 6.1-point ratio premium (0.750 versus 0.689). The 8 MiB pooled figure is
+14.844 GB/s. Against the compact Huffman decoder's best run on the same ISA in §2
+(1.100 on x86_64, 1.350 on arm64, the four `f_a_proj` ranges), each ISA's slowest FD4B
+run is 14.7x faster on x86_64 (16.220) and 11.0x on arm64 (14.844); the pooled medians
+give 14.8x and 12.9x. That rate is bought with a ratio premium measured on the same
+four ranges: FD4B retains 0.750257 against Huffman's 0.672227, **7.80 points**, which
+misses the proposal's six-point limit. (The 6.1 points once quoted here compared
+FD4B with the historical r = 0.689 of a different, unidentified 4 MB sample; it is a
+lower bound, not the premium.) Over every trunk family, byte-weighted, the 4-bit
+premium over per-family Huffman codes is 7.40 points. The 8 MiB pooled figure is
 the one to quote; the 1 MiB cases sit in cache. The arm64 spread on identical
 input (16.4–26.7 GB/s) is the shared three-core hosted runner; the gate is on
 the minimum.
@@ -302,10 +322,10 @@ These are warm-buffer, single-thread kernel ceilings with no competing model
 compute, as the report's `scope` field states, and §2's break-even arithmetic
 applies unchanged: at `B = 3 GB/s` and `r = .75`, serial read+decode needs
 `D > 12 GB/s` and the overlapped saturated stream needs `D > 4 GB/s`. The kernel
-clears both on the hosted runners. Whether it does so while sharing cores with
-the matmuls, the row-seekable layout and its padding cost, the 5-bit variant,
-and a supported reader are the open gates. No full-model speedup, storage-size
-result or ratio win over Huffman is claimed.
+clears both on the hosted runners. Sharing cores with the matmuls, the row-seekable
+layout, the bit width and every tensor family were the gates left open here; the
+follow-up below closes each on its evidence, and a supported reader remains. No
+full-model speedup, storage-size result or ratio win over Huffman is claimed.
 
 The measurement files were recorded from the CI jobs' stdout `CODEC_REPORT`
 lines rather than copied from the artifact zips; every derived field (per-arm
@@ -314,37 +334,51 @@ was recomputed from the primitives and matched exactly before the files were
 written. The run's artifacts `dictionary-rate-ubuntu-latest` (ID 10601747318)
 and `dictionary-rate-macos-14` (ID 10600672892) hold the originals.
 
-**2026-09-22 follow-up** (details in the [fixed-width note](fixed-width-trunk.md)).
-The three open gates now have tooling. *Bit-width curve:* the gate tool scores
-3/4/5-bit tables, a sign-split variant, unconstrained Huffman and order-0 entropy
-bounds, per range and pooled, in CI. On the only committed real counts (four of
-the gate-1 `f_a_proj` ranges) 3 bits retains 0.704128 against 0.750153 for 4 bits
-(+4.60 points), 5 bits 0.8125, Huffman 0.672050, high-byte entropy 0.670303; the
-sample-matched FD4B premium over the four-stream Huffman payload is 7.80 points.
-*FD3B:* a 3-bit decoder with branch-free escape expansion (scalar, SSSE3, AVX2,
-NEON) passes byte-exact tests locally; its rates await the hosted rate job (a
-reading on this VM under another agent's load, with no report kept, is orientation
-only). *Row index:* FDRX makes any
-whole-row range decodable for 0.0340 points of matrix bytes per row, or 0.0148
-grouped, with zero padding at K3 widths. *Families:* gate 1 sampled two of 23
-matrix families (4.00% of trunk bytes); the `families` CI job samples all of
-them, under per-family decision rules fixed in the note before the data.
-*Contention:* a byte-exact benchmark runs one decoder thread against
-`k3_matmul_bf16` on the other cores. On a quiet 4-vCPU VM (load 0.10 and 0.29
-before the runs, 9 interleaved repeats) the worst-case contended streamed speedup
-exceeds 1 up to B = 5 GB/s in every format, placement and thread count (4 and 2),
-and is the full 1.333 (FD4B) / 1.420 (FD3B) up to about 4.2 GB/s on 4 threads; at
-6 GB/s it fails for streamed input on 4 threads (0.970, 0.998, decode-limited) and
-everywhere on 2 (about 0.85, matmul-limited). Pinned layers should stay raw
-(resident slowdown 2.08 to 3.62). Hosted numbers for all of these await CI. No
-full-model speedup is claimed.
+**Follow-up, 2026-09-22 to 2026-09-23** (details in the [fixed-width note](fixed-width-trunk.md);
+the hosted results are from [CI run 35845709912](https://github.com/andrewd780/kimi-k3-for-me/actions/runs/35845709912)
+at head `cb4ab38`).
+*Bit-width curve:* the gate tool scores 3/4/5-bit tables, a sign-split variant,
+unconstrained Huffman and order-0 entropy bounds. On all eight gate-1 ranges, from
+committed counts, 3 bits retains 0.703403 against 0.750227 for 4 bits (+4.68 points),
+5 bits 0.8125, Huffman 0.673839, high-byte entropy 0.670093 (whole-BF16 entropy
+0.658087 in CI). *FD3B:* a 3-bit decoder with branch-free escape expansion (scalar,
+SSSE3, AVX2, NEON) is byte-exact in hosted CI under ASan/UBSan on both ISAs and
+decodes the pooled 8 MiB at 9.6 (SSSE3), 15.3 (AVX2) and 11.0 to 13.5 (NEON)
+reconstructed GB/s, every run above 4. *Row index:* FDRX makes any whole-row range
+decodable for 0.0340 points of matrix bytes per row, or 0.0148 grouped, with zero
+padding at K3 widths. *Families:* gate 1 sampled two of 23 matrix families (4.00% of
+trunk bytes); the `families` job sampled all 23 (92 MiB,
+[trunk-family-gate.json](../measurements/trunk-family-gate.json)). Its gate is a
+**STOP**: the byte-weighted pooled table covers under 99% of the router (98.49%) and
+the shared-expert down projection (98.88%), and gate 1's own table under 99% of all
+three shared-expert projections, 22.35% of trunk bytes. By the rules fixed before the
+data, the router takes its own table, the shared-expert down projection stays raw, and
+each family takes its better width: **r = 0.7329** over all 108.76 GB of matrices,
+payload only, 5.58 points above per-family Huffman codes (3 bits everywhere would be
+0.7133, 4 bits 0.7511). *Contention:* a byte-exact benchmark runs one decoder thread
+against `k3_matmul_bf16` on the other cores. Re-measured with the shipped kernels, on a
+quiet 4-vCPU VM (load 0.10 and 0.46 before the runs, 9 interleaved
+repeats), the worst-case contended streamed speedup exceeds 1 up to B = 5 GB/s in every
+format, placement and thread count (4 and 2) and is the full 1.333 (FD4B) / 1.420
+(FD3B) up to about 4.3 / 4.0 GB/s; at 6 GB/s it fails for streamed input at both
+thread counts (0.937 to 0.982, decoder-limited) and passes for cache-hot input. The
+hosted x86_64 (Xeon Platinum 8573C) and arm64 legs stay above 1 at every B up to 6.
+Pinned layers should stay raw: the resident slowdown is 2.3 to 6.1 in the worst case.
+The first VM tables, taken with the kernel it replaced, had the 2-thread case
+matmul-limited at B = 6 and resident slowdowns of 2.1 to 3.6. No full-model speedup is
+claimed.
 
 ## 3. Predictive expert reads: closed
 
 Andrew's follow-up closes this route independently of any future generation
-capture. The assumed 70% recall adds about 5.76% whole-token traffic while
-experts account for only 19.2% of baseline bytes. The audit remains the stopping
-record. No further capture or predictor work is planned; the next item is the
+capture. The 5.76% is toy arithmetic, not a measurement: a predictor that fetches 16
+experts per layer ahead of time at an assumed 70% recall, with no cache hits, no
+cancellation of wrong reads and every correct guess kept until use, reads
+`16 + 16 * 0.3 = 20.8` experts' bytes for every 16 used, and experts are 25.83 GB of
+the 134.64 GB one-position baseline (19.2%), so whole-token traffic grows by
+`0.192 * 0.3 = 5.76%`. Cache hits or cancellation would lower that; eviction of
+still-needed experts could raise it. The audit remains the stopping record. No further
+capture or predictor work is planned; the next item is the
 [fixed-width trunk dictionary falsifier](fixed-width-trunk.md).
 
 The [ordered review audit](predictive-prefetch-gates.md) supersedes the earlier
@@ -376,19 +410,26 @@ starting prefix, three-token guess and 0–3 Jacobi rounds. All emitted tokens
 equal greedy output. This proves the reference, not K3 state rollback or speed.
 
 For window `w`, independent draft agreement `p`, verification cost `V`, proposal
-cost `D` and rejection replay cost `R`, normalized to ordinary-step cost:
+cost `D` and rejection replay cost `R`, normalized to ordinary-step cost (the model
+was written when `--spec` replayed after a partial acceptance; since #14 the engine's
+rollback costs no replay, so `R = 0` for it):
 
 $$E[N]=\sum_{j=0}^w p^j,\qquad E[T]=V+D+(1-p^w)R.$$
 
 It pays only if `E[N] > E[T]`. Assuming `p=.9,w=2,V=D=R=1` gives
-`2.71/2.19 = 1.2374`; at `p=.5` it loses. Those are assumptions, not K3 acceptance.
+`2.71/2.19 = 1.2374`, and with `R = 0` it gives `2.71/2 = 1.355`; at `p=.5` it loses
+either way (`1.75` against `2.75` or `2`). Those are assumptions, not K3 acceptance.
 Correlated acceptance needs empirical prefix-length frequencies. Guaranteed
 convergence via `w` full Jacobi passes plus verification costs at least `w+1`
 sweeps to emit at most `w+1` tokens: no pass-count improvement.
 
-The existing `--spec` is unchanged. A new mode needs cheap early proposals or
-reused computation, complete KDA/KV/AttnRes rollback tests, and real acceptance
-including rejected-work I/O. The primary
+`--spec` itself changed in #14: a verify sweep is tentative, and only the positions
+behind emitted ids are committed, from a per-position log of each KDA layer's
+recurrence inputs (MLA rows are positional), bit-identical to serial decode with no
+replay sweep and no state snapshot. Oracle GATE 4 and the CLI tests hold that
+rollback across memory modes. A lookahead mode could reuse it; it still needs cheap
+early proposals or reused computation, and real K3 acceptance including rejected-work
+I/O. The primary
 [Lookahead Decoding paper](https://arxiv.org/abs/2402.02057) establishes prior art,
 not an offloaded K3 speed claim.
 

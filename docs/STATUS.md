@@ -1,9 +1,8 @@
 # Where everything stands
 
 *Plain-language status of this fork, written for the project owner. Last updated
-2026-09-20 with merged work through #10 and the under-review experiments in
-[PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12). Measurements and
-projections are distinguished below. Engineering priorities stay in [ROADMAP.md](ROADMAP.md).*
+2026-09-23 with merged work through #14. Measurements and projections are
+distinguished below. Engineering priorities stay in [ROADMAP.md](ROADMAP.md).*
 
 ## The short version
 
@@ -83,6 +82,10 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Direct I/O for selective raw extents (#8) | Reads the raw parts of a selective archive past the page cache, the way plain shards are read | done | Native test proves the direct path is taken and falls back cleanly; bytes identical | Speed unmeasured on the real model |
 | Known-route expert pipelining, `--expert-pipeline` (#9) | Publishes each routed expert as its read lands instead of waiting for the whole top-k | done, opt-in | Native pipeline-mode cases plus sanitizers; CLI parity for full recompute and `--incremental` at pool sizes 1 and 16 ([note](notes/expert-pipeline.md)) | Speed unmeasured on the real model |
 | MLA latent KV cache, `--kv-latent` (#10) | Keeps the attention cache in its 512-wide latent form and rebuilds keys and values on use: 55 KB per position instead of 2.37 MB, 42.8x less | done, opt-in | GATE 3b holds all 20 incremental steps bit-identical between layouts; state save/load round-trips; 20 CI checks green ([note](notes/kv-latent.md)) | Costs two kv_b matmuls per cached position per query token (score, then value); speed unmeasured on the real model |
+| Bounded trunk rows, `--trunk-rows` (#12) | Streams each trunk matrix through two small double-buffered row tiles instead of whole layers, with unchanged arithmetic | done, opt-in | Two 93-layer walks over position-dependent fixture bytes, ThreadSanitizer and ASan/UBSan lifetime runs, CLI logit parity across trunk, cache and expert modes, a 64 MiB cgroup ([results](notes/research-results.md)) | Real speed unmeasured; `--kv-latent` rereads `kv_b` for every rebuilt position |
+| Replay-free speculative rollback (#14) | A partly accepted `--spec` sweep commits only its accepted positions, from a per-position KDA log, instead of restoring a snapshot and replaying them | done | Oracle GATE 4: 14 verify sweeps at every accept count 0 to 4, both KV layouts, no replay; CLI parity with serial decode in every memory mode, saved state equal to serial's | Speed unmeasured on the real model; the drafting rule is unchanged ([study](notes/spec-replay.md)) |
+| Batched trunk matmul and lm_head blocks (#14) | Applies each trunk matrix, and lm_head, to every position of a prefill or verify sweep in one pass | done | Bitwise against the one-position kernel on cancelling data (`test_ops`), oracle GATE 3c, CLI byte counts at 1 to 130 positions; about 2x per position at 8 positions on the VM ([timing](notes/research-results.md#batched-kernel-timing)) | Full-checkpoint comparison needs a checkpoint host |
+| Faster exact decode kernels and router (#14) | Less work per weight in the decode matmuls and the MoE router, the same bits | done | `test_matmul_exact` and `test_ops` hold every partition and reduction order on cancelling data; bf16 at 82% to 93% of the VM's read rate, router 1.8x faster ([note](notes/decode-kernels.md)) | Kernel timings only; no s/token claim |
 
 ### Measured, no new code
 
@@ -93,6 +96,8 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Memory ladder and I/O split (upstream) | Speed against RAM budget | measured, single sample | 32.7 s/token at 8 GB, 19.2 s/token at 224 GB, on 124 cores; disk is 57% of the time at 8 GB | Share on a small core count unknown |
 | Jetson Orin Nano Super proof (upstream) | Full checkpoint on an 8 GB-class board | measured | 4 runs, 949 s per token including a 5-token prefill, 208 GB read per run | Proof of life, not usable speed |
 | Streaming option map and bounds (#6) | 26 ways to change bytes, overlap or compute, with the math checked | written | Ceilings: removing all expert reads gives at most 1.24x; removing all trunk reads at most 5.2x, disk time only ([map](notes/streaming-options.md)) | A menu, not code |
+| MLA cache variants (#14) | What each way of caching MLA attention costs, and whether absorbing `kv_b` stays exact | measured, benchmark only | Three variants held bitwise to the engine in `make test`; the absorbed one moves outputs by about 1e-6 relative, so it cannot be a mode; kv_b counts and timings on the VM and hosted arm64 ([note](notes/mla-variants.md)) | Rebuilding each position once per call (L1) is the candidate for `--kv-latent`; not in the engine |
+| `--spec` drafting policies (#14) | Which n-gram drafting rule pays, per workload, under the verify-step cost model | measured on a text proxy, not K3 | Teacher-forced replay of four corpora with a proxy tokenizer: the current rule pays on whole-file edits and little elsewhere ([note](notes/spec-replay.md)) | K3's own outputs through `spec_replay.py replay-ids` |
 
 ### Built and shelved, or studied and closed
 
@@ -103,14 +108,13 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Shared base plus low-rank delta (studied, closed PR #3) | Store one expert per layer plus small differences | dead on paper | Needs 0.99 correlation between experts; real expert weights look random. The write-up itself had errors and was closed unmerged | Kept only at PR #3 for the record |
 | Int8 trunk as the main model (upstream note) | Halve the trunk by rounding | not validated | The 90.9% figure was a 22-token draft with the exact model verifying, not a quality result | A real quality evaluation |
 
-### New research, under review
+### Research gates from #12 to #14
 
 | Technique | What it would do | Status | What is known | Size of the job |
 |---|---|---|---|---|
-| Bounded trunk rows | Overlaps matrix-row reads and exact compute with two small buffers | implemented, opt-in `--trunk-rows` in #12 | 93-layer wraparound, sanitizer, CLI logit and capped-allocation gates ([results](notes/research-results.md)) | Real speed unmeasured; a batch reads each matrix once, latent-cache `kv_b` rebuilds still reread |
-| Fixed-width trunk dictionary | 4-bit high-byte index into one 15-entry table, low byte raw; SIMD table lookup instead of entropy decode | gates 1–3 passed in CI (#13); benchmark-only, not in inference | 99.95% coverage on eight dense ranges, r = 0.7502; byte-exact on x86/ARM under sanitizers; 14.8–26.7 reconstructed GB/s with every SIMD run above the 4 GB/s target ([note](notes/fixed-width-trunk.md), [results](notes/research-results.md)) | Per-family samples (CI job built, not run), eight-range bit-width figures, hosted FD3B exactness and rates, hosted legs of decode under concurrent compute, a supported reader. Partial since: decode under concurrent compute measured on a 4-vCPU VM (worst-case streamed speedup above 1 up to a 5 GB/s SSD, the full 1/r to about 4.2 GB/s on 4 threads, below 1 at 6 GB/s for streamed input), bit-width curve on the four committed `f_a_proj` ranges only (3 bits beats 4 by 4.60 points), FD3B decoder byte-exact in local sanitizer runs; exact from shapes: FDRX row index (0.034 points). 4-bit ratio is 6.1 points worse than Huffman by design |
-| Next-layer expert prefetch | Would predict upcoming routes; true routing still decides computation | closed in #13 on the traffic arithmetic; diagnostic only in #12 | Synthetic validation only; [audit](notes/predictive-prefetch-gates.md) records unmeasured k=1/2/4, equal-slot static null and bytes/decode token; at 70% recall uncancelled misses add ~5.76% whole-token traffic on a 19.2% byte share | Not reopened by a generation capture; no engine predictor |
-| Bounded lookahead verification | Drafts without a matching history suffix | reference and cost gate built in #12 | Exhaustive toy-model exactness; proposal and replay work explicitly charged ([results](notes/research-results.md)) | K3 acceptance and state integration blocked; `--spec` unchanged |
+| Fixed-width trunk dictionary | A 4-bit high-byte index into one 15-entry table, low byte raw; SIMD table lookup instead of entropy decode | gates 1–3 passed in CI (#13); the per-family gate is a STOP on two families (#14); benchmark-only, not in inference | 99.95% coverage on eight dense ranges, r = 0.7502; byte-exact on x86/ARM under sanitizers; 14.8–26.7 reconstructed GB/s with every SIMD run above the 4 GB/s target. In #14: 3 bits beat 4 by 4.68 points on those ranges and 3.78 byte-weighted over all 23 families; the 3-bit decoder is byte-exact and 9.6–15.3 GB/s in hosted CI; the row index costs 0.034 points. By the rules fixed before the data, the router takes its own table, `moe.shared_down` stays raw, and per-family widths give r = 0.7329 over all matrices. Decode beside matmul threads keeps a worst-case streamed speedup above 1 up to a 5 GB/s SSD on a 4-vCPU VM, and at every rate to 6 GB/s on both hosted runners ([note](notes/fixed-width-trunk.md), [results](notes/research-results.md)) | A supported reader, and the placement a real row pipeline sees. By design the ratio stays above Huffman's: 7.80 points on the four `f_a_proj` ranges, 5.58 points above the per-family Huffman bound for the plan |
+| Next-layer expert prefetch | Would predict upcoming routes; true routing still decides computation | closed in #13 on the traffic arithmetic; diagnostic only in #12 | Synthetic validation only; the [audit](notes/predictive-prefetch-gates.md) records k=1/2/4, the equal-slot static null and bytes per decode token as unmeasured. Toy arithmetic, not a measurement: fetching 16 experts at an assumed 70% recall, with no cache hits, no cancellation and every correct guess kept until use, adds about 5.76% to whole-token traffic, because experts are 25.83 of the 134.64 GB one position streams | Not reopened by a generation capture; no engine predictor |
+| Bounded lookahead verification | Drafts without a matching history suffix | reference and cost gate built in #12; no engine mode | Exhaustive toy-model exactness; proposal and replay work explicitly charged ([results](notes/research-results.md)). Since #14 `--spec` rolls back without replay, so a lookahead mode would pay no replay cost (R = 0) | K3 acceptance and total work, including rejected-work reads, need a checkpoint host |
 | io_uring reads | Linux asynchronous read submission | standalone experiment built in #12 | Three runs per arm at five queue depths; noisy overlapping timings, no consistent meaningful gain ([results](notes/research-results.md)) | No engine backend replacement justified |
 | Speculative decoding on resident hardware | A cheap draft proposes tokens, the exact model verifies; ~1.7x fewer weight bytes per accepted token at the measured 66.7% acceptance ([note](notes/int8-draft-container.md)) | proposal | Only pays off once the model is resident in RAM; nothing on 8 GB, where both draft and exact stream from disk | Needs a large-memory host to pay for |
 | Chunked prefill, sampling, chat template, vision, HTTP serving | Usability features from the upstream roadmap | not started | n/a | Do not change size or speed |
@@ -130,10 +134,14 @@ a day of disk time.
    Automatically delete head branches* so this stops recurring.
 2. **Checkpoint-free engineering, in order of value per risk.** The lint findings
    and direct I/O for selective raw extents landed in #8; known-route expert
-   pipelining landed in #9; the latent KV cache landed in #10. The ranked list of
-   current state is [notes/research-queue.md](notes/research-queue.md). #12 implements
-   bounded trunk rows and gives the four other proposals executable research gates.
-   Read the measured results before selecting further integration work.
+   pipelining landed in #9; the latent KV cache landed in #10. #12 implemented bounded
+   trunk rows and gave the four other proposals executable research gates; #13 closed
+   predictive prefetch and built the fixed-width dictionary falsifier, whose first three
+   gates passed in CI; #14 added replay-free `--spec` rollback, the batched and faster
+   exact kernels, and the fixed-width follow-up gates.
+   [notes/research-queue.md](notes/research-queue.md) records what each proposal became
+   and which gates remain open. Read the measured results before selecting further
+   integration work.
 3. **The rental remains the only way to measure.** Everything marked blocked needs one
    machine with the checkpoint for a day or two. Without it there will never be a
    laptop speed or quality number; with it, one core-limited ladder run answers the

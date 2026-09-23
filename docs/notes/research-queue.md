@@ -1,17 +1,19 @@
 # Research queue: implementation and remaining gates
 
-Updated 2026-09-20 in [PR #12](https://github.com/andrewd780/kimi-k3-for-me/pull/12),
-following the five proposals in #11. The implementation is under review; this
-page does not call it merged. [Research results](research-results.md) records
-scope, measurements, usage and remaining work.
+Written in [#12](https://github.com/andrewd780/kimi-k3-for-me/pull/12) from the five
+proposals first queued in #11, and updated through #14 (2026-09-23); the work it lists
+is merged. It replaces #11's ranked queue: the per-machine ordering that queue drew
+from the memory ladder does not hold (see [the arithmetic](#what-the-arithmetic-establishes)).
+[Research results](research-results.md) records scope, measurements, usage and
+remaining work.
 
 | Proposal | Implemented in this follow-up | Gate still open |
 |---|---|---|
 | Smaller trunk ring | Opt-in `--trunk-rows`: two row buffers, unchanged matrix arithmetic, current-layer vector arena; no cross-layer read in flight | Real-model latency, queue depth and prefill cost |
-| Compact Huffman decoder | Four streams, bounded word refill and two-symbol lookup; independent encoder, corruption checks, x86/ARM CI timings on synthetic and pinned K3 ranges | Results in the results note; production container, concurrent reader and resource-cost gate remain separate |
+| Compact Huffman decoder | Four streams, bounded word refill and two-symbol lookup; independent encoder, corruption checks, x86/ARM CI timings on synthetic bytes and four pinned K3 ranges, all KDA `f_a_proj` (0.12% of trunk bytes) | Results in the results note; production container, concurrent reader and resource-cost gate remain separate |
 | Predictive expert prefetch | Lead-labelled centroid/ridge diagnostic, synthetic tests only; [ordered gate audit](predictive-prefetch-gates.md) | Closed; do not reopen on a generation capture |
-| Fixed-width trunk dictionary | [Eight-range falsifier, SIMD codec and rate gates](fixed-width-trunk.md), one pooled 15-entry dictionary, benchmark-only | Gates 1–3 passed in CI: 99.95% coverage, r = 0.7502, SIMD decode 14.8–26.7 reconstructed GB/s, every run above the 4 GB/s target. Gates 4–5: on committed `f_a_proj` counts 3 bits beats 4 by 4.60 points (FD3B built), 5 bits buys nothing; FDRX row index costs 0.034 points, zero padding. Open: eight-range and per-family CI samples, hosted FD3B exactness and rates, hosted decode-under-contention legs (measured on a 4-vCPU VM: worst-case streamed speedup above 1 up to B = 5 GB/s, below 1 at 6 GB/s for streamed input), supported reader |
-| Bounded lookahead | Bounded Jacobi reference, exhaustive toy exactness checks and rational break-even calculator | Useful early acceptance on K3, engine snapshot/replay integration, measured total work |
+| Fixed-width trunk dictionary | [Eight-range falsifier, per-family samples, FD4B and FD3B SIMD codecs, FDRX row index, rate and contention gates](fixed-width-trunk.md), benchmark-only | Gates 1–3 passed in CI: 99.95% coverage on the eight gate-1 ranges, r = 0.7502, SIMD decode 14.8–26.7 reconstructed GB/s. Gate 4: 3 bits beat 4 by 4.68 points on those ranges and 3.78 byte-weighted over all 23 families; FD3B byte-exact and 9.6–15.3 GB/s in hosted CI. Gate 5: FDRX costs 0.034 points, zero padding. Per-family gate: STOP on `moe.router` and `moe.shared_down`; by the rules fixed before the data r = 0.7329 over all matrices, 5.58 points above per-family Huffman. Contention: worst case above 1 up to B = 5 GB/s on a 4-vCPU VM with the shipped kernels (below 1 at 6 for streamed input), above 1 at every B to 6 on both hosted runners. Open: a supported reader, and the placement a real row pipeline sees |
+| Bounded lookahead | Bounded Jacobi reference, exhaustive toy exactness checks and rational break-even calculator | Useful early acceptance on K3 and measured total work. State rollback is no longer a gate: since #14 `--spec` commits verify sweeps from a KDA log with no replay or snapshot, and a lookahead mode would reuse that |
 | Linux async submission | Raw-syscall `io_uring` versus blocking-pool experiment, queue depths 1/2/4/8/16, three runs per arm | A repeatable benefit under concurrent real compute before adding an engine backend |
 
 ## What the arithmetic establishes
@@ -23,13 +25,26 @@ For independent disk and compute resources, every schedule satisfies
 
 $$t \ge \max(C, B_{\rm required}/D_{\rm disk}).$$
 
-Applying the historical **serialized** 18.63 s I/O + 14.06 s compute split to an
-ideal fully overlapping schedule gives a lower bound of 18.63 s, or a conditional
-1.75x ceiling. It is not a result of the new reader. Smaller buffers, startup,
-queue depth, shared cores, decompression, expert dependencies and prompt batches
-can change those service times or prevent full overlap. Dividing server compute
-time by core count does not establish Mac performance. No Mac or core-limited
-full-model measurement exists here.
+The only split on record is the memory ladder's 8 GB row: 32.69 s per token with
+57.3% of it I/O ([memory-ladder.tsv](../data/memory-ladder.tsv)), so 18.73 s of disk
+and 13.96 s of everything else. Fully overlapped, that would bound the step at
+18.73 s, a 1.75x ceiling. Four things keep that from describing the engine today:
+
+- Both figures are averages over a whole 8-step run whose first step is the prompt
+  prefill (99.70 GB of expert reads against 25.83 GB per later step), and the ladder
+  is meant as a comparison across budgets, not a per-token speed
+  ([PERFORMANCE.md](../PERFORMANCE.md#longer-runs-are-faster)).
+- The campaign (captured 2026-07-31) predates the asynchronous trunk reader
+  (2026-08-05), so no budget in it had read-ahead.
+- It also predates v1.0.0's fused kernels, which cut per-token compute about eightfold;
+  with the compute term divided by 8, the same model gives a ceiling of about 1.09x on
+  that 124-core host.
+- None of it measures the row pipeline, and none of it a small machine.
+
+Smaller buffers, startup, queue depth, shared cores, decompression, expert
+dependencies and prompt batches can change those service times or prevent full
+overlap. Dividing server compute time by core count does not establish Mac
+performance. No Mac or core-limited full-model measurement exists here.
 
 ## Corrections to the original proposals
 
@@ -52,9 +67,11 @@ full-model measurement exists here.
 
 ## Constraints and next decisions
 
-All native execution is in CI, including hosted ARM. Nothing runs on Andrew's
-Macs. The decoder fetches only four SHA-verified 1 MiB BF16 ranges from the
-existing immutable sample manifest; it does not download a checkpoint.
+Native gates run in CI, including hosted ARM; the kernel, batching, contention and
+MLA timings were taken on a 4-vCPU cloud VM, with conditions in each note. Nothing
+runs on Andrew's Macs. The Huffman benchmark fetches four SHA-verified 1 MiB BF16
+ranges of the existing immutable sample manifest and the fixed-width gates its eight,
+plus 92 1 MiB family samples whose hashes are recorded; nothing downloads a checkpoint.
 
 No standing checkpoint host exists. Full-model timing, core/thread sweeps
 and quality evaluation remain blocked on one. Predictive prefetch is closed. This work

@@ -73,45 +73,61 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   low byte raw, decoded by SSSE3 `pshufb` / NEON `tbl`. The eight-range histogram
   falsifier passes (99.95% coverage, r = 0.7502); byte-exact round trips pass on
   x86/ARM under sanitizers; the rate gate passes with every SIMD run at
-  14.8–26.7 reconstructed BF16 GB/s against a 4 GB/s target, 13x–15x the compact
-  Huffman kernel at a 6.1-point ratio premium. Follow-up gate tooling, most of it
-  awaiting hosted CI: a bit-width curve with entropy bounds (on the four committed
-  `f_a_proj` ranges only, 3 bits beats 4 by 4.60 points; eight-range figures
-  pending), an FD3B 3-bit decoder (byte-exact in local sanitizer runs; hosted
-  exactness and rate jobs pending), the FDRX row index for whole-row seeking
-  (0.034 points per row, zero padding, exact from the released shapes), a CI job
-  that samples all 23 trunk matrix families (not yet run), and a
-  decode-under-matmul-contention benchmark (measured on a quiet 4-vCPU VM: the
-  worst-case streamed speedup stays above 1 up to a 5 GB/s SSD at 4 and 2 threads
-  and fails at 6 GB/s for streamed input; hosted legs pending). A supported reader
+  14.8–26.7 reconstructed BF16 GB/s against a 4 GB/s target. Each ISA's slowest run
+  is 14.7x (x86_64) and 11.0x (arm64) the compact Huffman kernel's best run on the
+  four KDA `f_a_proj` ranges, where its ratio trails Huffman's by 7.80 points
+  (0.7503 against 0.6722), missing the six-point requirement. Follow-up gates, run in
+  hosted CI (run 35845709912) except where a VM is named: a bit-width curve with
+  entropy bounds (3 bits beat 4 by 4.68 points on the eight ranges and by 3.78
+  byte-weighted over all 23 families); an FD3B 3-bit decoder, byte-exact under
+  ASan/UBSan on SSSE3, AVX2 and NEON at 9.6 to 15.3 reconstructed GB/s pooled; the
+  FDRX row index for whole-row seeking (0.034 points per row, zero padding, exact
+  from the released shapes); samples of all 23 trunk matrix families, a STOP on two
+  (the pooled table covers 98.49% of `moe.router` and 98.88% of `moe.shared_down`),
+  after which the plan fixed before the data gives the router its own table, keeps
+  `shared_down` raw and reaches r = 0.7329 over all 108.76 GB of matrices, 5.58
+  points above per-family Huffman; and a decode-under-matmul-contention benchmark,
+  whose worst-case streamed speedup stays above 1 up to a 5 GB/s SSD on a quiet
+  4-vCPU VM with the shipped kernels (it fails at 6 GB/s for streamed input at 4 and
+  2 threads) and at every rate to 6 GB/s on both hosted runners. A supported reader
   remains. See [the note](docs/notes/fixed-width-trunk.md) and
   [results](docs/notes/research-results.md).
 - **Bounded trunk row streaming**, opt-in `--trunk-rows`: two small read/compute
   buffers, unchanged per-row arithmetic, and an explicitly sized current-layer
   vector arena. Synthetic gates cover compressed/plain logits, a 64 MiB cgroup,
-  93-layer wraparound, ThreadSanitizer and ASan/UBSan. A batch of positions reads
-  each matrix once (see the batched matmul entry below); `--kv-latent` still rereads
-  `kv_b` per rebuilt position. No full-model speedup is claimed. Fixes the trunk JSON ownership leak
-  and parallel read error-flag race uncovered by those gates.
+  two 93-layer row walks with wraparound over position-dependent fixture bytes
+  (`test_trunk_rows`), ThreadSanitizer and ASan/UBSan. A batch of
+  positions reads each matrix once (see the batched matmul entry above); `--kv-latent`
+  still rereads `kv_b` per rebuilt position. `--trunk-gb` caps the two buffers in this
+  mode and the memory plan charges the whole budget, so pass a small one; the run
+  report gives the mode's binds, matrix passes, reader tile time and main-thread
+  waits. No full-model speedup is claimed. Fixes the trunk JSON ownership leak and
+  parallel read error-flag race uncovered by those gates. Every refusal of a malformed
+  `trunk.json` now names its reason (no layers, a negative or overflowing run, a tensor
+  outside its layer's run, a misaligned offset).
 - **Executable research gates** for the other four proposals: a compact
   four-stream/two-symbol Huffman decoder benchmark with pinned K3 range samples,
   prompt-separated routing diagnostics, bounded Jacobi/lookahead cost analysis,
   and raw-syscall io_uring versus pread-pool experiments. They do not add default
   inference behavior. See [research results](docs/notes/research-results.md).
   The decoder is 2.63x/3.35x faster than the old kernel by median on the four
-  sampled K3 ranges (hosted x86/ARM respectively), but fails the strict every-run
-  throughput gate and remains outside inference. No model-level gain is claimed.
+  sampled K3 ranges (hosted x86/ARM respectively), all KDA `f_a_proj` and together
+  0.12% of trunk bytes, but fails the strict every-run throughput gate and remains
+  outside inference. No model-level gain is claimed.
 - **Predictive-prefetch gate correction:** routing diagnostics require declared
   source-layer lead and decode phase; zero lead is oracle-only. Removed inferred
   read counters and the 70% promotion flag. The [ordered audit](docs/notes/predictive-prefetch-gates.md)
-  records all real k=1/2/4 scores as unmeasured, the mandatory equal-slot static
-  null, and whole-expert byte accounting. Predictor development pauses pending
-  a real generation trajectory; the existing prefix replay is not eligible.
+  records all real k=1/2/4 scores as unmeasured, the equal-slot static null, and
+  whole-expert byte accounting. The route is closed on its traffic arithmetic: at an
+  assumed 70% recall, uncancelled misses add about 5.76% to whole-token reads, and no
+  generation capture reopens it. The existing prefix replay is not eligible evidence.
 
-- **Research queue**, `docs/notes/research-queue.md`: the ranked list of what is left to
-  build without the checkpoint, each item exact and gated on the synthetic model, with
-  the per-machine arithmetic that orders it. The status board now points at it, carries
-  the four new proposal rows, and lists `--kv-latent` under shipped with its evidence.
+- **Research queue**, `docs/notes/research-queue.md`: what each of the five
+  checkpoint-free proposals became, the gates each still has open, and the arithmetic
+  that bounds them; a per-machine ordering drafted from the memory ladder did not hold
+  and is not kept. The status board points at it, carries the research-gate rows, and
+  lists `--kv-latent`, `--trunk-rows` and replay-free rollback under shipped with their
+  evidence.
 - **`--kv-latent`**, off by default: the incremental decoder's MLA KV cache holds only
   the `kv_lora_rank` latent and the shared rope row per position, and rebuilds the
   per-head k and v through `kv_b` on every use, which is what MLA's own design caches.

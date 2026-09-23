@@ -60,10 +60,10 @@ after a partial acceptance. Speedup is emitted ids divided by summed step cost; 
 plain step costs 1.
 
 "Today" in the tables means the engine as it was before the replay-free rollback
-(commit 1804f7e on this branch), which restored a snapshot and replayed the accepted
-prefix through a second forward after every partial acceptance. The engine on this
-branch no longer does that, so the "replay-free" column is the one that describes it; the
-"today" column is kept to show what the rollback changed. The coefficients are estimates
+(commit 1804f7e), which restored a snapshot and replayed the accepted prefix through a
+second forward after every partial acceptance. The engine no longer does that, so the
+"replay-free" column is the one that describes it; the "today" column is kept to show
+what the rollback changed. The coefficients are estimates
 of a plain decode token's cost shares (trunk bytes, expert bytes, compute) at each memory
 tier, not measurements.
 

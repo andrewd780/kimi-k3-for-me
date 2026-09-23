@@ -1485,11 +1485,13 @@ tolerance: atol=1.0e-05 rtol=1.0e-04  (from MANIFEST.json)
         H=4 qh=32 (nope 24 + rope 8) v=16 kv_lora=32 scale=0.176777
   PASS  mxfp4          64 rows x 3584 elems, EXACT on released checkpoint bytes
   PASS  matmul_bf16   n=129    bit-identical to k3_matmul
-22 passed, 0 failed, 0 skipped
+24 passed, 0 failed, 0 skipped
 ```
 
-The worst case across all 22 kernels is 8 percent of the allowed tolerance, and two are
-exact rather than merely close.
+That is an excerpt of 24 checks. The worst tolerance-based comparison uses 58 percent of
+the allowed tolerance (a whole KDA layer), and five checks demand identical bits: MXFP4
+on released checkpoint bytes, the bf16 and batched matmuls, the router's blocked form
+and the batched MoE prefill.
 
 ![Where one token goes on the floor configuration: 80% of it is waiting on disk](docs/images/token_time_split.png)
 
