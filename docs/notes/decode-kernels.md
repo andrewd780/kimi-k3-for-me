@@ -171,46 +171,56 @@ differs only in its output format (load 0.72 to 0.94), with the same hash in all
 
 ## Reproduce
 
+Each block below runs on its own from the repository root. Point `D` at a scratch
+directory (the first block empties it). `$a` is left unquoted on purpose: it holds two
+compiler flags for the AVX2 build.
+
 ```sh
-D=/path/to/kern-timing; rm -rf $D; mkdir -p $D/base && git archive 49f5ccb | tar -x -C $D/base
+D=/path/to/kern-timing          # scratch directory; emptied here
+rm -rf -- "$D"; mkdir -p "$D/base" && git archive 49f5ccb | tar -x -C "$D/base"
 # The harness as it was when these runs were taken: later bench_kernels.c also calls
 # k3_matmul_bf16_batch, which the base object does not define.
-git show 3612040:benchmarks/bench_kernels.c > $D/bench_kernels.c
+git show 3612040:benchmarks/bench_kernels.c > "$D/bench_kernels.c"
 for v in "native:-march=native" "avx2:-mavx2 -mfma"; do n=${v%%:*}; a=${v#*:}
-  make -C $D/base -j2 ARCH="$a" BUILD=build/$n BIN=bin/$n build/$n/src/core/k3_ops.o
-  make -j2 ARCH="$a" BUILD=build/t-$n BIN=bin/t-$n build/t-$n/src/core/k3_ops.o
-  for k in old:$D/base/build/$n new:build/t-$n; do
+  make -C "$D/base" -j2 ARCH="$a" BUILD="build/$n" BIN="bin/$n" "build/$n/src/core/k3_ops.o"
+  make -j2 ARCH="$a" BUILD="build/t-$n" BIN="bin/t-$n" "build/t-$n/src/core/k3_ops.o"
+  for k in "old:$D/base/build/$n" "new:build/t-$n"; do
     cc -O3 -std=gnu99 $a -fopenmp -pthread -ffp-contract=off -Iinclude -Iinclude/k3 \
-       -Ithird_party -Isrc/core $D/bench_kernels.c ${k#*:}/src/core/k3_ops.o \
-       -o $D/bench_${k%%:*}_$n -lm
+       -Ithird_party -Isrc/core "$D/bench_kernels.c" "${k#*:}/src/core/k3_ops.o" \
+       -o "$D/bench_${k%%:*}_$n" -lm
   done
 done
 for t in 1 4; do for i in 1 2 3 4 5; do
   for b in old_native new_native old_avx2 new_avx2; do
     echo "== $b threads=$t run=$i"
-    OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores K3_BENCH_REPS=11 $D/bench_$b
+    OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores K3_BENCH_REPS=11 "$D/bench_$b"
   done
-done; done 2>&1 | tee $D/timing.log
-grep FNV $D/timing.log | sort | uniq -c    # exactly two distinct lines
+done; done 2>&1 | tee "$D/timing.log"
+grep FNV "$D/timing.log" | sort | uniq -c    # exactly two distinct lines
 ```
 
-The router, with the same two kernel objects per build:
+The router, with the same two kernel objects per build; it builds them itself when the
+first block has not run (`make` reuses them when it has):
 
 ```sh
-for n in native avx2; do a=$([ $n = native ] && echo -march=native || echo "-mavx2 -mfma")
-  for k in old:$D/base/build/$n new:build/t-$n; do
+D=/path/to/kern-timing          # the directory above, or another scratch one
+[ -d "$D/base" ] || { mkdir -p "$D/base" && git archive 49f5ccb | tar -x -C "$D/base"; }
+for v in "native:-march=native" "avx2:-mavx2 -mfma"; do n=${v%%:*}; a=${v#*:}
+  make -C "$D/base" -j2 ARCH="$a" BUILD="build/$n" BIN="bin/$n" "build/$n/src/core/k3_ops.o"
+  make -j2 ARCH="$a" BUILD="build/t-$n" BIN="bin/t-$n" "build/t-$n/src/core/k3_ops.o"
+  for k in "old:$D/base/build/$n" "new:build/t-$n"; do
     cc -O3 -std=gnu99 $a -fopenmp -pthread -ffp-contract=off -Iinclude -Iinclude/k3 \
-       -Ithird_party -Isrc/core benchmarks/bench_router.c ${k#*:}/src/core/k3_ops.o \
-       -o $D/router_${k%%:*}_$n -lm
+       -Ithird_party -Isrc/core benchmarks/bench_router.c "${k#*:}/src/core/k3_ops.o" \
+       -o "$D/router_${k%%:*}_$n" -lm
   done
 done
 for t in 1 4; do for i in 1 2 3 4 5; do
   for b in old_native new_native old_avx2 new_avx2; do
     echo "== $b threads=$t run=$i"
-    OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores $D/router_$b 51
+    OMP_NUM_THREADS=$t OMP_PROC_BIND=close OMP_PLACES=cores "$D/router_$b" 51
   done
-done; done 2>&1 | tee $D/router.log
-grep FNV $D/router.log | sort | uniq -c    # exactly one distinct line
+done; done 2>&1 | tee "$D/router.log"
+grep FNV "$D/router.log" | sort | uniq -c    # exactly one distinct line
 ```
 
 Wait for a quiet machine (1-minute load below 1.0) before each run; the runs above did.
