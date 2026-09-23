@@ -68,7 +68,13 @@ logits. It refuses an uncapped fallback. See [the mechanism note](notes/stream-l
 fixture manifest rather than hardcoded. Several fixtures are adversarial by construction:
 the router fixture reorders its top-2 on 5 of 6 rows, so an implementation that ignores
 the routing bias fails; the SiTU-GLU fixture drives the activation to its exact
-analytic cap.
+analytic cap. Two generated gates hold rewritten loops bitwise to the forms they
+replaced: the router's eight-expert blocks against the one-expert loop, on cancelling
+data where a reversed or split double chain changes every score, and the batched
+prefill MoE (`k3_moe_prefill`) against the per-token `k3_moe` at top-16, where summing a
+position's experts in fetch order changes the output (the CLI's tiny checkpoint routes
+to the top 2 and cannot show that). Each also computes the wrong orders on the same data
+and fails if the data stops telling them apart.
 
 **`test_cache`**, the streaming expert cache: prefetch, eviction, and mixed batch/serial
 access. Uses a synthetic shard of structurally faithful experts, a few KB. With
