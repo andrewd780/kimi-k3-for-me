@@ -766,6 +766,246 @@ static void t_moe(const char *dir)
     free(txt); free(ar);
 }
 
+/* A streamed expert source over experts held in memory as MXFP4, counting get() calls. */
+typedef struct {
+    K3ExpertSrc src;
+    unsigned char *p13, *s13, *p2, *s2;   /* gate and up share a shape; down its own  */
+    size_t pb13, sb13, pb2, sb2;          /* bytes per expert of each                 */
+    long gets;
+} MemExperts;
+
+static int mem_get(K3ExpertSrc *self, int layer, int e, K3ExpertQ *q)
+{
+    MemExperts *m = (MemExperts *)self->ctx;
+    (void)layer;
+    m->gets++;
+    q->p1 = m->p13 + (size_t)(2 * e) * m->pb13;
+    q->s1 = m->s13 + (size_t)(2 * e) * m->sb13;
+    q->p3 = m->p13 + (size_t)(2 * e + 1) * m->pb13;
+    q->s3 = m->s13 + (size_t)(2 * e + 1) * m->sb13;
+    q->p2 = m->p2  + (size_t)e * m->pb2;
+    q->s2 = m->s2  + (size_t)e * m->sb2;
+    return 0;
+}
+
+/* Orders in which a position's routed contributions can be summed: the top-k order k3_moe
+ * uses, and two WRONG ones -- reversed, and the order the batched path fetches experts in
+ * (first appearance in the 64-position sub-chunk), which is the natural mistake there. */
+enum { S_RIGHT, S_REVERSED, S_FETCH, S_COUNT };
+static const char *SNAME[S_COUNT] = { "top-k", "reversed", "fetch order" };
+
+/* The MoE of k3_moe with a streamed source, written out with public ops, one position at
+ * a time, summing each position's routed contributions in the order `mut` names. With
+ * S_RIGHT it must match k3_moe bit for bit, which is what licenses using the other two as
+ * the wrong orders the data has to be able to see. Every matrix here is fp32, so each
+ * k3_matmul is the per-position form of the k3_mmw_batch the engine calls. */
+static void moe_ref(float *out, const float *x, const K3MoeW *w, const K3Cfg *c, int T,
+                    int chunk, int mut)
+{
+    const int E = c->hidden, L = c->latent, I = c->moe_inter, K = c->topk;
+    const int SI = I * c->n_shared;
+    float *z    = (float *)malloc((size_t)L * sizeof(float));
+    float *acc  = (float *)malloc((size_t)L * sizeof(float));
+    float *cb   = (float *)malloc((size_t)K * L * sizeof(float));
+    float *gu   = (float *)malloc((size_t)2 * I * sizeof(float));
+    float *sgu  = (float *)malloc((size_t)2 * SI * sizeof(float));
+    float *sdn  = (float *)malloc((size_t)E * sizeof(float));
+    float *wt   = (float *)malloc((size_t)T * K * sizeof(float));
+    int   *idx  = (int *)malloc((size_t)T * K * sizeof(int));
+    int   *rank = (int *)malloc((size_t)c->n_experts * sizeof(int));
+    if (!z || !acc || !cb || !gu || !sgu || !sdn || !wt || !idx || !rank) {
+        printf("        moe_ref: out of memory\n");
+        exit(1);
+    }
+    for (int t = 0; t < T; t++)
+        k3_router(idx + (size_t)t * K, wt + (size_t)t * K, x + (size_t)t * E, w->gate,
+                  w->bias, E, c->n_experts, K, c->moe_renorm, c->routed_scale);
+    for (int t = 0; t < T; t++) {
+        const float *xt = x + (size_t)t * E;
+        const int *it = idx + (size_t)t * K;
+        const float *wtt = wt + (size_t)t * K;
+        if (t % chunk == 0) {           /* first-appearance rank within the sub-chunk */
+            int nu = 0;
+            for (int e = 0; e < c->n_experts; e++) rank[e] = -1;
+            for (int u = t; u < T && u < t + chunk; u++)
+                for (int j = 0; j < K; j++)
+                    if (rank[idx[(size_t)u * K + j]] < 0) rank[idx[(size_t)u * K + j]] = nu++;
+        }
+        k3_matmul(z, xt, (const float *)w->down, E, L);
+        for (int j = 0; j < K; j++) {
+            K3ExpertQ q;
+            w->src->get(w->src, w->layer, it[j], &q);
+            k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
+            k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
+            k3_situ_glu(gu, gu, I, c->situ_b1, c->situ_b2);
+            k3_matmul_mxfp4(cb + (size_t)j * L, gu, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+        }
+        int order[K3_MAX_TOPK];
+        for (int j = 0; j < K; j++) order[j] = mut == S_REVERSED ? K - 1 - j : j;
+        if (mut == S_FETCH)             /* slots by their expert's rank: insertion sort */
+            for (int a = 1; a < K; a++)
+                for (int b = a; b > 0 && rank[it[order[b]]] < rank[it[order[b - 1]]]; b--) {
+                    const int tmp = order[b]; order[b] = order[b - 1]; order[b - 1] = tmp;
+                }
+        for (int i = 0; i < L; i++) acc[i] = 0.0f;
+        for (int a = 0; a < K; a++) {
+            const int j = order[a];
+            for (int i = 0; i < L; i++) acc[i] += wtt[j] * cb[(size_t)j * L + i];
+        }
+        if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, L, c->rms_eps);
+        float *ot = out + (size_t)t * E;
+        k3_matmul(ot, acc, (const float *)w->up, L, E);
+        k3_matmul(sgu,      xt, (const float *)w->sh1, E, SI);
+        k3_matmul(sgu + SI, xt, (const float *)w->sh3, E, SI);
+        k3_situ_glu(sgu, sgu, SI, c->situ_b1, c->situ_b2);
+        k3_matmul(sdn, sgu, (const float *)w->sh2, SI, E);
+        for (int i = 0; i < E; i++) ot[i] += sdn[i];
+    }
+    free(z); free(acc); free(cb); free(gu); free(sgu); free(sdn); free(wt); free(idx);
+    free(rank);
+}
+
+/* The batched prefill MoE, bitwise against the per-token k3_moe, at K3's top-16.
+ *
+ * k3_moe_prefill fetches each unique routed expert once per 64-position sub-chunk and
+ * applies it to every (position, slot) that chose it; the hazard particular to it is
+ * summing a position's contributions in that fetch order instead of the top-k order
+ * k3_moe uses. Nothing else reaches it: the oracle and t_moe run resident experts
+ * through k3_moe, and the CLI's 65/129/130-token gate runs the tiny checkpoint, which
+ * routes to the top 2, where 0 + a + b and 0 + b + a are the same float in either order.
+ * Here a position sums sixteen contributions, as on K3, over T = 130 positions (two full
+ * sub-chunks and a remainder of two), with 40 experts so that every sub-chunk reuses
+ * each expert many times.
+ *
+ * The data proves it can see the order: the same MoE written out with public ops must
+ * match k3_moe bitwise when it sums in top-k order, and must DIFFER on most positions
+ * when it sums reversed or in fetch order. The dedup itself is checked by count: one
+ * get() per unique expert per sub-chunk, against T * 16 for the per-token path. */
+static void t_moe_prefill(void)
+{
+    K3Cfg c; memset(&c, 0, sizeof c);
+    c.hidden = 64; c.latent = 64; c.moe_inter = 64; c.n_experts = 40; c.topk = 16;
+    c.n_shared = 1; c.routed_scale = 2.5f; c.moe_renorm = 1; c.latent_norm = 1;
+    c.rms_eps = 1e-5f; c.situ_b1 = 4.0f; c.situ_b2 = 25.0f;
+    const int T = 130, CHUNK = 64;
+    const int E = c.hidden, L = c.latent, I = c.moe_inter, NE = c.n_experts, K = c.topk;
+    const int SI = I * c.n_shared;
+
+    unsigned s = 0x6D6F65u;
+    float *x    = (float *)malloc((size_t)T * E * sizeof(float));
+    float *gate = (float *)malloc((size_t)NE * E * sizeof(float));
+    float *bias = (float *)malloc((size_t)NE * sizeof(float));
+    float *down = (float *)malloc((size_t)L * E * sizeof(float));
+    float *up   = (float *)malloc((size_t)E * L * sizeof(float));
+    float *sh1  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh3  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh2  = (float *)malloc((size_t)E * SI * sizeof(float));
+    float *lnw  = (float *)malloc((size_t)L * sizeof(float));
+    MemExperts m; memset(&m, 0, sizeof m);
+    m.pb13 = (size_t)I * (L / 2); m.sb13 = (size_t)I * ((L + 31) / 32);
+    m.pb2  = (size_t)L * (I / 2); m.sb2  = (size_t)L * ((I + 31) / 32);
+    m.p13 = (unsigned char *)malloc(2 * NE * m.pb13);
+    m.s13 = (unsigned char *)malloc(2 * NE * m.sb13);
+    m.p2  = (unsigned char *)malloc(NE * m.pb2);
+    m.s2  = (unsigned char *)malloc(NE * m.sb2);
+    const size_t nout = (size_t)T * E;
+    float *yb = (float *)malloc(nout * sizeof(float));      /* k3_moe_prefill */
+    float *yt = (float *)malloc(nout * sizeof(float));      /* k3_moe         */
+    float *yr = (float *)malloc(nout * sizeof(float));      /* moe_ref        */
+    float *sc = (float *)malloc(k3_moe_scratch(&c, T) * sizeof(float));
+    int   *idx = (int *)malloc((size_t)K * sizeof(int));
+    float *wt  = (float *)malloc((size_t)K * sizeof(float));
+    if (!x || !gate || !bias || !down || !up || !sh1 || !sh3 || !sh2 || !lnw || !m.p13 ||
+        !m.s13 || !m.p2 || !m.s2 || !yb || !yt || !yr || !sc || !idx || !wt) {
+        printf("  FAIL  moe_prefill    out of memory\n");
+        g_fail++;
+        exit(1);
+    }
+    for (size_t i = 0; i < nout; i++) x[i] = xs_unit(&s, 1.0f);
+    for (int i = 0; i < NE * E; i++) gate[i] = xs_unit(&s, 0.05f);
+    for (int i = 0; i < NE; i++) bias[i] = xs_unit(&s, 0.01f);
+    for (int i = 0; i < L * E; i++) down[i] = xs_unit(&s, 0.2f);
+    for (int i = 0; i < E * L; i++) up[i] = xs_unit(&s, 0.2f);
+    for (int i = 0; i < SI * E; i++) { sh1[i] = xs_unit(&s, 0.2f); sh3[i] = xs_unit(&s, 0.2f); }
+    for (int i = 0; i < E * SI; i++) sh2[i] = xs_unit(&s, 0.2f);
+    for (int i = 0; i < L; i++) lnw[i] = 1.0f + xs_unit(&s, 0.25f);
+    /* random FP4 nibbles, and E8M0 scales 2^-6 .. 2^-3 (bytes 121..124) */
+    for (size_t i = 0; i < 2 * NE * m.pb13; i++) m.p13[i] = (unsigned char)(xs32(&s) >> 8);
+    for (size_t i = 0; i < NE * m.pb2; i++)      m.p2[i]  = (unsigned char)(xs32(&s) >> 8);
+    for (size_t i = 0; i < 2 * NE * m.sb13; i++)
+        m.s13[i] = (unsigned char)(121 + (xs32(&s) >> 8) % 4);
+    for (size_t i = 0; i < NE * m.sb2; i++)
+        m.s2[i]  = (unsigned char)(121 + (xs32(&s) >> 8) % 4);
+    m.src.get = mem_get;                 /* getmany and resident stay NULL */
+    m.src.ctx = &m;
+
+    K3MoeW w; memset(&w, 0, sizeof w);
+    w.gate = gate; w.bias = bias; w.latent_norm = lnw;
+    w.down = down; w.up = up; w.sh1 = sh1; w.sh3 = sh3; w.sh2 = sh2; w.wdt = K3_WF32;
+    w.src = &m.src; w.layer = 1;
+
+    const long drops0 = k3_expert_drops;
+    m.gets = 0;
+    k3_moe(yt, x, &w, &c, T, idx, wt, sc);
+    const long gets_token = m.gets;
+    m.gets = 0;
+    k3_moe_prefill(yb, x, &w, &c, T, idx, wt, sc);
+    const long gets_batch = m.gets;
+
+    /* unique experts per sub-chunk, from the router itself */
+    long uniq = 0;
+    {
+        char  *seen = (char *)malloc((size_t)NE);
+        int   *ri = (int *)malloc((size_t)K * sizeof(int));
+        float *rw = (float *)malloc((size_t)K * sizeof(float));
+        if (!seen || !ri || !rw) { printf("  FAIL  moe_prefill    out of memory\n"); exit(1); }
+        for (int t0 = 0; t0 < T; t0 += CHUNK) {
+            memset(seen, 0, (size_t)NE);
+            for (int t = t0; t < T && t < t0 + CHUNK; t++) {
+                k3_router(ri, rw, x + (size_t)t * E, gate, bias, E, NE, K,
+                          c.moe_renorm, c.routed_scale);
+                for (int j = 0; j < K; j++) if (!seen[ri[j]]) { seen[ri[j]] = 1; uniq++; }
+            }
+        }
+        free(seen); free(ri); free(rw);
+    }
+
+    const int batch_ok = memcmp(yb, yt, nout * sizeof(float)) == 0;
+    moe_ref(yr, x, &w, &c, T, CHUNK, S_RIGHT);
+    const int ref_ok = memcmp(yr, yt, nout * sizeof(float)) == 0;
+    int teeth[S_COUNT] = {0}, teeth_ok = 1;
+    for (int mu = S_REVERSED; mu < S_COUNT; mu++) {
+        float *ym = (float *)malloc(nout * sizeof(float));
+        if (!ym) { printf("  FAIL  moe_prefill    out of memory\n"); exit(1); }
+        moe_ref(ym, x, &w, &c, T, CHUNK, mu);
+        for (int t = 0; t < T; t++)
+            teeth[mu] += memcmp(ym + (size_t)t * E, yr + (size_t)t * E,
+                                (size_t)E * sizeof(float)) != 0;
+        if (2 * teeth[mu] < T) teeth_ok = 0;
+        free(ym);
+    }
+    const int count_ok = gets_token == (long)T * K && gets_batch == uniq;
+    const int drops_ok = k3_expert_drops == drops0;
+
+    if (batch_ok && ref_ok && teeth_ok && count_ok && drops_ok) {
+        printf("  PASS  moe_prefill    T=%d top%d of %d  bitwise == per-token k3_moe, "
+               "%ld expert gets vs %ld\n", T, K, NE, gets_batch, gets_token);
+        g_pass++;
+    } else {
+        printf("  FAIL  moe_prefill    batched=%s reference=%s gets=%ld/%ld (want %ld/%d) "
+               "drops=%ld\n", batch_ok ? "bitwise" : "DIFFERS",
+               ref_ok ? "bitwise" : "DIFFERS", gets_batch, gets_token, uniq, T * K,
+               k3_expert_drops - drops0);
+        g_fail++;
+    }
+    printf("        wrong routed-sum orders change: %s %d/%d, %s %d/%d positions\n",
+           SNAME[S_REVERSED], teeth[S_REVERSED], T, SNAME[S_FETCH], teeth[S_FETCH], T);
+
+    free(x); free(gate); free(bias); free(down); free(up); free(sh1); free(sh3); free(sh2);
+    free(lnw); free(m.p13); free(m.s13); free(m.p2); free(m.s2);
+    free(yb); free(yt); free(yr); free(sc); free(idx); free(wt);
+}
+
 /* The full KDA layer. This is the last and hardest component before the decoder
  * layer: projections, three depthwise convs with fused SiLU, L2Norm on q/k only,
  * the shared low-rank decay, the per-head beta, the recurrence, the head-wise norm
@@ -1440,6 +1680,7 @@ int main(int argc, char **argv)
     t_router(dir);
     t_mla(dir);
     t_moe(dir);
+    t_moe_prefill();
     t_mxfp4(dir);
     t_matmul_bf16();
     t_matmul_batch();

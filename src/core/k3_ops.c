@@ -1588,7 +1588,11 @@ static void moe_prefill_routed(const K3MoeScratch *s, const float *x, const K3Mo
     }
 
     /* 4. per token, sum contributions in the ORIGINAL top-k order and normalise, exactly
-     * as k3_moe does it, so every float matches the per-token path. */
+     * as k3_moe does it, so every float matches the per-token path. Summing in the
+     * fetch order of uniq[] instead is the natural slip here and changes the floats;
+     * test_ops's moe_prefill gate catches it at top-16. The CLI's K3_NO_BATCH_PREFILL
+     * comparison cannot: its tiny checkpoint routes to the top 2, where the order of
+     * two terms added to zero never changes a float. */
     for (int t = 0; t < T; t++) {
         const int   *it  = ridx + (size_t)t * K;
         const float *wtt = rwt + (size_t)t * K;

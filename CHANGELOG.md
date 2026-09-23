@@ -20,7 +20,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `test_ops` on cancelling inputs that expose a wrong summation order, by the oracle's
   GATE 3c, by a rows-mode byte-count check in `test_offline_cli.py` at 1 to 130
   positions, and by 65-, 129- and 130-token prompts matched against the per-token MoE
-  (`K3_NO_BATCH_PREFILL`). Positions share a widened weight in register blocks of 4 on
+  (`K3_NO_BATCH_PREFILL`). That CLI check runs the tiny checkpoint's top-2 routing,
+  where a position's two routed terms sum to the same float in either order, so the
+  MoE prefill's one ordering hazard, summing a position's experts in fetch order
+  instead of top-k order, is held by `test_ops`'s `moe_prefill` gate instead: top-16
+  of 40 experts over 130 positions, bitwise against `k3_moe`, with an in-test check
+  that a reversed or fetch-order sum would change most positions, and one expert read
+  per unique expert per sub-chunk. Positions share a widened weight in register blocks of 4 on
   AVX2, 8 when AVX-512VL gives the compiler 32 vector registers, and 2 on NEON. On the
   reference VM a block of 8 is about 10% faster than 4 with AVX-512VL and about 8%
   slower on plain AVX2 (`bench_batch`, 8 to 16 positions); the block is a loop shape

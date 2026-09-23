@@ -187,6 +187,9 @@ class OfflineCliTests(unittest.TestCase):
         # 64-position sub-chunk; K3_NO_BATCH_PREFILL sends the same binary down the
         # per-token k3_moe instead. Every logit must match across the sub-chunk
         # boundaries, including a one-position remainder (65, 129) and two (130).
+        # This cannot see the order of a position's routed sum: the tiny checkpoint
+        # routes to the top 2, and 0 + a + b equals 0 + b + a in float. test_ops's
+        # moe_prefill gate holds that order at top-16, where it changes the result.
         for n in (65, 129, 130):
             for mode in ([], ["--incremental"]):
                 with self.subTest(n=n, mode=mode):
