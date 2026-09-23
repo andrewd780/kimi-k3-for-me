@@ -89,9 +89,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   after which the plan fixed before the data gives the router its own table, keeps
   `shared_down` raw and reaches r = 0.7329 over all 108.76 GB of matrices, 5.58
   points above per-family Huffman; and a decode-under-matmul-contention benchmark,
-  whose worst-case streamed speedup stays above 1 up to a 5 GB/s SSD on a quiet
-  4-vCPU VM with the shipped kernels (it fails at 6 GB/s for streamed input at 4 and
-  2 threads) and at every rate to 6 GB/s on both hosted runners. A supported reader
+  whose worst-case streamed speedup stays above 1 up to a 4 GB/s SSD in every run on a
+  4-vCPU VM with the shipped kernels (5 GB/s is marginal: it passes in the idle runs and
+  fell just below 1 in one run taken during background downloads; it fails at 6 GB/s for
+  streamed input at 4 and 2 threads) and at every rate to 6 GB/s on both hosted runners. A supported reader
   remains. See [the note](docs/notes/fixed-width-trunk.md) and
   [results](docs/notes/research-results.md).
 - **Bounded trunk row streaming**, opt-in `--trunk-rows`: two small read/compute

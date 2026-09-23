@@ -358,8 +358,10 @@ payload only, 5.58 points above per-family Huffman codes (3 bits everywhere woul
 0.7133, 4 bits 0.7511). *Contention:* a byte-exact benchmark runs one decoder thread
 against `k3_matmul_bf16` on the other cores. Re-measured with the shipped kernels, on a
 quiet 4-vCPU VM (load 0.10 and 0.46 before the runs, 9 interleaved
-repeats), the worst-case contended streamed speedup exceeds 1 up to B = 5 GB/s in every
-format, placement and thread count (4 and 2) and is the full 1.333 (FD4B) / 1.420
+repeats), the worst-case contended streamed speedup exceeds 1 up to B = 4 GB/s in every
+run; at B = 5 it passes in every format, placement and thread count (4 and 2) of the idle
+runs but fell to 0.969 (FD4B) / 0.999 (FD3B) in one 4-thread run taken during background
+downloads, so 5 GB/s is marginal. It is the full 1.333 (FD4B) / 1.420
 (FD3B) up to about 4.3 / 4.0 GB/s; at 6 GB/s it fails for streamed input at both
 thread counts (0.937 to 0.982, decoder-limited) and passes for cache-hot input. The
 hosted x86_64 (Xeon Platinum 8573C) and arm64 legs stay above 1 at every B up to 6.

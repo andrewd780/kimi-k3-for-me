@@ -141,7 +141,7 @@ its provenance.
 | 4. Bit-width curve | **Result on all eight gate-1 ranges and on every family** | Eight ranges, from committed counts: 3 bits retain 0.703403, 4 bits 0.750227, 5 bits 0.8125; 3 bits gain 4.68 points. Every family, byte-weighted (CI run 35845709912): 0.713279 against 0.751122, +3.78 points. Both clear the 1.5-point bar, so FD3B is carried. FD3B is byte-exact in hosted CI under ASan/UBSan (SSSE3, AVX2, NEON) and decodes at 9.6 (SSSE3), 15.3 (AVX2) and 11.0 to 13.5 (NEON) reconstructed GB/s pooled | Nothing for the curve |
 | 5. Row-boundary cost | **Exact, from released shapes** | FDRX: zero padding at every K3 width; 0.0340 points per-row index, 0.0148 grouped; three range reads per chunk | Nothing for the cost; a container still needs a per-chunk checksum |
 | Every tensor family | **STOP on two families; plan applied** | All 23 families sampled, inventory equal to the config; the pooled table covers under 99% of `moe.router` (98.49%) and `moe.shared_down` (98.88%). By the plan the router takes its own table, `shared_down` stays raw, and per-family widths give **r = 0.7329** over all 108.76 GB of matrices ([result](#per-family-result)) | A census instead of four 1 MiB samples per family |
-| Decode under matmul contention | **Measured on a VM with the shipped kernels, and hosted** | VM, worst case: above 1 for B <= 5 GB/s in all eight cases, the full 1/r up to about 4.0 to 4.3 GB/s for streamed input; at B = 6 it fails for streamed input at 4 and 2 threads, decoder-limited. Hosted x86_64 and arm64: above 1 at every B up to 6. Resident slowdown 2.3 to 6.1 ([results](#results-on-a-4-vcpu-vm)) | Which placement a real row pipeline sees |
+| Decode under matmul contention | **Measured on a VM with the shipped kernels, and hosted** | VM, worst case: above 1 up to B = 4 GB/s in every run; B = 5 is marginal (all eight cases pass in the idle runs, worst 1.124, but one 4-thread run taken during background downloads fell to 0.969 FD4B and 0.999 FD3B); the full 1/r up to about 4.0 to 4.3 GB/s for streamed input; at B = 6 it fails for streamed input at 4 and 2 threads, decoder-limited. Hosted x86_64 and arm64: above 1 at every B up to 6. Resident slowdown 2.3 to 6.1 ([results](#results-on-a-4-vcpu-vm)) | Which placement a real row pipeline sees |
 | Supported container/reader | Not started | | Everything |
 
 Kernel speed alone still does not make deployment profitable, as the Huffman
@@ -485,7 +485,11 @@ gate 3's 16.2) and 15.4 to 19.4 on arm64. So FD3B decodes at 38% (SSSE3) and 60%
 (AVX2) of FD4B's pooled rate on x86_64 and about 71% on arm64: its escape expansion
 costs rate, as the orientation runs below suggested. The AVX2 report's
 `compiler_flags` field repeats the job's SSSE3 flags; the binary it timed was built
-with `-mavx2`, as its `native` field says. The workflow now records the AVX2 flags for
+with `-mavx2`, as its `native` field says. Figures in this note that are quoted from
+hosted job logs rather than from a committed file (this paragraph's FD4B re-timing and
+the FD3B/FD4B ratios, the whole-BF16 and low-byte entropies) are identified by run and job
+id; GitHub keeps those logs only for its retention period, so the committed JSON files
+are the durable record. The workflow now records the AVX2 flags for
 those runs.
 
 Kernel rates, **for orientation only and not admissible as a result**: they were
@@ -671,10 +675,12 @@ escapes stated above. The one-minute load average was 0.10 before the 4-thread r
 0.46 before the 2-thread run, under the 0.5 bar; 2.79 and 1.56 after them are the
 benchmark's own threads. Nothing else of this work ran except a background git sync of
 a few seconds every five minutes, which overlapped the last seconds of the 4-thread run
-and the middle of the 2-thread one. A first 4-thread run, taken while CI logs were being
-downloaded on the VM and so not idle by the protocol, is not used; its worst case at
-B = 5 was 0.969 (FD4B) and 0.999 (FD3B) for streamed input, which says how thin that
-margin is on a shared VM. A VM's vCPUs can still share physical cores with other
+and the middle of the 2-thread one. A first 4-thread run was taken while CI logs were
+being downloaded on the VM. The protocol above forbids other builds and benchmarks and
+asks for a load average below 0.5, and that run did not record its load, so it is
+reported here rather than discarded: its worst case at B = 5 was 0.969 (FD4B) and 0.999
+(FD3B) for streamed input, below 1. Its raw report was not kept. The tables below are
+the two idle runs, so B = 5 is a pass only for them. A VM's vCPUs can still share physical cores with other
 tenants. The tables first published here were measured at `516f010` with the previous
 `k3_matmul_bf16`; they remain in this note's history, and
 [what the shipped kernel changed](#what-the-shipped-kernel-changed) compares them.
@@ -766,11 +772,17 @@ that arithmetic on the printed `min` rows, not new measurements.
 | 2 | FD4B | hot | 2.5, 3, 4, 5, 6 | none | 7.619 | 5.716 |
 | 2 | FD3B | hot | 2.5, 3, 4, 5, 6 | none | 7.641 | 5.380 |
 
-- **B up to 5 GB/s: the condition holds** in all eight format x placement x
-  thread-count cases, so a streamed FD4B or FD3B trunk is worth building there by
-  this gate. Up to about 4.3 GB/s for FD4B and 4.0 for FD3B (streamed input, either
-  thread count) decoding is fully hidden and the modelled gain is the whole byte
-  saving, 1.333 and 1.420. At B = 3 GB/s that holds with margin in every case.
+- **B up to 4 GB/s: the condition holds in every run**, including the one taken during
+  background downloads (by the model above, a run whose worst case is 0.969 at B = 5 has
+  min(D_c, M_c) = 4.85 GB/s and so gives 1.21 at B = 4),
+  so a streamed FD4B or FD3B trunk is worth building there by this gate. **At B = 5 it
+  is marginal:** all eight format x placement x thread-count cases pass in the idle runs
+  (worst 1.124), but the run with background activity fell just below 1, so B = 5 is
+  not established as a pass on this VM. In the idle runs decoding is fully hidden up to
+  about 4.3 GB/s for FD4B and 4.0 for FD3B (streamed input, either thread count), where
+  the modelled gain is the whole byte saving, 1.333 and 1.420; in the run with
+  background activity that limit falls to about 3.6 and 3.5 GB/s. At B = 3 GB/s the
+  whole saving holds with margin in every run.
 - **B = 6 GB/s: the condition fails for streamed input** on 4 and on 2 threads, and
   the decoder is the limiting stage in every failing case: one decoder thread at its
   slowest (5.62 to 5.89 GB/s) is below 6. Cache-hot input passes on both (1.178 and
@@ -778,7 +790,7 @@ that arithmetic on the printed `min` rows, not new measurements.
   is not measured here; `stream` is the conservative bracket. A second decoder thread
   is a different design, not measured.
 - **Margins at B = 5 are thin:** 1.153 (FD4B) and 1.124 (FD3B) for streamed input on
-  4 threads, 1.149 and 1.179 on 2, and the discarded run, taken with the VM busy, fell to
+  4 threads, 1.149 and 1.179 on 2, and the run taken during background downloads fell to
   0.969 and 0.999.
 - **What contention costs.** On 4 threads the medians show the decoder 10% to 20%
   slower beside the matmul and the 3-thread matmul 2% to 11% slower beside the
@@ -809,7 +821,8 @@ all) and 15.5 to 23.4 (3 threads), and from 10.4 to 16.4 and 5.4 to 8.6 on 2 thr
    to 4.3 GB/s for streamed input instead of 3.6 to 3.8.
 2. **The full byte saving holds to a slightly lower B** on 4 threads for streamed FD3B,
    about 4.0 GB/s instead of 4.2, because the contended decoder is a little slower
-   beside a faster matmul; B <= 5 still passes and B = 6 still fails for streamed input.
+   beside a faster matmul; B <= 4 passes in every run, B = 5 passes only in the idle runs,
+   and B = 6 still fails for streamed input.
 3. **Resident decoding costs more,** 4.50 to 5.91 worst on 4 threads instead of 2.67
    to 3.62, since the raw matmul it is compared with got faster.
 

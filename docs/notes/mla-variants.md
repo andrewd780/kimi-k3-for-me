@@ -411,6 +411,9 @@ Three cautions about individual cells:
 
 ### Apple Silicon and the hosted runners
 
+The hosted figures in this section come from the job logs and artifacts named below;
+GitHub keeps those only for its retention period, and this note is their durable record.
+
 The `MLA cache variants` workflow ran at head `cb4ab38` (run 35845709990) on `macos-14`
 (Apple M1 (Virtual), 3 cores, NEON kernels; job 107131235227, artifact
 `mla-variants-macOS-ARM64`, ID 10742829385) and on `ubuntu-latest` (AMD EPYC 7763, AVX2
