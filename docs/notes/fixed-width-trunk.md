@@ -67,8 +67,9 @@ model ranges and unrelated workspace files are not uploaded. No user secrets
 or personal files are inputs. Standard GitHub logs retain the public repository
 identity. Gates 2 and 3 passed in hosted CI at head `9f0c07f`, recorded below.
 Gate 4 (the bit-width curve) and gate 5 (row-boundary cost) now have results from
-committed counts and exact shapes; the every-family samples, decode under matmul
-contention and the deployment gates remain ([status](#remaining-gates)).
+committed counts and exact shapes, and decode under matmul contention has a
+quiet-machine result on this VM; the every-family samples, the hosted contention
+legs and the deployment gates remain ([status](#remaining-gates)).
 
 ## Gates 2 and 3: passed in CI run 35498176696
 
@@ -124,7 +125,7 @@ its provenance.
 | 4. Bit-width curve | **Result on committed counts** | On the four committed `f_a_proj` ranges (CI run 35462000448): 3 bits retains 0.704128, 4 bits 0.750153, 5 bits 0.8125; 3 bits gains 4.60 points over 4, above the 1.5-point prototype bar. FD3B built, byte-exact under local ASan/UBSan (scalar, SSSE3, AVX2; NEON under qemu without ASan). | Eight-range and whole-BF16 figures (histogram CI job); FD3B hosted rates |
 | 5. Row-boundary cost | **Exact, from released shapes** | FDRX: zero padding at every K3 width; 0.0340 points per-row index, 0.0148 grouped; three range reads per chunk | Nothing for the cost; a container still needs a per-chunk checksum |
 | Every tensor family | **Tooling and CI job built** | Gate 1 sampled 2 of 23 families, 4.00% of trunk bytes; inventory exact | The `families` CI job's samples and the [per-family plan](#per-family-plan) decisions |
-| Decode under matmul contention | **Benchmark and model built; not measured** | Byte-exact benchmark on the engine's `k3_matmul_bf16`, break-even arithmetic unit-tested | The quiet-machine measurement ([placeholder](#decode-under-matmul-contention)); hosted x86 and arm64 legs |
+| Decode under matmul contention | **Measured on this VM; hosted legs pending** | Worst-case contended streamed speedup above 1 for B <= 5 GB/s at 4 and 2 threads, both formats, streamed and cache-hot input; the full 1.333 (FD4B) / 1.420 (FD3B) up to about 4.2 GB/s on 4 threads. At B = 6 it fails for streamed input on 4 threads (0.970, 0.998) and in every case on 2 (0.846 to 0.854). Resident slowdown 2.08 to 3.62 ([results](#results-on-this-vm)) | Hosted x86_64 and arm64 legs (`contention` CI job) |
 | Supported container/reader | Not started | | Everything |
 
 Kernel speed alone still does not make deployment profitable, as the Huffman
@@ -404,10 +405,11 @@ timing.
 
 ## Decode under matmul contention
 
-> **PLACEHOLDER: this measurement has not been taken.** The benchmark, the
-> break-even arithmetic and the protocol below are committed and tested; the
-> tables are empty until the run on a quiet machine fills them. No contention
-> number in this note is a result.
+> **Measured on 2026-09-23 on this 4-vCPU VM, at 4 and 2 threads, by the protocol
+> below; the hosted x86_64 and arm64 legs have not run.** The tables are the
+> driver's output pasted as printed; the reports are
+> [decode-contention-x86_64-t4.json](../measurements/decode-contention-x86_64-t4.json)
+> and [decode-contention-x86_64-t2.json](../measurements/decode-contention-x86_64-t2.json).
 
 Kernel rates alone (gate 3) had the decoder to themselves. In a streamed trunk the
 decoder shares the machine with the matmuls it feeds.
@@ -494,30 +496,145 @@ RESEARCH_COMMIT=$(git rev-parse HEAD) python3 tools/bench_decode_contention.py \
   --out docs/measurements/decode-contention-x86_64-t2.json
 ```
 
-The driver prints the three tables below in this form; paste them with the CPU
-model, load averages and head from the report's `execution` field. The hosted
+The driver prints three tables per run (rates, then the break-even from the
+medians and from the worst case); the results below paste them with the CPU model,
+load averages and head from the report's `execution` field. The hosted
 x86_64 and arm64 legs come from the `contention` CI job (`decode-contention-*`
 artifacts, 1 s per arm, 5 repeats) and are recorded the same way.
 
-**Rates, reconstructed or consumed BF16 GB/s (PLACEHOLDER, not measured):**
+### Results on this VM
+
+**Conditions.** Both runs at head `516f01004a6bb576d9f940f7189c8cbf0517c076`, on
+`Intel(R) Xeon(R) Processor @ 2.80GHz` (family 6 model 85; 4 vCPUs, one thread per
+core, 1 MiB L2 per core, 33 MiB shared L3; SSSE3, AVX2 and AVX-512F/BW), Linux 6.18,
+gcc 13.3.0 with the flags above (`-O3 -march=native -fopenmp -ffp-contract=off`), so
+FD4B dispatches to `ssse3_pshufb` and FD3B to `avx2_vpshufb`. 2 s per arm and 9
+repeats of the four arms in interleaved order, per format x placement case, the
+cases run in turn. Every case was byte-exact (scalar and native decoders before
+timing, native after), with the 44,671 FD4B and 2,927,952 FD3B escapes stated above.
+Nothing else ran: the one-minute load average was 0.10 before the 4-thread run and
+0.29 before the 2-thread run, under the 0.5 bar; 2.55 and 1.34 after them are the
+benchmark's own threads. A VM's vCPUs can still share physical cores with other
+tenants.
+
+**4 threads** (the contended arm: decoder on one core, matmul on three).
+Rates, reconstructed or consumed BF16 GB/s:
 
 | Format | Input | Stat | Decode alone | Decode + matmul | Matmul all | Matmul rest | Matmul + decode | Core-s/token (contended) |
 |---|---|---|---:|---:|---:|---:|---:|---:|
-| FD4B `ssse3_pshufb` | stream | median / min / max | pending | pending | pending | pending | pending | pending |
-| FD3B `avx2_vpshufb` | stream | median / min / max | pending | pending | pending | pending | pending | pending |
-| FD4B `ssse3_pshufb` | hot | median / min / max | pending | pending | pending | pending | pending | pending |
-| FD3B `avx2_vpshufb` | hot | median / min / max | pending | pending | pending | pending | pending | pending |
+| FD4B ssse3_pshufb | stream | median | 7.005 | 6.120 | 19.761 | 15.471 | 14.892 | 17.78 |
+| FD4B ssse3_pshufb | stream | min | 6.248 | 5.818 | 17.623 | 14.581 | 14.129 | 18.70 |
+| FD4B ssse3_pshufb | stream | max | 7.389 | 6.599 | 21.076 | 16.406 | 15.260 | 16.49 |
+| FD3B avx2_vpshufb | stream | median | 6.869 | 6.305 | 20.064 | 15.913 | 15.054 | 17.26 |
+| FD3B avx2_vpshufb | stream | min | 6.696 | 5.989 | 19.096 | 15.342 | 14.611 | 18.17 |
+| FD3B avx2_vpshufb | stream | max | 7.292 | 6.699 | 20.541 | 16.292 | 15.782 | 16.24 |
+| FD4B ssse3_pshufb | hot | median | 9.559 | 8.656 | 20.043 | 15.626 | 15.219 | 12.57 |
+| FD4B ssse3_pshufb | hot | min | 8.419 | 7.789 | 18.803 | 15.491 | 14.399 | 13.97 |
+| FD4B ssse3_pshufb | hot | max | 10.798 | 9.065 | 20.759 | 16.207 | 15.573 | 12.00 |
+| FD3B avx2_vpshufb | hot | median | 7.723 | 7.195 | 19.773 | 15.723 | 15.544 | 15.12 |
+| FD3B avx2_vpshufb | hot | min | 7.366 | 6.799 | 19.658 | 15.366 | 14.501 | 16.00 |
+| FD3B avx2_vpshufb | hot | max | 8.374 | 7.650 | 20.882 | 16.354 | 15.836 | 14.22 |
 
-**Streamed speedup over raw reads, contended rates, limiting stage in brackets;
-resident slowdown (PLACEHOLDER, not measured):**
+Streamed speedup over raw reads from the contended rates, limiting stage in
+brackets, and resident slowdown; medians, then the worst case:
 
 | Format | Input | Stat | r | B = 2.5 GB/s | B = 3 GB/s | B = 4 GB/s | B = 5 GB/s | B = 6 GB/s | Resident slowdown |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| FD4B | stream, hot | median, worst | 0.7503 | pending | pending | pending | pending | pending | pending |
-| FD3B | stream, hot | median, worst | 0.7041 | pending | pending | pending | pending | pending | pending |
+| FD4B ssse3_pshufb | stream | median | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 1.224 (decode) | 1.020 (decode) | 3.229 |
+| FD3B avx2_vpshufb | stream | median | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.420 (ssd) | 1.261 (decode) | 1.051 (decode) | 3.182 |
+| FD4B ssse3_pshufb | hot | median | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 2.316 |
+| FD3B avx2_vpshufb | hot | median | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.420 (ssd) | 1.420 (ssd) | 1.199 (decode) | 2.748 |
 
-For orientation only, and **not admissible as a result**: one FD4B `stream` run
-on 2026-09-22, on this 4-vCPU VM while another agent's builds held the load
-average near 5 (no report file kept), gave decode 6.48 GB/s alone and 6.46 with
-the matmul running; the matmul gave 19.6 on four threads, 15.1 on three and 14.8
-on three against the decoder. The quiet run replaces these.
+| Format | Input | Stat | r | B = 2.5 GB/s | B = 3 GB/s | B = 4 GB/s | B = 5 GB/s | B = 6 GB/s | Resident slowdown |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| FD4B ssse3_pshufb | stream | worst | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 1.164 (decode) | 0.970 (decode) | 3.623 |
+| FD3B avx2_vpshufb | stream | worst | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.420 (ssd) | 1.198 (decode) | 0.998 (decode) | 3.430 |
+| FD4B ssse3_pshufb | hot | worst | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 1.298 (decode) | 2.665 |
+| FD3B avx2_vpshufb | hot | worst | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.420 (ssd) | 1.360 (decode) | 1.133 (decode) | 3.071 |
+
+**2 threads** (the contended arm: decoder on one core, matmul on one). Rates:
+
+| Format | Input | Stat | Decode alone | Decode + matmul | Matmul all | Matmul rest | Matmul + decode | Core-s/token (contended) |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| FD4B ssse3_pshufb | stream | median | 6.836 | 6.987 | 10.439 | 5.421 | 5.341 | 15.57 |
+| FD4B ssse3_pshufb | stream | min | 6.283 | 6.230 | 10.142 | 5.335 | 5.110 | 17.46 |
+| FD4B ssse3_pshufb | stream | max | 7.968 | 7.558 | 11.215 | 5.655 | 5.668 | 14.40 |
+| FD3B avx2_vpshufb | stream | median | 6.801 | 6.432 | 10.457 | 5.426 | 5.337 | 16.92 |
+| FD3B avx2_vpshufb | stream | min | 6.095 | 6.218 | 9.845 | 5.321 | 5.076 | 17.50 |
+| FD3B avx2_vpshufb | stream | max | 7.407 | 6.838 | 10.929 | 5.797 | 5.724 | 15.91 |
+| FD4B ssse3_pshufb | hot | median | 9.468 | 9.486 | 10.554 | 5.438 | 5.318 | 11.47 |
+| FD4B ssse3_pshufb | hot | min | 8.547 | 8.464 | 9.997 | 5.123 | 5.113 | 12.86 |
+| FD4B ssse3_pshufb | hot | max | 10.697 | 9.994 | 10.854 | 5.687 | 5.637 | 10.89 |
+| FD3B avx2_vpshufb | hot | median | 7.737 | 7.694 | 10.326 | 5.451 | 5.404 | 14.14 |
+| FD3B avx2_vpshufb | hot | min | 7.168 | 7.319 | 9.478 | 5.212 | 5.127 | 14.87 |
+| FD3B avx2_vpshufb | hot | max | 8.322 | 8.333 | 10.672 | 5.587 | 5.524 | 13.06 |
+
+Speedup and resident slowdown, medians, then the worst case:
+
+| Format | Input | Stat | r | B = 2.5 GB/s | B = 3 GB/s | B = 4 GB/s | B = 5 GB/s | B = 6 GB/s | Resident slowdown |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| FD4B ssse3_pshufb | stream | median | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.333 (ssd) | 1.068 (matmul) | 0.890 (matmul) | 1.954 |
+| FD3B avx2_vpshufb | stream | median | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.334 (matmul) | 1.067 (matmul) | 0.890 (matmul) | 1.959 |
+| FD4B ssse3_pshufb | hot | median | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.329 (matmul) | 1.064 (matmul) | 0.886 (matmul) | 1.985 |
+| FD3B avx2_vpshufb | hot | median | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.351 (matmul) | 1.081 (matmul) | 0.901 (matmul) | 1.911 |
+
+| Format | Input | Stat | r | B = 2.5 GB/s | B = 3 GB/s | B = 4 GB/s | B = 5 GB/s | B = 6 GB/s | Resident slowdown |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|
+| FD4B ssse3_pshufb | stream | worst | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.278 (matmul) | 1.022 (matmul) | 0.852 (matmul) | 2.195 |
+| FD3B avx2_vpshufb | stream | worst | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.269 (matmul) | 1.015 (matmul) | 0.846 (matmul) | 2.153 |
+| FD4B ssse3_pshufb | hot | worst | 0.7503 | 1.333 (ssd) | 1.333 (ssd) | 1.278 (matmul) | 1.023 (matmul) | 0.852 (matmul) | 2.123 |
+| FD3B avx2_vpshufb | hot | worst | 0.7041 | 1.420 (ssd) | 1.420 (ssd) | 1.282 (matmul) | 1.025 (matmul) | 0.854 (matmul) | 2.082 |
+
+**Decision, by the rule fixed above** (a streamed deployment at B is worth building
+only if the contended worst-case speedup at B exceeds 1). Every `Matmul all` run
+(at least 17.623 GB/s on 4 threads, 9.478 on 2) exceeds 6 GB/s, so raw streaming is
+SSD-bound at every tabulated B, `t_raw = 1/B`, and the speedup
+`(1/B) / max(r/B, 1/D_c, 1/M_c)` exceeds 1 exactly when `B < min(D_c, M_c)` (r < 1)
+and is the full `1/r` while `B <= r * min(D_c, M_c)`. The last two columns below are
+that arithmetic on the printed `min` rows, not new measurements. Because M_all drops
+out, the per-arm minimum the rule first named gives the same streamed speedup in
+every cell; only the resident slowdown differs.
+
+| Threads | Format | Input | Worst case > 1 at B (GB/s) | Worst case <= 1 at B | Break-even B = min(D_c, M_c) | Full 1/r up to B = r min(D_c, M_c) |
+|---:|---|---|---|---|---:|---:|
+| 4 | FD4B | stream | 2.5, 3, 4, 5 | 6 (0.970, decode) | 5.818 | 4.365 |
+| 4 | FD3B | stream | 2.5, 3, 4, 5 | 6 (0.998, decode) | 5.989 | 4.217 |
+| 4 | FD4B | hot | 2.5, 3, 4, 5, 6 | none | 7.789 | 5.844 |
+| 4 | FD3B | hot | 2.5, 3, 4, 5, 6 | none | 6.799 | 4.787 |
+| 2 | FD4B | stream | 2.5, 3, 4, 5 | 6 (0.852, matmul) | 5.110 | 3.834 |
+| 2 | FD3B | stream | 2.5, 3, 4, 5 | 6 (0.846, matmul) | 5.076 | 3.574 |
+| 2 | FD4B | hot | 2.5, 3, 4, 5 | 6 (0.852, matmul) | 5.113 | 3.836 |
+| 2 | FD3B | hot | 2.5, 3, 4, 5 | 6 (0.854, matmul) | 5.127 | 3.610 |
+
+- **B up to 5 GB/s: the condition holds** in all eight format x placement x
+  thread-count cases, so a streamed FD4B or FD3B trunk is worth building there by
+  this gate. Up to about 4.2 GB/s on 4 threads (3.6 on 2) decoding is fully hidden
+  and the modelled gain is the whole byte saving: 1.333 for FD4B and 1.420 for FD3B,
+  in the median and the worst case alike. At B = 3 GB/s that holds with margin in
+  every case.
+- **B = 6 GB/s: the condition fails** for streamed input on 4 threads, where one
+  decoder thread at its slowest (5.818 FD4B, 5.989 FD3B) is the limiting stage, and
+  in every case on 2 threads, where the decoder's core leaves the matmul one thread
+  at about 5.1 GB/s. Cache-hot input passes on 4 threads (1.298, 1.133). Which
+  placement a real row pipeline sees is not measured here; `stream` is the
+  conservative bracket. A second decoder thread is a different design, not measured.
+- **Margins at B = 5 are thin:** 1.164 (FD4B) and 1.198 (FD3B) for streamed input
+  on 4 threads, 1.015 to 1.025 on 2 threads.
+- **What contention costs.** On 4 threads the medians show the decoder 6.8% to
+  12.6% slower beside the matmul and the 3-thread matmul 1.1% to 5.4% slower beside
+  the decoder; the decoder's core itself leaves the matmul at 0.78 to 0.80 of its
+  4-thread rate. On 2 threads the decoder is unchanged within the run spread and the
+  matmul loses 0.9% to 2.2%, but one matmul thread is about 0.52 of two: on a small
+  machine the cost is the core, not memory traffic.
+- **Resident slowdown** is 2.665 to 3.623 in the worst case on 4 threads and 2.082 to
+  2.195 on 2, as expected: a pinned layer should be decoded once and kept raw.
+- Decode rates here (6.8 to 7.0 GB/s streamed, 7.7 to 9.6 hot, medians alone) are
+  below gate 3's hosted single-kernel rates (16.22 to 16.33 GB/s, pooled 8 MiB,
+  x86_64): a different CPU, a whole 12288 x 7168 matrix in 22 FDRX chunks and output
+  to two 8 MiB buffers. The gap is not diagnosed here.
+
+Scope, as the reports' `scope` field says: synthetic weights with the committed
+four-range high-byte distribution, one matrix shape, the SSD rate B a model
+parameter with no disk in the loop, one VM, no full-model claim. An earlier
+orientation reading taken under another agent's load (2026-09-22, no report kept)
+is superseded by these tables.

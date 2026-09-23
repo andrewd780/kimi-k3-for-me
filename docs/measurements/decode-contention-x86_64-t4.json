@@ -1,0 +1,1471 @@
+{
+  "schema": "decode-contention-v1",
+  "runs": [
+    {
+      "native": "ssse3_pshufb",
+      "index_bits": 4,
+      "input": "stream",
+      "threads": 4,
+      "openmp": true,
+      "matrix": [
+        12288,
+        7168
+      ],
+      "raw_bytes": 176160768,
+      "packed_bytes": 132165279,
+      "row_index_bytes": 49168,
+      "escape_values": 44671,
+      "chunk_rows": 585,
+      "chunks": 22,
+      "seconds_per_arm": 2.0,
+      "byte_exact": true,
+      "arms": {
+        "decode_alone": {
+          "GBps_runs": [
+            6.924892,
+            6.417699,
+            7.372071,
+            7.07407,
+            6.878885,
+            7.388537,
+            7.057224,
+            6.24824,
+            7.005476
+          ],
+          "median": 7.005476,
+          "min": 6.24824
+        },
+        "matmul_all_threads": {
+          "GBps_runs": [
+            18.641267,
+            17.622754,
+            18.301531,
+            21.075989,
+            19.870034,
+            20.200226,
+            19.760503,
+            19.045915,
+            20.046664
+          ],
+          "median": 19.760503,
+          "min": 17.622754
+        },
+        "matmul_rest_threads": {
+          "GBps_runs": [
+            14.817682,
+            14.58143,
+            16.217459,
+            16.120613,
+            16.406403,
+            15.305764,
+            15.374925,
+            15.827385,
+            15.47085
+          ],
+          "median": 15.47085,
+          "min": 14.58143
+        },
+        "decode_concurrent": {
+          "GBps_runs": [
+            6.104553,
+            5.818049,
+            6.165678,
+            6.151128,
+            6.283737,
+            6.598697,
+            6.120427,
+            5.92865,
+            6.057054
+          ],
+          "median": 6.120427,
+          "min": 5.818049
+        },
+        "matmul_concurrent": {
+          "GBps_runs": [
+            14.479818,
+            14.992695,
+            15.03295,
+            14.12949,
+            15.259736,
+            14.709804,
+            14.344748,
+            14.892016,
+            14.940287
+          ],
+          "median": 14.892016,
+          "min": 14.12949
+        }
+      },
+      "summary": {
+        "payload_and_framing_ratio": 0.7502537625176566,
+        "derived": {
+          "median": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.16338729307612032,
+                  "speedup": 1.2240854000000003,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.16338729307612032,
+                  "speedup": 1.0200711666666666,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 3.2286150949925547,
+                "decode_hidden": false,
+                "decode_needed_GBps": 14.892016,
+                "matmul_core_loss": 1.3269192700303303
+              },
+              "core_seconds_per_token": 17.778171359612653,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.15005075250353134,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.14274547511118446,
+                  "speedup": 1.167579333333333,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.820722389170986,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.47085,
+                "matmul_core_loss": 1.2772732590646279
+              },
+              "core_seconds_per_token": 15.53213514684798,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "decode_slowdown_under_matmul": 1.144605760349727,
+            "matmul_slowdown_under_decode": 1.0388687468506614,
+            "core_seconds_per_token_alone": 15.53213514684798,
+            "core_seconds_per_token_contended": 17.778171359612653
+          },
+          "worst": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.17187892367355448,
+                  "speedup": 1.1636098000000001,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.17187892367355448,
+                  "speedup": 0.9696748333333333,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 3.622518304675674,
+                "decode_hidden": false,
+                "decode_needed_GBps": 14.12949,
+                "matmul_core_loss": 1.4916312619917633
+              },
+              "core_seconds_per_token": 18.702145684919465,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.1600450686913435,
+                  "speedup": 1.2496479999999999,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.1600450686913435,
+                  "speedup": 1.0413733333333333,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 3.373108107243,
+                "decode_hidden": false,
+                "decode_needed_GBps": 14.58143,
+                "matmul_core_loss": 1.4453993195454768
+              },
+              "core_seconds_per_token": 17.414503924305084,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "decode_slowdown_under_matmul": 1.2699337870822331,
+            "matmul_slowdown_under_decode": 1.16114615601837,
+            "core_seconds_per_token_alone": 17.414503924305084,
+            "core_seconds_per_token_contended": 18.702145684919465
+          }
+        }
+      }
+    },
+    {
+      "native": "avx2_vpshufb",
+      "index_bits": 3,
+      "input": "stream",
+      "threads": 4,
+      "openmp": true,
+      "matrix": [
+        12288,
+        7168
+      ],
+      "raw_bytes": 176160768,
+      "packed_bytes": 124038544,
+      "row_index_bytes": 49168,
+      "escape_values": 2927952,
+      "chunk_rows": 585,
+      "chunks": 22,
+      "seconds_per_arm": 2.0,
+      "byte_exact": true,
+      "arms": {
+        "decode_alone": {
+          "GBps_runs": [
+            6.756424,
+            7.292247,
+            6.69627,
+            6.868574,
+            7.053132,
+            6.801492,
+            7.1238,
+            6.780343,
+            6.902422
+          ],
+          "median": 6.868574,
+          "min": 6.69627
+        },
+        "matmul_all_threads": {
+          "GBps_runs": [
+            20.064127,
+            20.032526,
+            20.178587,
+            19.096483,
+            20.242415,
+            19.826204,
+            20.540902,
+            19.144622,
+            20.213586
+          ],
+          "median": 20.064127,
+          "min": 19.096483
+        },
+        "matmul_rest_threads": {
+          "GBps_runs": [
+            15.342177,
+            15.959033,
+            15.613812,
+            15.449571,
+            16.29187,
+            15.883248,
+            15.993277,
+            16.285252,
+            15.913408
+          ],
+          "median": 15.913408,
+          "min": 15.342177
+        },
+        "decode_concurrent": {
+          "GBps_runs": [
+            6.022595,
+            5.988971,
+            6.315017,
+            6.154803,
+            6.160015,
+            6.698801,
+            6.35472,
+            6.353343,
+            6.304715
+          ],
+          "median": 6.304715,
+          "min": 5.988971
+        },
+        "matmul_concurrent": {
+          "GBps_runs": [
+            14.610823,
+            15.604258,
+            14.839017,
+            15.053527,
+            14.932092,
+            15.595381,
+            15.000884,
+            15.781825,
+            15.326537
+          ],
+          "median": 15.053527,
+          "min": 14.610823
+        }
+      },
+      "summary": {
+        "payload_and_framing_ratio": 0.7041212717692057,
+        "derived": {
+          "median": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.15861145190543902,
+                  "speedup": 1.2609430000000001,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.15861145190543902,
+                  "speedup": 1.0507858333333333,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 3.18240031468512,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.053527,
+                "matmul_core_loss": 1.3328522279197426
+              },
+              "core_seconds_per_token": 17.25851208183082,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.1455906276906968,
+                  "speedup": 1.3737148,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.1455906276906968,
+                  "speedup": 1.1447623333333332,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.9211488439958573,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.913408,
+                "matmul_core_loss": 1.2608315578913076
+              },
+              "core_seconds_per_token": 15.841716199024717,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "decode_slowdown_under_matmul": 1.089434494659949,
+            "matmul_slowdown_under_decode": 1.05712156360433,
+            "core_seconds_per_token_alone": 15.841716199024717,
+            "core_seconds_per_token_contended": 17.25851208183082
+          },
+          "worst": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.16697359195761674,
+                  "speedup": 1.1977942000000001,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.16697359195761674,
+                  "speedup": 0.9981618333333334,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 3.4297881889893933,
+                "decode_hidden": false,
+                "decode_needed_GBps": 14.610823,
+                "matmul_core_loss": 1.4058689233316972
+              },
+              "core_seconds_per_token": 18.16839654090828,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.14933686963040618,
+                  "speedup": 1.3392540000000002,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.14933686963040618,
+                  "speedup": 1.116045,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 3.0675140040649493,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.342177,
+                "matmul_core_loss": 1.338851846123272
+              },
+              "core_seconds_per_token": 16.249344784484496,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "decode_slowdown_under_matmul": 1.2176126750321548,
+            "matmul_slowdown_under_decode": 1.1150549151132692,
+            "core_seconds_per_token_alone": 16.249344784484496,
+            "core_seconds_per_token_contended": 18.16839654090828
+          }
+        }
+      }
+    },
+    {
+      "native": "ssse3_pshufb",
+      "index_bits": 4,
+      "input": "hot",
+      "threads": 4,
+      "openmp": true,
+      "matrix": [
+        12288,
+        7168
+      ],
+      "raw_bytes": 176160768,
+      "packed_bytes": 132165279,
+      "row_index_bytes": 49168,
+      "escape_values": 44671,
+      "chunk_rows": 585,
+      "chunks": 22,
+      "seconds_per_arm": 2.0,
+      "byte_exact": true,
+      "arms": {
+        "decode_alone": {
+          "GBps_runs": [
+            9.490602,
+            9.817967,
+            8.73623,
+            10.763191,
+            10.798405,
+            9.558986,
+            8.419115,
+            10.033917,
+            9.370915
+          ],
+          "median": 9.558986,
+          "min": 8.419115
+        },
+        "matmul_all_threads": {
+          "GBps_runs": [
+            19.952979,
+            20.065347,
+            20.510042,
+            20.488864,
+            20.042969,
+            19.081948,
+            18.802752,
+            19.326514,
+            20.758598
+          ],
+          "median": 20.042969,
+          "min": 18.802752
+        },
+        "matmul_rest_threads": {
+          "GBps_runs": [
+            15.541993,
+            16.206529,
+            15.563926,
+            16.083333,
+            15.617297,
+            15.863238,
+            16.018712,
+            15.490641,
+            15.625681
+          ],
+          "median": 15.625681,
+          "min": 15.490641
+        },
+        "decode_concurrent": {
+          "GBps_runs": [
+            8.333999,
+            8.663,
+            8.655718,
+            8.620241,
+            8.743038,
+            7.78916,
+            8.815784,
+            9.06456,
+            8.329721
+          ],
+          "median": 8.655718,
+          "min": 7.78916
+        },
+        "matmul_concurrent": {
+          "GBps_runs": [
+            14.953951,
+            15.46637,
+            14.983113,
+            14.399363,
+            15.219332,
+            14.84827,
+            15.573422,
+            15.419747,
+            15.306479
+          ],
+          "median": 15.219332,
+          "min": 14.399363
+        }
+      },
+      "summary": {
+        "payload_and_framing_ratio": 0.7502537625176566,
+        "derived": {
+          "median": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.15005075250353134,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.12504229375294276,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.315575553639802,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.219332,
+                "matmul_core_loss": 1.3169414400053827
+              },
+              "core_seconds_per_token": 12.570880890528088,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.15005075250353134,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.12504229375294276,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.096767272177195,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.625681,
+                "matmul_core_loss": 1.2826941110598635
+              },
+              "core_seconds_per_token": 11.383006523913728,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "decode_slowdown_under_matmul": 1.1043550633234587,
+            "matmul_slowdown_under_decode": 1.0266995292566061,
+            "core_seconds_per_token_alone": 11.383006523913728,
+            "core_seconds_per_token_contended": 12.570880890528088
+          },
+          "worst": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.15005075250353134,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.12838354841857144,
+                  "speedup": 1.2981933333333333,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.66506247143466,
+                "decode_hidden": false,
+                "decode_needed_GBps": 14.399363,
+                "matmul_core_loss": 1.4416330777965665
+              },
+              "core_seconds_per_token": 13.96941390342476,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.3001015050070627,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.332205881394916,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.2500845875058855,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.998647057673899,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.18756344062941416,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.331529410231866,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.15005075250353134,
+                  "speedup": 1.3328823525579663,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 6.664411762789832,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.12504229375294276,
+                  "speedup": 1.3328823525579665,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 7.997294115347798,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.4656508433487367,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.490641,
+                "matmul_core_loss": 1.3400735321411166
+              },
+              "core_seconds_per_token": 12.924161268731927,
+              "compressed_GB_read_per_token": 81.63511189954622
+            },
+            "decode_slowdown_under_matmul": 1.3863375511608442,
+            "matmul_slowdown_under_decode": 1.125503190661976,
+            "core_seconds_per_token_alone": 12.924161268731927,
+            "core_seconds_per_token_contended": 13.96941390342476
+          }
+        }
+      }
+    },
+    {
+      "native": "avx2_vpshufb",
+      "index_bits": 3,
+      "input": "hot",
+      "threads": 4,
+      "openmp": true,
+      "matrix": [
+        12288,
+        7168
+      ],
+      "raw_bytes": 176160768,
+      "packed_bytes": 124038544,
+      "row_index_bytes": 49168,
+      "escape_values": 2927952,
+      "chunk_rows": 585,
+      "chunks": 22,
+      "seconds_per_arm": 2.0,
+      "byte_exact": true,
+      "arms": {
+        "decode_alone": {
+          "GBps_runs": [
+            8.37428,
+            8.022514,
+            7.366388,
+            8.234723,
+            7.679624,
+            7.686759,
+            7.723064,
+            7.496502,
+            8.293512
+          ],
+          "median": 7.723064,
+          "min": 7.366388
+        },
+        "matmul_all_threads": {
+          "GBps_runs": [
+            19.773102,
+            19.678262,
+            20.881924,
+            19.768628,
+            19.887325,
+            19.65824,
+            20.447435,
+            19.73411,
+            19.966725
+          ],
+          "median": 19.773102,
+          "min": 19.65824
+        },
+        "matmul_rest_threads": {
+          "GBps_runs": [
+            15.856732,
+            15.366483,
+            16.353801,
+            16.066682,
+            15.456961,
+            15.827874,
+            15.610669,
+            15.528129,
+            15.723166
+          ],
+          "median": 15.723166,
+          "min": 15.366483
+        },
+        "decode_concurrent": {
+          "GBps_runs": [
+            7.365841,
+            6.798628,
+            7.089628,
+            7.650336,
+            7.195039,
+            6.933558,
+            7.627806,
+            7.46254,
+            7.108305
+          ],
+          "median": 7.195039,
+          "min": 6.798628
+        },
+        "matmul_concurrent": {
+          "GBps_runs": [
+            15.543828,
+            14.951126,
+            15.705244,
+            15.835841,
+            14.501431,
+            15.027783,
+            15.637332,
+            15.642426,
+            14.92435
+          ],
+          "median": 15.543828,
+          "min": 14.501431
+        }
+      },
+      "summary": {
+        "payload_and_framing_ratio": 0.7041212717692057,
+        "derived": {
+          "median": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.14082425435384113,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.13898465317561168,
+                  "speedup": 1.1991731666666667,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.7481577236759938,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.543828,
+                "matmul_core_loss": 1.2720870302991003
+              },
+              "core_seconds_per_token": 15.122920112038308,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.14082425435384113,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.12948228837673753,
+                  "speedup": 1.2871773333333332,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.560266495266646,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.723166,
+                "matmul_core_loss": 1.2575776405337196
+              },
+              "core_seconds_per_token": 14.08896779827281,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "decode_slowdown_under_matmul": 1.0733873714930522,
+            "matmul_slowdown_under_decode": 1.0115375697672415,
+            "core_seconds_per_token_alone": 14.08896779827281,
+            "core_seconds_per_token_contended": 15.122920112038308
+          },
+          "worst": {
+            "contended": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.14708850079751384,
+                  "speedup": 1.3597256000000002,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.14708850079751384,
+                  "speedup": 1.1331046666666666,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 3.071490894927624,
+                "decode_hidden": false,
+                "decode_needed_GBps": 14.501431,
+                "matmul_core_loss": 1.4399905774816293
+              },
+              "core_seconds_per_token": 16.00469977177748,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "alone": {
+              "streamed": [
+                {
+                  "ssd_GBps": 2.5,
+                  "raw_s_per_GB": 0.4,
+                  "compressed_s_per_GB": 0.28164850870768227,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 3.5505247465658742,
+                  "decode_needed_to_break_even_GBps": 2.5
+                },
+                {
+                  "ssd_GBps": 3.0,
+                  "raw_s_per_GB": 0.3333333333333333,
+                  "compressed_s_per_GB": 0.23470709058973524,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 4.260629695879049,
+                  "decode_needed_to_break_even_GBps": 3.0
+                },
+                {
+                  "ssd_GBps": 4.0,
+                  "raw_s_per_GB": 0.25,
+                  "compressed_s_per_GB": 0.17603031794230142,
+                  "speedup": 1.4202098986263496,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 5.680839594505398,
+                  "decode_needed_to_break_even_GBps": 4.0
+                },
+                {
+                  "ssd_GBps": 5.0,
+                  "raw_s_per_GB": 0.2,
+                  "compressed_s_per_GB": 0.14082425435384113,
+                  "speedup": 1.4202098986263498,
+                  "limiting_stage": "ssd",
+                  "decode_hidden": true,
+                  "decode_needed_for_full_gain_GBps": 7.1010494931317485,
+                  "decode_needed_to_break_even_GBps": 5.0
+                },
+                {
+                  "ssd_GBps": 6.0,
+                  "raw_s_per_GB": 0.16666666666666666,
+                  "compressed_s_per_GB": 0.13575174155909248,
+                  "speedup": 1.227731333333333,
+                  "limiting_stage": "decode",
+                  "decode_hidden": false,
+                  "decode_needed_for_full_gain_GBps": 8.521259391758099,
+                  "decode_needed_to_break_even_GBps": 6.0
+                }
+              ],
+              "resident": {
+                "slowdown": 2.834757550104611,
+                "decode_hidden": false,
+                "decode_needed_GBps": 15.366483,
+                "matmul_core_loss": 1.3589266978006613
+              },
+              "core_seconds_per_token": 14.77114699904485,
+              "compressed_GB_read_per_token": 76.61543558120728
+            },
+            "decode_slowdown_under_matmul": 1.2317602904586045,
+            "matmul_slowdown_under_decode": 1.1277370488471103,
+            "core_seconds_per_token_alone": 14.77114699904485,
+            "core_seconds_per_token_contended": 16.00469977177748
+          }
+        }
+      }
+    }
+  ],
+  "execution": {
+    "machine": "x86_64",
+    "system": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu_count": 4,
+    "threads": 4,
+    "seconds_per_arm": 2.0,
+    "repeats": 9,
+    "load_average_before": [
+      0.0986328125,
+      1.24365234375,
+      2.345703125
+    ],
+    "load_average_after": [
+      2.55126953125,
+      2.1904296875,
+      2.46484375
+    ],
+    "head_sha": "516f01004a6bb576d9f940f7189c8cbf0517c076",
+    "run_id": null
+  },
+  "scope": "synthetic weights with the committed four-range high-byte distribution; one decoder thread against k3_matmul_bf16 on the remaining threads; matmul weights from DRAM; decoder input either streamed from DRAM or one cache-resident chunk; no disk, no full-model claim"
+}

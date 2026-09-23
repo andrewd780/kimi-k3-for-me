@@ -172,9 +172,13 @@ grouped, with zero padding at K3 widths. *Families:* gate 1 sampled two of 23
 matrix families (4.00% of trunk bytes); the `families` CI job samples all of
 them, under per-family decision rules fixed in the note before the data.
 *Contention:* a byte-exact benchmark runs one decoder thread against
-`k3_matmul_bf16` on the other cores, and the break-even model is unit-tested; the
-measurement is **not yet taken** (it needs a quiet machine) and the note holds a
-marked placeholder for it. Hosted numbers for all of these await CI. No
+`k3_matmul_bf16` on the other cores. On a quiet 4-vCPU VM (load 0.10 and 0.29
+before the runs, 9 interleaved repeats) the worst-case contended streamed speedup
+exceeds 1 up to B = 5 GB/s in every format, placement and thread count (4 and 2),
+and is the full 1.333 (FD4B) / 1.420 (FD3B) up to about 4.2 GB/s on 4 threads; at
+6 GB/s it fails for streamed input on 4 threads (0.970, 0.998, decode-limited) and
+everywhere on 2 (about 0.85, matmul-limited). Pinned layers should stay raw
+(resident slowdown 2.08 to 3.62). Hosted numbers for all of these await CI. No
 full-model speedup is claimed.
 
 ## 3. Predictive expert reads: closed
