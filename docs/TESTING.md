@@ -16,6 +16,19 @@ misalignment, tails and heap-sized widths. The dedicated KDA workflow compiles
 both the original C and opt-in SIMD, compares full oracle-logit traces within each
 ISA, runs sanitizer coverage, and records three synthetic timing runs per arm.
 
+**`test_mla_variants`** holds the MLA cache variants of `benchmarks/mla_variants.h`
+to the engine's own `k3_mla_cached` by `memcmp`: outputs, accumulators, appended cache
+rows, raw scores and every softmax normaliser, at three value-row budgets and on every
+thread, with each variant's kv_b application count checked against its closed form
+(including the prefill shape C=0, T=256, where L0 makes 65,792 and L1 256). Ordinary
+random layers cannot see a reordered score chain, a double sum rounded to float, and
+the test prints an order witness showing 0.0% sensitivity there, so it also runs
+*cancelling* layers (exactly negated huge terms built into the weights, where 94-100%
+of reordered chains round differently) and *sharp* layers (where the double softmax
+normaliser stops being exact in any order). Mutants that reorder a chain in E+, L1, A
+or E itself pass every ordinary case and fail the cancelling ones; see
+[the variants note](notes/mla-variants.md).
+
 **`test_quality`** checks stable NLL arithmetic on synthetic logits. Python quality
 tests cover overlapping target windows and token-weighted aggregation. A tiny CLI
 primitive check compares native scores with ordinary prefix logits. These tests
