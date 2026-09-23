@@ -60,6 +60,22 @@
 #define NONATTN_GMAC    103.0
 #define NONATTN_SECONDS 16.0
 
+/* A double as a JSON value: the number in `fmt`, or null when it is not finite. printf
+ * writes nan and inf for a projection that could not be made, a ratio with nothing to
+ * divide or a gap with no second score, and strict JSON parsers reject both. Returns
+ * one of JN_BUFS rotating buffers, so one fprintf may use up to that many. */
+#define JN_BUFS 16
+static const char *jnum(double x, const char *fmt)
+{
+    static char buf[JN_BUFS][40];
+    static int next = 0;
+    char *b = buf[next];
+    next = (next + 1) % JN_BUFS;
+    if (isfinite(x)) snprintf(b, sizeof buf[0], fmt, x);
+    else snprintf(b, sizeof buf[0], "null");
+    return b;
+}
+
 static double now_s(void)
 {
     struct timespec t;
@@ -299,10 +315,10 @@ static void print_result(const Result *r, FILE *json, const char *cpu)
     if (!json) return;
     fprintf(json,
             "{\"mode\":\"time\",\"variant\":\"%s\",\"C\":%d,\"T\":%d,\"threads\":%d,"
-            "\"status\":\"%s\",\"seconds_per_call\":%.9g,\"runs\":[",
+            "\"status\":\"%s\",\"seconds_per_call\":%s,\"runs\":[",
             MLA_NAME[r->v], r->C, r->T, r->threads,
             r->status == 1 ? "measured" : r->status == 0 ? "projected" : "not_run_memory",
-            s);
+            jnum(s, "%.9g"));
     for (int i = 0; i < r->nruns; i++) fprintf(json, "%s%.9g", i ? "," : "", r->runs[i]);
     fprintf(json, "],\"stall_share\":[");
     for (int i = 0; i < r->nruns; i++) fprintf(json, "%s%.4f", i ? "," : "", r->stall[i]);
@@ -313,14 +329,16 @@ static void print_result(const Result *r, FILE *json, const char *cpu)
     for (int i = 0; i < r->nruns; i++) fprintf(json, "%s%.6g", i ? "," : "", r->cpu[i]);
     fprintf(json, "],\"redone\":%d,", r->discarded);
     fprintf(json,
-            "\"min\":%.9g,\"max\":%.9g,\"ms_per_token_per_layer\":%.9g,"
-            "\"s_per_token_x24\":%.9g,\"fraction_of_16s\":%.9g,\"kv_b_applications\":%.9g,"
+            "\"min\":%s,\"max\":%s,\"ms_per_token_per_layer\":%s,"
+            "\"s_per_token_x24\":%s,\"fraction_of_16s\":%s,\"kv_b_applications\":%.9g,"
             "\"macs_per_call\":%.9g,\"gmac_per_token_x24\":%.9g,"
             "\"persistent_bytes_per_position_per_layer\":%.0f,\"transient_bytes\":%.0f,"
             "\"vcap\":%d,\"load_before\":%.2f,\"load_after\":%.2f,\"isa\":\"%s\","
             "\"cpu\":\"%s\"}\n",
-            r->status == 1 ? r->lo : s, r->status == 1 ? r->hi : s, per_tok_layer * 1e3,
-            per_tok_model, per_tok_model / NONATTN_SECONDS, r->rebuilds, r->macs,
+            jnum(r->status == 1 ? r->lo : s, "%.9g"),
+            jnum(r->status == 1 ? r->hi : s, "%.9g"),
+            jnum(per_tok_layer * 1e3, "%.9g"), jnum(per_tok_model, "%.9g"),
+            jnum(per_tok_model / NONATTN_SECONDS, "%.9g"), r->rebuilds, r->macs,
             r->macs / r->T * N_MLA_LAYERS / 1e9, r->persistent_pp, r->transient, r->vcap,
             r->load_before, r->load_after, isa(), cpu);
     fflush(json);
@@ -662,11 +680,12 @@ static void dev_print(const char *label, const Dev *d, FILE *json, int C, int fi
            label, d->max_abs, d->max_abs / d->max_ref, sqrt(d->sum_d2 / d->sum_r2),
            d->max_rel_elem, 100.0 * d->n_equal / d->n);
     if (json)
-        fprintf(json, "%s\"%s\":{\"max_abs\":%.6g,\"max_ref\":%.6g,\"max_abs_over_max_ref\":%.6g,"
-                "\"rel_l2\":%.6g,\"max_rel_elementwise\":%.6g,\"bitwise_equal_fraction\":%.6g,"
-                "\"elements\":%.0f}", first ? "" : ",", label, d->max_abs, d->max_ref,
-                d->max_abs / d->max_ref, sqrt(d->sum_d2 / d->sum_r2), d->max_rel_elem,
-                d->n_equal / d->n, d->n);
+        fprintf(json, "%s\"%s\":{\"max_abs\":%s,\"max_ref\":%s,"
+                "\"max_abs_over_max_ref\":%s,\"rel_l2\":%s,\"max_rel_elementwise\":%s,"
+                "\"bitwise_equal_fraction\":%s,\"elements\":%.0f}", first ? "" : ",", label, jnum(d->max_abs, "%.6g"),
+                jnum(d->max_ref, "%.6g"), jnum(d->max_abs / d->max_ref, "%.6g"),
+                jnum(sqrt(d->sum_d2 / d->sum_r2), "%.6g"), jnum(d->max_rel_elem, "%.6g"),
+                jnum(d->n_equal / d->n, "%.6g"), d->n);
     (void)C;
 }
 
@@ -743,6 +762,7 @@ static int run_numerics(const NumOpt *o)
     char cpu[256];
     cpu_name(cpu, sizeof cpu);
     FILE *json = o->json ? fopen(o->json, "a") : NULL;
+    if (o->json && !json) { fprintf(stderr, "cannot open %s\n", o->json); return 1; }
     printf("numerics: absorbed (A) against expanded (E) and a double reference (R)\n"
            "weights ~ N(0, 0.02) in bf16, norm weights 1 + N(0, 0.1), hidden ~ N(0, 1);\n"
            "the engine's projections and rmsnorms; %d query tokens per context%s\n",
@@ -894,18 +914,22 @@ static int run_numerics(const NumOpt *o)
                "whose gap is within 2x their largest score difference: %d\n", flips, rows,
                min_gap, at_risk);
         if (json) {
-            fprintf(json, "\"scores\":{\"count\":%.0f,\"rms_score\":%.6g,"
-                    "\"abs_max_score\":%.6g,\"bitwise_equal_fraction\":%.6g,\"median\":%.6g,"
-                    "\"p90\":%.6g,\"p99\":%.6g,\"p999\":%.6g,\"max\":%.6g,"
-                    "\"e_vs_ref_median\":%.6g,\"e_vs_ref_max\":%.6g,\"a_vs_ref_median\":%.6g,"
-                    "\"a_vs_ref_max\":%.6g},",
-                    hS.n, score_rms, score_abs_max, hS.zeros / hS.n, hist_q(&hS, 0.5),
-                    hist_q(&hS, 0.9), hist_q(&hS, 0.99), hist_q(&hS, 0.999), hS.max,
-                    hist_q(&hER, 0.5), hER.max, hist_q(&hAR, 0.5), hAR.max);
-            fprintf(json, "\"argmax\":{\"rows\":%d,\"changed\":%d,\"min_top2_gap\":%.6g,"
+            fprintf(json, "\"scores\":{\"count\":%.0f,\"rms_score\":%s,"
+                    "\"abs_max_score\":%s,\"bitwise_equal_fraction\":%s,\"median\":%s,"
+                    "\"p90\":%s,\"p99\":%s,\"p999\":%s,\"max\":%s,"
+                    "\"e_vs_ref_median\":%s,\"e_vs_ref_max\":%s,\"a_vs_ref_median\":%s,"
+                    "\"a_vs_ref_max\":%s},",
+                    hS.n, jnum(score_rms, "%.6g"), jnum(score_abs_max, "%.6g"),
+                    jnum(hS.zeros / hS.n, "%.6g"), jnum(hist_q(&hS, 0.5), "%.6g"),
+                    jnum(hist_q(&hS, 0.9), "%.6g"), jnum(hist_q(&hS, 0.99), "%.6g"),
+                    jnum(hist_q(&hS, 0.999), "%.6g"), jnum(hS.max, "%.6g"),
+                    jnum(hist_q(&hER, 0.5), "%.6g"), jnum(hER.max, "%.6g"),
+                    jnum(hist_q(&hAR, 0.5), "%.6g"), jnum(hAR.max, "%.6g"));
+            fprintf(json, "\"argmax\":{\"rows\":%d,\"changed\":%d,\"min_top2_gap\":%s,"
                     "\"rows_gap_within_2x_diff\":%d},\"seconds_per_query\":{\"e_plus\":%.6g,"
-                    "\"a\":%.6g,\"reference\":%.6g}}\n", rows, flips, min_gap, at_risk,
-                    tE / o->queries, tA / o->queries, tR / o->queries);
+                    "\"a\":%.6g,\"reference\":%.6g}}\n", rows, flips,
+                    jnum(min_gap, "%.6g"), at_risk, tE / o->queries, tA / o->queries,
+                    tR / o->queries);
             fflush(json);
         }
         free(xq); free(q); free(cq); free(ql); free(gbuf); free(accE); free(accA); free(accX);
