@@ -87,6 +87,40 @@ def markdown(report):
     return "\n".join(lines) + "\n"
 
 
+def break_even_markdown(report, statistic):
+    """Streamed speedup over raw reads at each SSD rate, from the contended rates, with
+    the limiting stage; then the resident slowdown. r excludes the FDRX index, which is
+    small enough (0.028 points here) to keep resident rather than stream."""
+    lines = ["| Format | Input | Stat | r | " +
+             " | ".join(f"B = {b:g} GB/s" for b in SSD_GBPS) + " | Resident slowdown |",
+             "|---|---|---|---:|" + "---:|" * (len(SSD_GBPS) + 1)]
+    for run in report["runs"]:
+        derived = run["summary"]["derived"][statistic]["contended"]
+        cells = [f"{row['speedup']:.3f} ({row['limiting_stage']})"
+                 for row in derived["streamed"]]
+        lines.append(f"| FD{run['index_bits']}B {run['native']} | {run['input']} | "
+                     f"{statistic} | {run['summary']['payload_and_framing_ratio']:.4f} | " +
+                     " | ".join(cells) + f" | {derived['resident']['slowdown']:.3f} |")
+    return "\n".join(lines) + "\n"
+
+
+def load_average():
+    try:
+        return os.getloadavg()
+    except OSError:
+        return None
+
+
+def cpu_model():
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.lower().startswith(("model name", "cpu model")):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -98,6 +132,7 @@ def main():
     parser.add_argument("--inputs", nargs="+", default=["stream", "hot"],
                         choices=("stream", "hot"))
     args = parser.parse_args()
+    load_before = load_average()
     runs = []
     for placement in args.inputs:
         for bits in args.bits:
@@ -112,13 +147,12 @@ def main():
                 raise SystemExit("benchmark must be byte-exact, as requested, with OpenMP")
             run["summary"] = summarize(run)
             runs.append(run)
-    try:
-        load = os.getloadavg()
-    except OSError:
-        load = None
     report = {"schema": "decode-contention-v1", "runs": runs,
               "execution": {"machine": platform.machine(), "system": platform.platform(),
-                            "cpu_count": os.cpu_count(), "load_average_after": load,
+                            "cpu_model": cpu_model(), "cpu_count": os.cpu_count(),
+                            "threads": args.threads, "seconds_per_arm": args.seconds,
+                            "repeats": args.repeats, "load_average_before": load_before,
+                            "load_average_after": load_average(),
                             "head_sha": os.environ.get("RESEARCH_COMMIT"),
                             "run_id": os.environ.get("GITHUB_RUN_ID")},
               "scope": "synthetic weights with the committed four-range high-byte "
@@ -127,7 +161,8 @@ def main():
                        "streamed from DRAM or one cache-resident chunk; no disk, no "
                        "full-model claim"}
     args.out.write_text(json.dumps(report, indent=2) + "\n")
-    table = markdown(report)
+    table = (markdown(report) + "\n" + break_even_markdown(report, "median") + "\n" +
+             break_even_markdown(report, "min"))
     print(table, flush=True)
     print("CONTENTION_REPORT " + json.dumps(report, separators=(",", ":")), flush=True)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
