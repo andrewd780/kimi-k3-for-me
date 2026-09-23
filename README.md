@@ -627,7 +627,7 @@ needs nothing at all, and `--layers N` runs against partial shard sets.
 
 **macOS, Windows, WSL?** Linux is the reference platform. macOS/arm64 builds with plain
 `make` (see the Makefile's platform block). Windows builds natively too, via MSYS2's
-MinGW-w64 GCC (`pacman -S mingw-w64-x86_64-gcc`, then open the "MSYS2 MinGW x64" shell
+MinGW-w64 GCC (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp`, then open the "MSYS2 MinGW x64" shell
 specifically -- `make`, `make test`, and `make test-all` all pass every gate unmodified,
 including the full-model oracle and tokenizer parity against real Kimi K3 weights.
 Four Linux-only calls needed porting -- `O_DIRECT`, `pread`, `posix_memalign`, and
