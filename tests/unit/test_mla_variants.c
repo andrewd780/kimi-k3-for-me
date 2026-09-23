@@ -66,8 +66,12 @@ enum { LAYER_ORDINARY, LAYER_CANCELLING, LAYER_SHARP, LAYER_KINDS };
 static Witness g_wit[LAYER_KINDS];
 /* Threads available at start-up. The comparisons run on one thread, and the threaded
  * variants are rerun on all of these: on a loaded machine every OpenMP fork and join
- * costs milliseconds, and the fixture geometry makes thousands of tiny ones. */
-static int g_threads = 1;
+ * costs milliseconds, and the fixture geometry makes thousands of tiny ones. So only
+ * the attention step itself (mla_attend, which is what differs between variants) runs
+ * on g_attend_threads; the projections, gate and o_proj around it stay on one thread,
+ * as they are the same calls in every variant and their kernels' thread independence is
+ * test_ops's to prove. */
+static int g_threads = 1, g_attend_threads = 1;
 
 #define CHECK(cond, ...)                                                             \
     do {                                                                             \
@@ -263,10 +267,12 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     mla_project(q, ct, xnew, K->w, c, T, ql);
     const unsigned long long k0 = mla_kvb_calls;
     mla_zprobe = r->z;
+    set_threads(g_attend_threads);
     if (mla_attend(v, r->acc, q, ct, T, K->C, &r->cache, K->w, c, scr, vcap, r->probe)) {
         fprintf(stderr, "variant %s refused the layer\n", MLA_NAME[v]);
         exit(1);
     }
+    set_threads(1);
     mla_zprobe = NULL;
     r->kvb = mla_kvb_calls - k0;
     /* The gate works in place, so keep the pre-gate accumulator for comparison. */
@@ -518,9 +524,14 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
     }
 
     /* 5. thread-count independence: everything above ran on one thread; the variants
-     *    that split work across threads run again on all of them. */
-    if (g_threads > 1) {
-        set_threads(g_threads);
+     *    that split work across threads run again on all of them, on the cases of up to
+     *    48 positions. Those include three blocks of L1 and A (so A's unsynchronised
+     *    block loop is exercised), the 96 heads of K3's geometry and every kind of
+     *    layer; the larger cases take no path they do not, and each would add hundreds
+     *    of fork/joins of the tiny kv_b kernel, which a loaded machine turns into
+     *    seconds (~10 ms apiece measured at load 7 on four cores). */
+    if (g_threads > 1 && N <= 48) {
+        g_attend_threads = g_threads;
         const int vs[3] = {MLA_L1, MLA_EP, MLA_A};
         const Run *base[3] = {&rE, &rEP, &rA};
         for (int i = 0; i < 3; i++) {
@@ -532,7 +543,7 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
                   MLA_NAME[vs[i]]);
             run_free(&r);
         }
-        set_threads(1);
+        g_attend_threads = 1;
     }
 
     run_free(&eng_x); run_free(&eng_l); run_free(&rE); run_free(&rEP); run_free(&rL0);
