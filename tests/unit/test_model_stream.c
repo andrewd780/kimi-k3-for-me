@@ -72,6 +72,37 @@ int main(int argc, char **argv)
                 (unsigned long long)ms.lm_head_bytes_read);
         bad++;
     }
+
+    /* Five positions in one streamed pass: a full register block of positions plus a
+     * remainder on every build. Each row must be the one-position projection to the bit,
+     * and the head must be read once for all five, not once per position. */
+    {
+        enum { NB = 5 };
+        float xb[NB][7], got_b[NB][11], one[11];
+        for (int t = 0; t < NB; t++)
+            for (int i = 0; i < c.hidden; i++)
+                xb[t][i] = x[(i + t) % c.hidden] * (float)(t + 1) - 0.5f * (float)t;
+        const uint64_t before = ms.lm_head_bytes_read;
+        if (k3_model_stream_project_batch(&ms, &got_b[0][0], &xb[0][0], NB) != 0) bad++;
+        if (ms.lm_head_bytes_read - before != (uint64_t)c.hidden * c.vocab * 2) {
+            fprintf(stderr, "a batched projection read the head %llu bytes, not once\n",
+                    (unsigned long long)(ms.lm_head_bytes_read - before));
+            bad++;
+        }
+        for (int t = 0; t < NB; t++) {
+            if (k3_model_stream_project(&ms, one, xb[t]) != 0) bad++;
+            k3_matmul_bf16(ref_logits, xb[t], head, c.hidden, c.vocab);
+            if (memcmp(got_b[t], one, sizeof one) != 0 ||
+                memcmp(got_b[t], ref_logits, sizeof ref_logits) != 0) {
+                fprintf(stderr, "batched streamed logits differ at position %d\n", t);
+                bad++;
+            }
+        }
+        if (k3_model_stream_project_batch(&ms, &got_b[0][0], &xb[0][0], 0) == 0) {
+            fprintf(stderr, "a batched projection of zero positions was accepted\n");
+            bad++;
+        }
+    }
     if (k3_model_stream_embed_row(&ms, got_row, -1) == 0 ||
         k3_model_stream_embed_row(&ms, got_row, c.vocab) == 0) {
         fprintf(stderr, "out-of-range embedding row was accepted\n");

@@ -200,22 +200,37 @@ static void rows_submit(K3Rows *r, int slot, int64_t off, size_t len)
     pthread_mutex_unlock(&r->mu);
 }
 
+/* Called only by the main thread, which is what makes the wait it adds to
+ * row_wait_seconds time that no compute overlapped. */
 static int rows_wait(K3Rows *r)
 {
+    const double start = now_s();
     pthread_mutex_lock(&r->mu);
     while (r->busy) pthread_cond_wait(&r->cv, &r->mu);
     const int result = r->result;
     pthread_mutex_unlock(&r->mu);
+    r->tr->row_wait_seconds += now_s() - start;
     return result;
 }
 
-static void rows_apply(const K3WeightStream *stream, float *y, const float *x, int in, int out)
+/* One pass over a streamed matrix for T positions: position t reads X + t*ldx and writes
+ * Y + t*ldy. Each row tile is read from disk ONCE and applied to every position before the
+ * next tile replaces it, so a T-position batch costs one matrix of I/O rather than T. The
+ * product for a tile is k3_mmw_batch_ld over its rows, whose outputs are bit-identical to
+ * the per-position kernel's (see k3_ops.c), and tiling splits output ROWS only, so every
+ * output is the same float whether the matrix is tiled, resident, or batched. T == 1 takes
+ * the single-position kernel through k3_mmw_batch_ld, so decode runs exactly as before.
+ * matrix_calls counts passes, which is what the no-reread gate in test_offline_cli.py
+ * compares. */
+static void rows_run(const K3RowMatrix *m, float *Y, int ldy, const float *X, int ldx,
+                     int in, int out, int T)
 {
-    const K3RowMatrix *m = (const K3RowMatrix *)stream;
     K3Rows *r = m->owner;
     const size_t esz = m->dtype == K3_DT_BF16 ? 2u : 4u;
+    if (T <= 0) return;
     if (in <= 0 || out <= 0 || (uint64_t)in * (uint64_t)out > INT64_MAX / esz ||
-        (int64_t)((uint64_t)in * (uint64_t)out * esz) != m->nbytes) goto failed;
+        (int64_t)((uint64_t)in * (uint64_t)out * esz) != m->nbytes ||
+        (T > 1 && (ldy < out || ldx < in))) goto failed;
     const size_t row = (size_t)in * esz;
     if (r->tr->read_error || row > r->payload) goto failed;
     const size_t per = r->payload / row;
@@ -231,14 +246,26 @@ static void rows_apply(const K3WeightStream *stream, float *y, const float *x, i
         const int64_t off = m->off + (int64_t)first * (int64_t)row;
         const size_t prefix = r->tr->direct ? (size_t)(off % K3_TRUNK_ALIGN) : 0;
         const void *weight = r->buf[slot] + prefix;
-        k3_mmw(y + first, x, weight, m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32,
-               in, (int)count);
+        k3_mmw_batch_ld(Y + first, ldy, X, ldx, weight,
+                        m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32, in, (int)count, T);
         first = next; count = nnext; slot = 1 - slot;
     }
     return;
 failed:
     r->tr->read_error = 1;
-    if (out > 0) memset(y, 0, (size_t)out * sizeof(float));
+    if (out > 0)
+        for (int t = 0; t < T; t++) memset(Y + (size_t)t * ldy, 0, (size_t)out * sizeof(float));
+}
+
+static void rows_apply(const K3WeightStream *stream, float *y, const float *x, int in, int out)
+{
+    rows_run((const K3RowMatrix *)stream, y, out, x, in, in, out, 1);
+}
+
+static void rows_apply_batch(const K3WeightStream *stream, float *Y, int ldy,
+                             const float *X, int ldx, int in, int out, int T)
+{
+    rows_run((const K3RowMatrix *)stream, Y, ldy, X, ldx, in, out, T);
 }
 
 static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
@@ -249,7 +276,8 @@ static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
     if (narrow) {
         if (r->count == 64) return -1;
         K3RowMatrix *m = &r->matrix[r->count++];
-        m->stream.apply = rows_apply; m->owner = r;
+        m->stream.apply = rows_apply; m->stream.apply_batch = rows_apply_batch;
+        m->owner = r;
         m->off = off; m->nbytes = nb; m->dtype = dt;
         *dest = m;
         return 0;
@@ -260,6 +288,7 @@ static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
     const size_t esz = dt == K3_DT_BF16 ? 2u : 4u;
     size_t done = 0;
     float *dst = (float *)(r->small + start);
+    const double sync_start = now_s();   /* main thread, inside bind: never overlapped */
     while (done < (size_t)take) {
         size_t count = (size_t)take - done;
         if (count > r->payload / esz) count = r->payload / esz;
@@ -273,6 +302,7 @@ static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
         }
         done += count;
     }
+    r->tr->row_sync_seconds += now_s() - sync_start;
     *dest = dst; r->small_used = start + (size_t)take * 4;
     return 0;
 }
@@ -295,14 +325,24 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
     K3Rows *r = (K3Rows *)calloc(1, sizeof *r);
     if (!r) return -1;
     r->tr = tr;
-    for (int L = 0; L < tr->n_layers; L++) {
+    /* Only the layers the config describes are ever bound; a trunk may hold more. */
+    for (int L = 0; L < tr->n_layers && L < c->n_layers; L++) {
         Finder f = { &tr->lay[L] }; K3MemSrc src = { find_in_layer, &f };
         K3LayerBind tmp; size_t small = 0;
-        if (k3_bind_layer_stream(c, L, &tmp, &src, NULL, NULL, &small)) goto bad;
+        if (k3_bind_layer_stream(c, L, &tmp, &src, NULL, NULL, &small)) {
+            fprintf(stderr, "k3_trunk: layer %d's tensors do not match the config's plan "
+                            "(names, dtypes or shapes)\n", L);
+            goto bad;
+        }
         if (small > r->small_cap) r->small_cap = small;
     }
     const uint64_t fixed = r->small_cap + sizeof *r;
-    if (budget <= 0 || (uint64_t)budget < fixed + 6u * K3_TRUNK_ALIGN) goto bad;
+    if (budget <= 0 || (uint64_t)budget < fixed + 6u * K3_TRUNK_ALIGN) {
+        fprintf(stderr, "k3_trunk: a %lld-byte row budget is below the %llu bytes the "
+                        "largest layer's vectors and two minimal row buffers need\n",
+                (long long)budget, (unsigned long long)(fixed + 6u * K3_TRUNK_ALIGN));
+        goto bad;
+    }
     r->cap = (size_t)(((uint64_t)budget - fixed) / 2);
     if (r->cap > (8u << 20) + 2u * K3_TRUNK_ALIGN) r->cap = (8u << 20) + 2u * K3_TRUNK_ALIGN;
     r->cap &= ~(size_t)(K3_TRUNK_ALIGN - 1);
@@ -313,15 +353,22 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
     for (size_t i = 0; i < sizeof cols / sizeof *cols; i++) {
         /* Conservatively allow F32 matrices too; reject an undersized row buffer
          * during opening, before any forward pass can start. */
-        if (cols[i] < 0 || (uint64_t)cols[i] > r->payload / 4) goto bad;
+        if (cols[i] < 0 || (uint64_t)cols[i] > r->payload / 4) {
+            fprintf(stderr, "k3_trunk: a %lld-wide matrix row does not fit a %zu-byte row "
+                            "buffer; raise the trunk budget\n", (long long)cols[i], r->payload);
+            goto bad;
+        }
     }
     r->small = (unsigned char *)malloc(r->small_cap ? r->small_cap : 1);
     if (!r->small || posix_memalign((void **)&r->buf[0], K3_TRUNK_ALIGN, r->cap) ||
-        posix_memalign((void **)&r->buf[1], K3_TRUNK_ALIGN, r->cap)) goto bad;
-    if (pthread_mutex_init(&r->mu, NULL)) goto bad;
-    if (pthread_cond_init(&r->cv, NULL)) { pthread_mutex_destroy(&r->mu); goto bad; }
+        posix_memalign((void **)&r->buf[1], K3_TRUNK_ALIGN, r->cap)) {
+        fprintf(stderr, "k3_trunk: cannot allocate the row pipeline's buffers\n");
+        goto bad;
+    }
+    if (pthread_mutex_init(&r->mu, NULL)) goto no_thread;
+    if (pthread_cond_init(&r->cv, NULL)) { pthread_mutex_destroy(&r->mu); goto no_thread; }
     if (pthread_create(&r->thread, NULL, rows_worker, r)) {
-        pthread_cond_destroy(&r->cv); pthread_mutex_destroy(&r->mu); goto bad;
+        pthread_cond_destroy(&r->cv); pthread_mutex_destroy(&r->mu); goto no_thread;
     }
     r->started = 1; tr->row_state = r;
     tr->nslot = 2; tr->slot_bytes = (int64_t)r->cap;
@@ -330,8 +377,9 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
     printf("trunk: row pipeline, two %zu-byte buffers + %zu-byte current-layer vectors\n",
            r->cap, r->small_cap);
     return 0;
+no_thread:
+    fprintf(stderr, "k3_trunk: cannot start the row pipeline's reader thread\n");
 bad:
-    fprintf(stderr, "k3_trunk: row pipeline metadata, allocation or budget failed\n");
     rows_close(r);
     return -1;
 }
@@ -349,18 +397,26 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
     size_t jn = 0;
     char *txt = slurp(p, &jn);
     if (!txt) { fprintf(stderr, "k3_trunk: cannot read %s\n", p); return -1; }
-    /* The parser arena backs every K3TrunkTensor.name, so it must outlive the whole
-     * K3Trunk. It is owned by the struct and freed in k3_trunk_close. */
+    /* Every K3TrunkTensor.name points at an object key of the parsed tree: the parser
+     * allocates each string on its own (see j_dup in json.h) and the tree owns them. So the
+     * tree, and the arena pointer the parser may also return, belong to the K3Trunk and are
+     * freed together in k3_trunk_close, not before and not at process exit. */
     char *arena = NULL;
     jval *root = json_parse(txt, &arena);
     tr->json_arena = arena;
     tr->json_root = root;
     if (!root) { fprintf(stderr, "k3_trunk: %s is not valid JSON\n", p); free(txt); return -1; }
 
+    /* Every refusal below says which field of trunk.json failed. They guard the offsets
+     * the readers seek to and the pointers the binder hands the kernels, so a malformed
+     * manifest stops here, with its reason, instead of reading outside a layer's run. */
     jval *jl = json_get(root, "layers");
     if (!jl || jl->t != J_ARR) { fprintf(stderr, "k3_trunk: no layers array\n"); goto bad; }
     tr->n_layers = jl->len;
-    if (tr->n_layers <= 0 || tr->n_layers > c->n_layers) goto bad;
+    /* More layers than the config uses are accepted, as they always were: only layers
+     * below the count the caller binds are ever read, and k3_run refuses a trunk with
+     * FEWER layers than it needs. rows_open stops its metadata walk at c->n_layers. */
+    if (tr->n_layers <= 0) { fprintf(stderr, "k3_trunk: %s lists no layers\n", p); goto bad; }
     tr->lay = (K3TrunkLayer *)calloc((size_t)tr->n_layers, sizeof(K3TrunkLayer));
     if (!tr->lay) goto bad;
 
@@ -368,8 +424,16 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
         jval *e = jl->kids[i];
         jval *v;
         K3TrunkLayer *L = &tr->lay[i];
-        if (json_size(e, "file_off", &L->file_off) || json_size(e, "nbytes", &L->nbytes)) goto bad;
-        if (L->file_off < 0 || L->nbytes <= 0 || L->file_off > INT64_MAX - L->nbytes) goto bad;
+        if (json_size(e, "file_off", &L->file_off) || json_size(e, "nbytes", &L->nbytes)) {
+            fprintf(stderr, "k3_trunk: layer %d: file_off and nbytes must be non-negative "
+                            "integers\n", i);
+            goto bad;
+        }
+        if (L->nbytes <= 0 || L->file_off > INT64_MAX - L->nbytes) {
+            fprintf(stderr, "k3_trunk: layer %d: run of %lld bytes at %lld is empty or "
+                            "overflows\n", i, (long long)L->nbytes, (long long)L->file_off);
+            goto bad;
+        }
         jval *ts = json_get(e, "tensors");
         if (!ts || ts->t != J_OBJ) { fprintf(stderr, "k3_trunk: layer %d has no tensors\n", i); goto bad; }
         L->nt = ts->len;
@@ -377,15 +441,27 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
         if (!L->t) goto bad;
         for (int k = 0; k < ts->len; k++) {
             K3TrunkTensor *t = &L->t[k];
-            /* keys live in the parser arena, which is kept for the process lifetime */
+            /* a key of the parsed tree, which k3_trunk_close frees (see above) */
             t->name = ts->keys[k];
             jval *o = ts->kids[k];
-            if (json_size(o, "off", &t->off) || json_size(o, "nbytes", &t->nbytes)) goto bad;
+            if (json_size(o, "off", &t->off) || json_size(o, "nbytes", &t->nbytes)) {
+                fprintf(stderr, "k3_trunk: layer %d, %s: off and nbytes must be non-negative "
+                                "integers\n", i, t->name);
+                goto bad;
+            }
             if ((v = json_get(o, "dtype"))  && v->t == J_STR) t->dtype  = dt_of(v->str);
-            if (t->off < 0 || t->nbytes <= 0 || t->off > L->nbytes ||
-                t->nbytes > L->nbytes - t->off ||
-                (t->dtype == K3_DT_F32 && t->off % 4) ||
-                (t->dtype == K3_DT_BF16 && t->off % 2)) goto bad;
+            if (t->nbytes <= 0 || t->off > L->nbytes || t->nbytes > L->nbytes - t->off) {
+                fprintf(stderr, "k3_trunk: layer %d, %s: %lld bytes at %lld do not fit the "
+                                "layer's %lld-byte run\n", i, t->name, (long long)t->nbytes,
+                        (long long)t->off, (long long)L->nbytes);
+                goto bad;
+            }
+            if ((t->dtype == K3_DT_F32 && t->off % 4) || (t->dtype == K3_DT_BF16 && t->off % 2)) {
+                fprintf(stderr, "k3_trunk: layer %d, %s: offset %lld is not a multiple of "
+                                "its %d-byte element\n", i, t->name, (long long)t->off,
+                        t->dtype == K3_DT_F32 ? 4 : 2);
+                goto bad;
+            }
         }
     }
     free(txt);                      /* arena holds the strings; txt itself is done */
@@ -845,6 +921,26 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
 {
     const uint64_t n = tr->hits + tr->misses;
     printf("trunk [%s]\n", label ? label : "");
+    if (tr->row_state) {
+        /* The row pipeline has no pins, no ring and no timed bind: each matrix is read
+         * tile by tile inside the matmul that uses it, so the ring's bind-wall breakdown
+         * below would divide device time by zero binds and call all of it overlapped.
+         * What is measured instead is split by thread. The main thread's own vector reads
+         * and its waits for a tile are time no compute overlapped; the reader thread's
+         * tile reads are the rest of load_seconds, and whatever of them the main thread
+         * did not wait for ran beside a matmul. */
+        const double reader = tr->load_seconds - tr->row_sync_seconds;
+        printf("  row pipeline: %llu layer binds, %llu matrix passes, two %.2f MiB buffers\n",
+               (unsigned long long)n, (unsigned long long)tr->matrix_calls,
+               (double)tr->row_buffer_bytes / 2.0 / (1 << 20));
+        printf("  read %.2f GB in %.2f s of device time (%.0f MB/s)\n",
+               (double)tr->bytes_read / 1e9, tr->load_seconds,
+               tr->load_seconds > 0 ? (double)tr->bytes_read / 1e6 / tr->load_seconds : 0.0);
+        printf("  reader thread %.2f s of tile reads; main thread waited %.2f s for tiles "
+               "and read layer vectors for %.2f s\n",
+               reader, tr->row_wait_seconds, tr->row_sync_seconds);
+        return;
+    }
     printf("  pinned %d/%d layers, ring %d slots\n", tr->npin, tr->n_layers, tr->nslot);
     printf("  binds %llu, hits %llu (%.1f%%), reads %llu\n",
            (unsigned long long)n, (unsigned long long)tr->hits,

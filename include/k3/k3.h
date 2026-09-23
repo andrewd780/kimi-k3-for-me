@@ -133,7 +133,10 @@ void k3_rmsnorm(float *y, const float *x, const float *w, int n, float eps);
  *   a  = b1 * tanh(gate / b1) * sigmoid(gate)     sigmoid sees the UNCAPPED gate
  *   u  = b2 * tanh(up / b2)
  *   y  = a * u                                    |y| <= b1*b2
- * modeling_kimi_linear.py:75-82 */
+ * modeling_kimi_linear.py:75-82
+ * y may be x itself: y[i] depends only on x[i] and x[n+i], both read before y[i] is
+ * written, so the result lands over the gate half. The batched MoE shared expert and
+ * dense MLP rely on this to avoid a separate activation buffer per position. */
 void k3_situ_glu(float *y, const float *x, int n, float b1, float b2);
 
 /* Causal depthwise convolution with a fused SiLU.
@@ -193,11 +196,13 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  * scratch must hold at least
  *     T*H*(qk_nope+qk_rope)      q
  *   + T*H*(qk_nope+v_head)       kv
- *   + T*(kv_lora+qk_rope)        compressed latent plus the shared rope slot
- *   + q_lora                     transient
- *   + 2*H*v_head                 attention accumulator and gate buffer
+ *   + T*qk_rope                  the shared rope slot
+ *   + T*(kv_lora+qk_rope)        kv_a output: compressed latent plus rope slot
+ *   + T*q_lora                   q_a output
+ *   + 2*T*H*v_head               attention accumulator and gate buffer
  *   + T                          scores
- * floats. Use k3_mla_scratch() rather than recomputing this.
+ * floats; the per-position rows let every projection take all T positions in one pass
+ * (k3_mmw_batch). Use k3_mla_scratch() rather than recomputing this.
  */
 typedef struct {
     /* Tagged by wdt: fp32 when zero (every fixture), bf16 for the real checkpoint. */
@@ -226,6 +231,40 @@ void   k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c
                      float *kvc, float *ropec, int cached, int cap, int kv_latent);
 void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
               int T, float *scratch);
+
+/* A recording hook for tests: NULL, and ignored, everywhere else. Defined in k3_ops.c.
+ *
+ * WHY IT EXISTS
+ *   Some of k3_mla_cached's reduction trees cannot be seen in its output. The softmax
+ *   normaliser z is a double sum, and the probability quotient e/z a double, that
+ *   reach the output only rounded to float, where a different summation order or a
+ *   reciprocal multiply changes the float about once in 2^29 values. Once in 2^29 is
+ *   still a different logit somewhere in a long enough run, and the contract forbids
+ *   it, so a test that holds another loop (the other cache layout, or a replacement
+ *   for it) to the engine's arithmetic must see those doubles themselves. With this
+ *   set, the call copies them out as it forms them.
+ *
+ * WHAT IT RECORDS, per query token t of the call and head h; any pointer may be NULL
+ *   scores  [T][H][n]       the raw scaled scores of positions 0..cached+t, pre-softmax
+ *   z       [T][H]          the softmax normaliser of row (t, h)
+ *   quot    [T][H][n]       e_s / z for positions 0..cached+t, the double that is
+ *                           rounded to the float probability
+ *   acc     [T][H][v_head]  the attention output before the gate
+ *   n is the row stride of scores and quot and must be at least cached + T; the call
+ *   aborts rather than write past it.
+ *
+ * Recording is copies of values the call has already computed, into memory it never
+ * reads back, so it cannot change a bit of the output; with the hook NULL the cost is
+ * one test per (token, head) row and one per probability. Set it only around a call
+ * made from one thread: the pointer is global. */
+typedef struct {
+    int     n;
+    float  *scores;
+    double *z;
+    double *quot;
+    float  *acc;
+} K3MlaTrace;
+extern K3MlaTrace *k3_mla_trace;
 
 /* MoE routing, one token. modeling_kimi_linear.py:703-759.
  *
@@ -278,9 +317,18 @@ enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2, K3_WSTREAM = 3 };
 /* A streamed matrix owns no weight bytes. apply completes every output row before
  * returning; its owner records I/O errors and the caller must check them before
  * consuming a layer's output. Keeping this callback here avoids an I/O dependency
- * in the arithmetic-only library and fixtures. */
+ * in the arithmetic-only library and fixtures.
+ *
+ * apply_batch is OPTIONAL and computes the same product for T positions in one pass:
+ * position t reads X + t*ldx and writes Y + t*ldy. A source that reads its matrix from
+ * disk implements it so the matrix is read ONCE per batch instead of once per position;
+ * each output must be bit-identical to apply on that position alone. NULL means
+ * k3_mmw_batch falls back to T calls of apply, which is always correct. ZERO THIS FIELD
+ * when building one of these on the stack: it is a function pointer. */
 typedef struct K3WeightStream {
     void (*apply)(const struct K3WeightStream *, float *, const float *, int, int);
+    void (*apply_batch)(const struct K3WeightStream *, float *Y, int ldy,
+                        const float *X, int ldx, int in, int out, int T);
 } K3WeightStream;
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
@@ -310,6 +358,58 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
         stream->apply(stream, y, x, in, out);
     }
     else                     k3_matmul(y, x, (const float *)W, in, out);
+}
+
+/* ---- the same product for T positions at once --------------------------------------
+ * Y[t*out + o] = W[o] . X[t*in], for t < T. Prefill, speculative verification and draft
+ * prefill apply every trunk matrix to T positions; one call here reads the matrix once
+ * and widens each weight once per block of positions, where T calls of k3_mmw read and
+ * widen it T times (and, under the row pipeline, reread it from disk T times).
+ *
+ * EXACT, not close: every Y[t*out + o] is BIT-IDENTICAL to what k3_mmw produces for that
+ * position alone -- same operands, same 16-accumulator partition, same fma order within
+ * each accumulator, same reduction tree, same tail -- in the scalar, AVX2 and NEON builds
+ * alike. The definitions in k3_ops.c carry the argument; test_ops checks it bitwise.
+ *
+ * T == 1 goes straight to the single-position kernel, so decode is unchanged. The _ld
+ * forms take row strides so a caller can write a sub-range of output rows or interleave
+ * two products (a [gate | up] layout). K3_WI8 (draft only, no exactness contract) is
+ * applied per position. Y must not overlap X. */
+void k3_matmul_batch(float *Y, const float *X, const float *W, int in, int out, int T);
+void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, int out,
+                          int T);
+void k3_matmul_batch_ld(float *Y, int ldy, const float *X, int ldx, const float *W,
+                        int in, int out, int T);
+void k3_matmul_bf16_batch_ld(float *Y, int ldy, const float *X, int ldx,
+                             const uint16_t *W, int in, int out, int T);
+
+static inline void k3_mmw_batch_ld(float *Y, int ldy, const float *X, int ldx,
+                                   const void *W, int wdt, int in, int out, int T)
+{
+    if (T <= 0) return;
+    if (T == 1) { k3_mmw(Y, X, W, wdt, in, out); return; }   /* decode: unchanged */
+    if (wdt == K3_WBF16) {
+        k3_matmul_bf16_batch_ld(Y, ldy, X, ldx, (const uint16_t *)W, in, out, T);
+    } else if (wdt == K3_WI8) {
+        for (int t = 0; t < T; t++)
+            k3_matmul_q8(Y + (size_t)t * ldy, X + (size_t)t * ldx, W, in, out);
+    } else if (wdt == K3_WSTREAM) {
+        const K3WeightStream *stream = (const K3WeightStream *)W;
+        if (stream->apply_batch) {
+            stream->apply_batch(stream, Y, ldy, X, ldx, in, out, T);
+        } else {
+            for (int t = 0; t < T; t++)
+                stream->apply(stream, Y + (size_t)t * ldy, X + (size_t)t * ldx, in, out);
+        }
+    } else {
+        k3_matmul_batch_ld(Y, ldy, X, ldx, (const float *)W, in, out, T);
+    }
+}
+
+static inline void k3_mmw_batch(float *Y, const float *X, const void *W, int wdt,
+                                int in, int out, int T)
+{
+    k3_mmw_batch_ld(Y, out, X, in, W, wdt, in, out, T);
 }
 
 /* Byte stride of one row for a per-row int8 matrix: the f32 scale plus `in` int8 weights.
@@ -397,7 +497,10 @@ typedef struct {
     int          cache_only;
 } K3MoeW;
 
-size_t k3_moe_scratch(const K3Cfg *c);
+/* Floats of scratch k3_moe and k3_moe_prefill need for T positions. It grew a T when the
+ * trunk matrices of the MoE (down, up, the shared expert) started taking every position in
+ * one pass: the latent, aggregate and shared-expert rows are now held per position. */
+size_t k3_moe_scratch(const K3Cfg *c, int T);
 
 /* Number of routed experts that failed to load and were dropped from a MoE sum.
  * Non-zero means some token was computed with part of its routed contribution missing,
@@ -441,14 +544,14 @@ extern long k3_expert_drops;
  * k and v are rebuilt through kv_b on every use instead of being stored. */
 #define K3_KV_LATENT_BYTES_PER_POS 55296.0
 
-/* idx and wt must each hold topk entries. */
+/* idx and wt must each hold topk entries; scratch holds k3_moe_scratch(c, T) floats. */
 void   k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
               int T, int *idx, float *wt, float *scratch);
 
 /* Batched MoE for prefill over a chunk of T tokens: fetches each unique routed expert
  * from disk ONCE and reuses it across the chunk, cutting prefill expert I/O ~3-4x, with
  * per-token output bit-identical to k3_moe. Streamed source only (w->src != NULL); falls
- * back to k3_moe for the resident path or T <= 1. */
+ * back to k3_moe for the resident path or T <= 1. scratch holds k3_moe_scratch(c, T). */
 void   k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                       int T, int *idx, float *wt, float *scratch);
 
@@ -493,6 +596,72 @@ size_t k3_kda_scratch(const K3Cfg *c, int T);
  * UPDATED IN PLACE so a decode loop can carry it. */
 void   k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                     int T, float *state, float *scratch);
+
+/* ---- tentative sweeps: speculative decode without a replay sweep --------------------
+ * Speculative decode feeds the pending token plus nd drafted tokens through the model in
+ * ONE batch, then keeps only the prefix the model itself would have emitted. Whatever
+ * absorbed the rejected tokens must end up as if they had never been fed.
+ *
+ * MLA needs nothing. Its KV cache is positional: every call writes all of its own rows
+ * before it reads any, and reads only rows at or below its own positions, so rows past the
+ * kept prefix are overwritten by the next call before anything can read them. That holds
+ * for both cache layouts, since the latent layout writes its rows in the same loop.
+ *
+ * KDA is not positional: k3_kda_layer folds every position into the recurrent matrix S
+ * and the ShortConv history in place. What makes it cheap anyway is that the state depends
+ * on each position only through a handful of per-position values:
+ *
+ *   S      k3_kda_step reads, per head, the post-conv L2-normalised k, the post-conv v,
+ *          alpha and beta. q feeds only the output, never S.
+ *   conv   the history is the last conv_k-1 PRE-conv q, k and v inputs; while fewer
+ *          positions than that have been fed, the older ones come from the history the
+ *          sweep started from.
+ *
+ * So a LOGGED call is tentative. It runs on log->work, a one-layer copy of `state`, and
+ * leaves `state` exactly as it found it, while recording those values for each position
+ * as one row of log->rows. Once the caller knows how many positions to keep, it commits
+ * them with k3_kda_advance, which applies the SAME k3_kda_step to the SAME operands in
+ * the SAME order, and copies the right inputs into the history. The committed state is
+ * therefore bit-identical to feeding the kept positions alone, and no weight is read: at
+ * K3 scale the alternative, replaying the accepted positions through a second forward,
+ * re-reads the 108.81 GB trunk and the routed experts. A commit costs O(n * H * D^2)
+ * arithmetic per layer.
+ *
+ * No copy of the whole carried state is ever taken; the recurrence is not invertible in
+ * floating point (undoing the decay would divide), which is why the sweep must not touch
+ * `state` in the first place. The work copy is one layer's state, and one buffer serves
+ * every layer because layers run one after another.
+ *
+ * Several calls can build one log, as a draft model proposing a token at a time does: a
+ * call with row0 > 0 starts from `state` advanced by rows 0..row0-1, replayed into the
+ * work copy, so it computes exactly what it would have computed had the earlier calls
+ * updated `state` in place.
+ *
+ * rows holds cap rows of k3_kda_log_row() floats, P = H*D:
+ *   [0,P) k after conv and L2 norm   [P,2P) v after conv   [2P,3P) alpha
+ *   [3P,3P+H) beta after its sigmoid   then q, k and v BEFORE conv, P each
+ * At K3 size a row is 295,296 bytes per KDA layer, 20.38 MB per position across the 69
+ * KDA layers; the work copy is 6.73 MB. */
+typedef struct {
+    float *rows;    /* cap * k3_kda_log_row() floats, for ONE KDA layer               */
+    float *work;    /* k3_kda_state_floats() floats, never `state` itself; one buffer
+                     * may serve every layer. Unused by k3_kda_advance.                */
+    int    cap;     /* rows `rows` holds; a call's positions past it are not recorded  */
+    int    row0;    /* row this call's first position lands in, 0 <= row0 <= cap      */
+} K3KdaLog;
+
+size_t k3_kda_log_row(const K3Cfg *c);       /* floats per position per KDA layer     */
+size_t k3_kda_state_floats(const K3Cfg *c);  /* floats of one KDA layer's `state`     */
+
+/* k3_kda_layer as a tentative call when log is non-NULL: same output bits, `state` left
+ * untouched, positions recorded from row log->row0. state may be NULL (zero history). */
+void   k3_kda_layer_log(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
+                        int T, float *state, float *scratch, const K3KdaLog *log);
+
+/* Commit the first n recorded rows: advance `state` in place exactly as feeding those n
+ * positions would have. 0 <= n <= log->cap, rows 0..n-1 must have been recorded by calls
+ * made while `state` held its current value, and log->work is not used. */
+void   k3_kda_advance(float *state, const K3KdaLog *log, int n, const K3Cfg *c);
 
 /* One decoder layer, reproducing _forward_attn_residual (modeling_kimi_linear.py
  * :984-1046) statement for statement.
@@ -548,6 +717,15 @@ void   k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                             int T, float *state, float *scratch,
                             float *kvc, float *ropec, int cached, int cap,
                             int kv_latent);
+
+/* The same, with a KDA layer run as a tentative, logged call (see K3KdaLog): its carried
+ * state is left untouched until k3_kda_advance commits the positions kept. Ignored on an
+ * MLA layer, whose cache is positional. kda_log == NULL is exactly k3_decoder_layer_inc. */
+void   k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
+                                const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                                int T, float *state, float *scratch,
+                                float *kvc, float *ropec, int cached, int cap,
+                                int kv_latent, const K3KdaLog *kda_log);
 
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* Dequantise OCP MX FP4, the format Kimi K3 ships its routed experts in.

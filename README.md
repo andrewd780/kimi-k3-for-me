@@ -432,7 +432,8 @@ printf 'La capitale de la France est' > /tmp/p.txt
 |---|---|---|---|
 | `--preset` | `NAME` | none | `laptop` · `desktop` · `workstation` · `server` · `max`. Sets both budgets below |
 | `--trunk` | `DIR` | off | the packed trunk directory from step 5. **This is what enables streaming.** Without it the trunk loads fully resident, around 113.5 GB |
-| `--trunk-gb` | `X` | 16 | budget for pinned layers plus the streaming ring |
+| `--trunk-gb` | `X` | 16 | budget for pinned layers plus the streaming ring; under `--trunk-rows`, a cap on the row buffers instead |
+| `--trunk-rows` | none | off | stream each trunk matrix through two double-buffered row tiles of at most 8 MiB, plus the current layer's vectors, instead of whole layers through a ring; nothing is pinned and every output bit is unchanged. A batch of positions reads each matrix once. The memory plan charges the whole `--trunk-gb` budget, so pass a small one. Needs `--trunk`; not with `--trunk-gb auto`, `--preset auto` or `--draft-trunk`. No speedup claimed. [Results](docs/notes/research-results.md) |
 | `--cache-gb` | `X` | 64 | budget for the routed-expert LRU cache |
 | `--ultra-low-memory` | none | off | stream exact embedding rows and lm_head chunks; full recompute also reuses one recurrent-state slot. Requires `--trunk` |
 | `--stream-lm-head` | none | off | stream only the output table; give the net freed memory to `--trunk-gb` to fund another ring slot. [Mechanism and limits](docs/notes/stream-lm-head.md) |
@@ -456,7 +457,8 @@ shorthand. Order matters if you mix them: a later flag wins, so
 |---|---|---|---|
 | `--gen` | `N` | 8 | tokens to generate. Ceiling 4096; prompts may be up to 32768 tokens |
 | `--incremental` | none | off | carry the KV cache and the recurrent state between tokens instead of re-running the whole prefix |
-| `--kv-latent` | none | off | cache MLA's compressed latent instead of the expanded k and v and rebuild them on use: 0.055 MB per position instead of 2.37, paid for with a `kv_b` matmul per cached position per step. Logits are bitwise identical. Needs `--incremental`. See [the note](docs/notes/kv-latent.md) |
+| `--kv-latent` | none | off | cache MLA's compressed latent instead of the expanded k and v and rebuild them on use: 0.055 MB per position instead of 2.37, paid for with two `kv_b` matmuls per cached position per query token (one to score it, one to weight its value). Logits are bitwise identical. Needs `--incremental`. See [the note](docs/notes/kv-latent.md) |
+| `--spec` | `N` | off | speculative decode: draft up to N tokens (at most 8) by n-gram lookup and verify them in one batched sweep. Output is identical to serial decode. A sweep reads the trunk and lm_head once for all its positions, though `--kv-latent` under `--trunk-rows` still reads `kv_b` for every cached position it rebuilds; each extra position costs its own experts and arithmetic. A rejected draft costs no second sweep: only the accepted positions are committed, from a per-position log of the recurrent layers' inputs that the memory plan counts. Needs `--incremental`; not with `--ultra-low-memory`. No full-checkpoint speedup measured. [Drafting study](docs/notes/spec-replay.md) |
 | `--tok` | `DIR` | none | directory holding `tiktoken.model` and `tokenizer_config.json` |
 
 **Pass `--incremental` for any generation of length.** Without it every step re-runs the
@@ -472,6 +474,7 @@ is a pure speed choice.
 | `--layers` | `N` | bind only the first N layers, for partial shard sets |
 | `--out` | `FILE` | JSON results (default `k3_run.json`) |
 | `--dump-logits` | `PATH` | float32 logits for the first step, for elementwise comparison |
+| `--dump-all-logits` | `PATH` | float32 logits behind every generated token, in order, one vocabulary-length vector each, so two runs compare step by step. Under `--spec` it holds one sweep's worth, counted in the memory plan |
 | `--dump-cache-trace` | `DIR` | writes `expert_hist.json` and `expert_trace.bin`, which `tools/sim_cache.py` replays |
 
 ### Exit codes
@@ -627,7 +630,7 @@ needs nothing at all, and `--layers N` runs against partial shard sets.
 
 **macOS, Windows, WSL?** Linux is the reference platform. macOS/arm64 builds with plain
 `make` (see the Makefile's platform block). Windows builds natively too, via MSYS2's
-MinGW-w64 GCC (`pacman -S mingw-w64-x86_64-gcc`, then open the "MSYS2 MinGW x64" shell
+MinGW-w64 GCC (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp`, then open the "MSYS2 MinGW x64" shell
 specifically -- `make`, `make test`, and `make test-all` all pass every gate unmodified,
 including the full-model oracle and tokenizer parity against real Kimi K3 weights.
 Four Linux-only calls needed porting -- `O_DIRECT`, `pread`, `posix_memalign`, and
@@ -1482,11 +1485,13 @@ tolerance: atol=1.0e-05 rtol=1.0e-04  (from MANIFEST.json)
         H=4 qh=32 (nope 24 + rope 8) v=16 kv_lora=32 scale=0.176777
   PASS  mxfp4          64 rows x 3584 elems, EXACT on released checkpoint bytes
   PASS  matmul_bf16   n=129    bit-identical to k3_matmul
-22 passed, 0 failed, 0 skipped
+24 passed, 0 failed, 0 skipped
 ```
 
-The worst case across all 22 kernels is 8 percent of the allowed tolerance, and two are
-exact rather than merely close.
+That is an excerpt of 24 checks. The worst tolerance-based comparison uses 58 percent of
+the allowed tolerance (a whole KDA layer), and five checks demand identical bits: MXFP4
+on released checkpoint bytes, the bf16 and batched matmuls, the router's blocked form
+and the batched MoE prefill.
 
 ![Where one token goes on the floor configuration: 80% of it is waiting on disk](docs/images/token_time_split.png)
 

@@ -111,6 +111,7 @@ endfunction()
 k3_add_test(test_quality tests/unit/test_quality.c)
 k3_add_test(test_kda_exact tests/unit/test_kda_exact.c)
 k3_add_test(test_ops    tests/unit/test_ops.c)
+k3_add_test(test_matmul_exact tests/unit/test_matmul_exact.c)
 k3_add_test(test_cache  tests/unit/test_cache.c)
 k3_add_test(test_st     tests/unit/test_st.c)
 k3_add_test(test_model_stream tests/unit/test_model_stream.c)
@@ -118,7 +119,11 @@ k3_add_test(test_cfg    tests/unit/test_cfg.c)
 k3_add_test(test_tok    tests/unit/test_tok.c)
 k3_add_test(scale_test  tests/unit/scale_test.c)
 k3_add_test(test_trunk  tests/unit/test_trunk.c)
+# The rows-only build: 93 layers whose dense matrices span several row tiles.
+k3_add_test(test_trunk_rows tests/unit/test_trunk.c)
+target_compile_definitions(test_trunk_rows PRIVATE K3_TEST_ROWS_ONLY)
 k3_add_test(k3_model    tests/unit/k3_model.c)
+k3_add_test(test_mla_variants tests/unit/test_mla_variants.c)
 
 set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 
@@ -128,11 +133,14 @@ set(FIX ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures)
 add_test(NAME quality COMMAND test_quality)
 add_test(NAME kda_exact COMMAND test_kda_exact)
 add_test(NAME ops        COMMAND test_ops   ${FIX}/ops)
+add_test(NAME matmul_exact COMMAND test_matmul_exact)
 add_test(NAME cache      COMMAND test_cache ${FIX}/cache)
 add_test(NAME config     COMMAND test_cfg   fixture ${FIX}/ref_k3.json)
 add_test(NAME scale      COMMAND scale_test)
 add_test(NAME trunk      COMMAND test_trunk)
+add_test(NAME trunk_rows COMMAND test_trunk_rows)
 add_test(NAME oracle     COMMAND k3_model   ${FIX})
+add_test(NAME mla_variants COMMAND test_mla_variants)
 
 # The negative half of the config contract. Each fixture is the working flat config with
 # exactly one field mutated, so a rejection can only come from that field. Without these
@@ -169,6 +177,15 @@ target_link_libraries(bench_kda PRIVATE k3)
 
 add_executable(bench_kernels benchmarks/bench_kernels.c)
 target_link_libraries(bench_kernels PRIVATE k3)
+
+add_executable(bench_batch benchmarks/bench_batch.c)
+target_link_libraries(bench_batch PRIVATE k3)
+
+add_executable(bench_router benchmarks/bench_router.c)
+target_link_libraries(bench_router PRIVATE k3)
+
+add_executable(bench_mla benchmarks/bench_mla.c)
+target_link_libraries(bench_mla PRIVATE k3)
 
 install(TARGETS k3_cli RUNTIME DESTINATION bin)
 install(DIRECTORY include/k3 DESTINATION include)

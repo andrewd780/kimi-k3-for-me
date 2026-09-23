@@ -123,13 +123,19 @@ int main(void)
     char path[] = "/tmp/k3-uring-XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) return 2;
+    /* Until the reopen below unlinks it, the file exists under its name, so every setup
+     * failure removes it: returning early would leave up to 64 MiB in /tmp per failed
+     * run. After the unlink the file lives only as long as the descriptor. */
     unsigned char *buf = NULL;
-    if (posix_memalign((void **)&buf, 4096, (size_t)MAX_QD * BLOCK)) return 2;
+    if (posix_memalign((void **)&buf, 4096, (size_t)MAX_QD * BLOCK)) {
+        buf = NULL;
+        goto setup_failed;
+    }
     for (unsigned block = 0; block < BLOCKS; block++) {
         for (unsigned j = 0; j < BLOCK; j++) buf[j] = (unsigned char)(block * 17 + j * 13);
-        if (write(fd, buf, BLOCK) != BLOCK) return 2;
+        if (write(fd, buf, BLOCK) != BLOCK) goto setup_failed;
     }
-    if (fsync(fd)) return 2;
+    if (fsync(fd)) goto setup_failed;
     close(fd);
     fd = open(path, O_RDONLY | O_DIRECT); unlink(path);
     if (fd < 0) { printf("{\"status\":\"O_DIRECT_unavailable\",\"errno\":%d}\n", errno); free(buf); return 0; }
@@ -177,4 +183,7 @@ int main(void)
     puts("]}");
     ring_close(&ring); close(fd); free(buf);
     return 0;
+setup_failed:
+    close(fd); unlink(path); free(buf);
+    return 2;
 }

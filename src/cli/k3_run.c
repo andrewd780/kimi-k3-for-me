@@ -195,6 +195,15 @@ static void k3_state_fp(const K3Cfg *c, int32_t *fp)
 }
 
 #define K3_SPEC_MAX 8
+
+/* Positions whose logits one lm_head pass serves when a run needs EVERY position's logits
+ * (--tf-check, --score-prompt, and a --spec verify sweep of spec_n + 1 <= K3_SPEC_MAX + 1
+ * positions). One pass of the batched kernel covers 16 positions at hidden 7168 (see
+ * k3_mm_pass in k3_ops.c), so for a resident head a larger block would buy no fewer
+ * passes. A streamed head (--stream-lm-head, --ultra-low-memory) is read from disk once
+ * per block, 16x less than once per position; a larger block would cut that further but
+ * costs a vocab row (0.66 MB) per position, and 16 keeps the buffer at 10.5 MB. */
+#define K3_LOGIT_ROWS 16
 /* Longest-suffix n-gram drafting for --spec: if the last n ids (n=3, then 2) already
  * appeared earlier in the sequence, propose the ids that followed them there. Costs
  * nothing when it misses: no draft means the step runs exactly as without --spec. The
@@ -320,10 +329,18 @@ static int spec_draft(const int *seq, int T, int cap, int *out)
 {
     /* Evidence-gated: a draft only fires when the suffix n-gram's occurrences AGREE on
      * what follows. Measured on the released checkpoint, an eager most-recent-match
-     * drafter went 0.91x on code: partial acceptances pay a replay sweep, so weak
-     * drafts are worse than no drafts. Rules: match length 4 (then 3); if the n-gram
-     * occurred more than once, every occurrence must propose the same next id, and the
-     * draft stops at the first position where historical continuations diverge. */
+     * drafter went 0.91x on code, when every partial acceptance also paid a replay sweep.
+     * The replay was not the whole cost. Verify sweeps are tentative now (see the
+     * speculative step in main), yet the teacher-forced replay of this rule and of an
+     * eager drafter (docs/notes/spec-replay.md, a proxy, not K3) still has eager drafts of
+     * up to 8 ids losing on every non-edit corpus without any replay: 0.93x to 0.95x at
+     * 8 GB and 0.57x to 0.68x with the trunk resident, against 1.07x to 1.13x and 0.87x
+     * to 0.92x for this rule (which at --spec 8 loses there too). A rejected draft still
+     * costs its position's experts and arithmetic in the sweep. So the gate stays; the
+     * study's cost-aware stop rule is the candidate to replace it, not yet measured on
+     * K3. Rules: match length 4 (then 3); if the n-gram occurred more than once, every
+     * occurrence must propose the same next id, and the draft stops at the first
+     * position where historical continuations diverge. */
     if (cap > K3_SPEC_MAX) cap = K3_SPEC_MAX;
     for (int n = 4; n >= 3; n--) {
         if (T < n + 1) continue;
@@ -379,7 +396,11 @@ static void usage(FILE *f)
 "  --trunk DIR           packed trunk directory; enables streaming (see scripts/)\n"
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
 "  --trunk-rows          exact double-buffered matrix rows; needs --trunk\n"
-"                        bounded buffers, no pins; batched prompts reread matrices\n"
+"                        bounded buffers, no pins; a batch of positions reads each\n"
+"                        matrix once (--kv-latent still rereads kv_b per position).\n"
+"                        --trunk-gb (default 16) then caps two row buffers of at most\n"
+"                        8 MiB each plus the current layer's vectors, and the memory\n"
+"                        plan charges the whole budget; pass a small one\n"
 "  --cache-gb X          routed-expert cache budget\n"
 "  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
 "                        recurrent-state slot during full recompute; needs --trunk\n"
@@ -418,9 +439,14 @@ static void usage(FILE *f)
 "  --draft-trunk-gb X    trunk budget for the draft model (default 6)\n"
 "  --spec N              speculative decode: draft up to N tokens by n-gram lookup and\n"
 "                        verify them in ONE batched sweep. Output is identical to\n"
-"                        serial decode by construction; needs --incremental. An extra\n"
-"                        verified position costs ~22%% of a serial token when the trunk\n"
-"                        streams, so repetitive text decodes up to several times faster\n"
+"                        serial decode by construction; needs --incremental. A sweep\n"
+"                        reads the trunk and lm_head once for all its positions (but\n"
+"                        --kv-latent with --trunk-rows rereads kv_b for every cached\n"
+"                        position it rebuilds); each extra position still costs its\n"
+"                        own experts and arithmetic.\n"
+"                        No full-checkpoint speedup has been measured.\n"
+"                        A rejected draft costs no second sweep: the sweep is tentative\n"
+"                        and only the accepted positions are committed\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "diagnostics:\n"
@@ -433,6 +459,9 @@ static void usage(FILE *f)
 "  --config PATH         model config; defaults to <model_dir>/config.json\n"
 "  --layers N            bind only the first N layers (partial shard sets)\n"
 "  --dump-logits PATH    write float32 logits for the first step\n"
+"  --dump-all-logits PATH  write the float32 logits behind EVERY generated token, in\n"
+"                        order, one vocabulary-length vector each, so two runs can be\n"
+"                        compared step by step rather than at the first step only\n"
 "  --dump-cache-trace D  write expert_hist.json and expert_trace.bin into D, for\n"
 "                        offline analysis with tools/sim_cache.py\n"
 "  --out FILE            JSON results (default k3_run.json)\n"
@@ -581,6 +610,24 @@ typedef struct {
     const int   *score_targets; /* optional next-token targets for each input position */
     double      *score_nll;
     int          score_start;   /* first scored input position, zero-based */
+    /* [logit_rows][vocab]: when every position needs logits, lm_head is applied to this
+     * many positions per pass. NULL (or 1 row) projects one position at a time. */
+    float       *logit_block;
+    int          logit_rows;
+    /* Tentative sweeps for speculative decode: log rows for each KDA layer (see K3KdaLog
+     * in k3.h), allocated only with --spec or --draft-trunk. Only KDA layers carry state
+     * that absorbs a rejected token, so the MLA layers get no log. log_row0 >= 0 makes
+     * the next forward() tentative: KDA state untouched, positions recorded from that row
+     * on, until spec_commit applies the ones kept. */
+    float       *kda_log;
+    float       *kda_work;     /* one KDA layer's state; every layer, both models, share it */
+    int         *kda_slot;     /* [n_layers] -> dense KDA index, or -1 */
+    int          n_kda, log_cap, log_row0;
+    size_t       log_floats;   /* floats of log rows per KDA layer */
+    /* --dump-all-logits: the logit vector behind every position of a verify sweep. */
+    float       *all_logits;
+    long         forwards;     /* forward() calls, so the report can show there was no
+                                * replay: one per decode step */
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -591,9 +638,11 @@ typedef struct {
  * yields a token drawn from uninitialised memory, printed as though it were output. */
 /* arg_all: when non-NULL, receives argmax(logits) for EVERY position 0..T-1, which is
  * what batched greedy verification consumes. logits_last still gets the final position's
- * full vector either way. The extra cost is one lm_head matmul per additional position,
- * pure RAM-resident compute; measured, an extra verified position costs ~22% of a serial
- * token at streamed-trunk budgets, which is the entire economics of --spec. */
+ * full vector either way. The extra cost is lm_head applied to the additional positions,
+ * which with a logit block is one pass over the head per block of positions rather than
+ * one per position. (The ~22% of a serial token per extra verified position once measured
+ * at streamed-trunk budgets predates batching the trunk matrices and the head over
+ * positions; it needs remeasuring.) */
 static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
                    float *logits_last, float *scratch, float *h, float *br, float *kstate,
                    int *arg_all)
@@ -603,6 +652,7 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     const int P = c->kda_heads * c->kda_head_dim;
     const size_t kper = (size_t)P * c->kda_head_dim + (size_t)3 * P * (c->conv_k - 1);
 
+    w->forwards++;
     for (int t = 0; t < T; t++) {
         if (w->ultra) {
             if (k3_model_stream_embed_row(&w->ms, h + (size_t)t * E, ids[t]) != 0) {
@@ -664,9 +714,19 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
                                  w->ropec + rpper * (size_t)mi,
                                  w->cached, w->kv_cap, w->kv_latent);
         } else {
-            k3_decoder_layer_inc(h, br, &nb, &w->lay[L].lay, c, L, T,
-                                 layer_state, scratch,
-                                 NULL, NULL, 0, 0, 0);
+            /* In a tentative sweep a KDA layer leaves its state alone and records its
+             * recurrence inputs instead; see the speculative step in main(). */
+            K3KdaLog rlog, *rl = NULL;
+            if (w->kda_log && w->log_row0 >= 0 && w->kda_slot[L] >= 0) {
+                rlog.rows = w->kda_log + w->log_floats * (size_t)w->kda_slot[L];
+                rlog.work = w->kda_work;
+                rlog.cap  = w->log_cap;
+                rlog.row0 = w->log_row0;
+                rl = &rlog;
+            }
+            k3_decoder_layer_inc_log(h, br, &nb, &w->lay[L].lay, c, L, T,
+                                     layer_state, scratch,
+                                     NULL, NULL, 0, 0, 0, rl);
         }
         if (w->trunk && w->trunk->read_error) {
             fprintf(stderr, "trunk row read failed at layer %d; refusing partial output\n", L);
@@ -697,22 +757,44 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
 
     float *nrm = scratch;
     if (arg_all || w->score_targets) {
-        for (int t = 0; t < T; t++) {
-            if (w->score_targets && t < w->score_start) continue;
-            k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
+        /* Every position's logits, lm_head applied to a block of positions per pass
+         * (k3_mmw_batch, or one streamed pass over the head per block) instead of once
+         * per position: verifying 9 speculative positions otherwise reads the 2.35 GB
+         * head 9 times. Each position's vector is bit-identical to the one-position
+         * projection, and positions before score_start are still never projected.
+         * nrm holds at most T rows, well inside the layer scratch. */
+        const int first = w->score_targets ? w->score_start : 0;
+        const int rows = (w->logit_block && w->logit_rows > 1) ? w->logit_rows : 1;
+        float *blk = rows > 1 ? w->logit_block : logits_last;
+        int last = -1;                        /* row of blk holding the final position */
+        for (int t0 = first; t0 < T; t0 += rows) {
+            const int n = T - t0 < rows ? T - t0 : rows;
+            for (int j = 0; j < n; j++)
+                k3_rmsnorm(nrm + (size_t)j * E, h + (size_t)(t0 + j) * E, w->mb.norm, E,
+                           c->rms_eps);
             if (w->stream_lm_head) {
-                if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
+                if (k3_model_stream_project_batch(&w->ms, blk, nrm, n) != 0) return -1;
             } else {
-                k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+                k3_mmw_batch(blk, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab, n);
             }
-            if (arg_all) arg_all[t] = argmax_(logits_last, c->vocab);
-            if (w->score_targets && k3_token_nll(logits_last, c->vocab,
-                                                 w->score_targets[t], w->score_nll + t)) {
-                fprintf(stderr, "invalid logits/target at score position %d\n", t + 1);
-                return -1;
+            for (int j = 0; j < n; j++) {
+                const int t = t0 + j;
+                const float *lt = blk + (size_t)j * c->vocab;
+                if (arg_all) arg_all[t] = argmax_(lt, c->vocab);
+                if (arg_all && w->all_logits && t <= K3_SPEC_MAX)
+                    memcpy(w->all_logits + (size_t)t * c->vocab, lt,
+                           (size_t)c->vocab * sizeof(float));
+                if (w->score_targets && k3_token_nll(lt, c->vocab,
+                                                     w->score_targets[t], w->score_nll + t)) {
+                    fprintf(stderr, "invalid logits/target at score position %d\n", t + 1);
+                    return -1;
+                }
             }
+            last = n - 1;
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
+        if (blk != logits_last && last >= 0)
+            memcpy(logits_last, blk + (size_t)last * c->vocab, (size_t)c->vocab * sizeof(float));
         return 0;
     }
     k3_rmsnorm(nrm, h + (size_t)(T - 1) * E, w->mb.norm, E, c->rms_eps);
@@ -722,6 +804,61 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
     }
     return 0;
+}
+
+/* Commit the first n positions of a tentative sweep (or of a run of tentative draft
+ * calls) to every KDA layer's carried state. No weights are read and no forward runs: see
+ * k3_kda_advance for why the result is the state serial decode holds after those
+ * positions, to the bit. MLA layers need nothing, because their KV rows are positional
+ * and the caller sets `cached`. */
+static void spec_commit(const Weights *w, const K3Cfg *c, float *kstate, int n)
+{
+    const size_t kper = k3_kda_state_floats(c);
+    for (int L = 0; L < w->n_bound; L++) {
+        if (w->kda_slot[L] < 0) continue;
+        K3KdaLog rl;
+        rl.rows = w->kda_log + w->log_floats * (size_t)w->kda_slot[L];
+        rl.work = NULL;
+        rl.cap  = w->log_cap;
+        rl.row0 = 0;
+        k3_kda_advance(kstate + kper * (size_t)L, &rl, n, c);
+    }
+}
+
+/* How many of a step's emitted ids the output loop keeps: all of them, unless --gen runs
+ * out or a --stop-id is reached first. A speculative step needs this BEFORE it appends
+ * anything, because the carried state must end exactly one position short of the last
+ * kept id, the same place serial decode would leave it; otherwise --save-state would write
+ * a state that has consumed ids the sequence does not contain. */
+static int emit_keep(const int *emit, int emitn, int nout, int gen, int T, int Tmax,
+                     const int *stop_id, int n_stop)
+{
+    int k = 0;
+    while (k < emitn && nout + k < gen && T + k < Tmax) {
+        const int id = emit[k++];
+        for (int s = 0; s < n_stop; s++)
+            if (id == stop_id[s]) return k;
+    }
+    return k;
+}
+
+/* `cap` log rows per KDA layer among the first nl, and nothing for MLA layers. work is
+ * the one-layer work state the tentative calls run on; NULL allocates it, and a second
+ * model passes the first one's, since the two never run at the same time. Returns 0, or
+ * -1 when out of memory. */
+static int spec_log_alloc(Weights *w, const K3Cfg *c, int nl, int cap, float *work)
+{
+    w->kda_slot = (int *)malloc((size_t)nl * sizeof(int));
+    if (!w->kda_slot) return -1;
+    w->n_kda = 0;
+    for (int L = 0; L < nl; L++) w->kda_slot[L] = k3_is_mla(c, L) ? -1 : w->n_kda++;
+    w->log_cap = cap;
+    w->log_row0 = -1;
+    w->log_floats = (size_t)cap * k3_kda_log_row(c);
+    w->kda_log = (float *)malloc(w->log_floats * (size_t)(w->n_kda > 0 ? w->n_kda : 1)
+                                 * sizeof(float));
+    w->kda_work = work ? work : (float *)malloc(k3_kda_state_floats(c) * sizeof(float));
+    return (w->kda_log && w->kda_work) ? 0 : -1;
 }
 
 int main(int argc, char **argv)
@@ -749,7 +886,7 @@ int main(int argc, char **argv)
     const char *trace_dir = NULL;
     const char *expert_profile = NULL;
     int pin_experts = 0;
-    const char *logits_path = NULL;
+    const char *logits_path = NULL, *all_logits_path = NULL;
     const char *prompt_text = NULL, *prompt_file = NULL, *tok_dir = NULL;
     const char *cfg_path = NULL;
     int gen = 8, want_layers = -1;
@@ -763,7 +900,7 @@ int main(int argc, char **argv)
      * past the end-of-message marker that a caller will only throw away. */
     int stop_id[8]; int n_stop = 0, hit_stop = 0, stopped_at = -1;
     double cache_gb = 64.0, trunk_gb = 16.0;
-    double memory_plan_bytes = 0.0;
+    double memory_plan_bytes = 0.0, all_logits_bytes = 0.0;
     int budget_auto = 0;
     int spec_n = 0;
     int tf_check = 0;
@@ -847,6 +984,8 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--expert-pipeline")) expert_pipeline = 1;
         else if (!strcmp(argv[i], "--stream-lm-head")) stream_lm_head = 1;
         else if (!strcmp(argv[i], "--dump-logits") && i + 1 < argc) logits_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-all-logits") && i + 1 < argc)
+            all_logits_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-cache-trace") && i + 1 < argc) trace_dir = argv[++i];
         else if (!strcmp(argv[i], "--preset") && i + 1 < argc && !strcmp(argv[i + 1], "auto")) {
             /* Not in the table: the table is fixed budgets, auto is computed from this
@@ -887,8 +1026,12 @@ int main(int argc, char **argv)
         return 2;
     }
     const int head_streamed = ultra || stream_lm_head;
+    /* An omitted --trunk-gb is not refused: the 16 GB default becomes the row budget,
+     * which the row pipeline caps at two 8 MiB buffers plus the current layer's vectors,
+     * and which the memory plan below charges in full. Only a computed (auto) budget and
+     * a draft trunk are refused. */
     if (trunk_rows && (!trunk_dir || draft_dir || budget_auto)) {
-        fprintf(stderr, "--trunk-rows needs --trunk and an explicit --trunk-gb; "
+        fprintf(stderr, "--trunk-rows needs --trunk; --trunk-gb auto, --preset auto and "
                         "draft trunks are unsupported\n");
         return 2;
     }
@@ -902,7 +1045,8 @@ int main(int argc, char **argv)
     }
     if (score_prompt) {
         if (incremental || load_state || save_state || spec_n || draft_dir || tf_check ||
-            reread_prompt || n_stop || want_layers != -1 || trace_dir || logits_path) {
+            reread_prompt || n_stop || want_layers != -1 || trace_dir || logits_path ||
+            all_logits_path) {
             fprintf(stderr, "--score-prompt requires a complete teacher-forced model; "
                             "generation/state/partial-layer diagnostics cannot be combined\n");
             return 2;
@@ -933,6 +1077,19 @@ int main(int argc, char **argv)
                 "use deterministic serial decode\n");
         return 2;
     }
+    /* Speculative depth is settled here rather than where its buffers are allocated,
+     * because the rollback log is sized from it and the memory plan below must count it. */
+    if (spec_n < 0) spec_n = 0;
+    if (spec_n > 0 && !incremental) {
+        fprintf(stderr, "--spec needs --incremental; ignoring --spec\n");
+        spec_n = 0;
+    }
+    if (draft_dir && (!incremental || !trunk_dir)) {
+        fprintf(stderr, "--draft-trunk needs --incremental and --trunk; ignoring\n");
+        draft_dir = NULL;
+    }
+    if (draft_dir && spec_n <= 0) spec_n = 4;
+    if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
     {
         int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
         if (nsrc == 0) {
@@ -1232,6 +1389,16 @@ int main(int argc, char **argv)
         printf("resident trunk: %s in RAM (large matrices kept in the checkpoint's bf16,\n"
                "  fp32 only for the norms and biases that kernels read elementwise)\n", b1);
 
+    /* Runs that need every position's logits project them a block at a time: see
+     * K3_LOGIT_ROWS and forward(). Sized here so the memory plan below counts it. */
+    int logit_rows = 1;
+    if (score_prompt)    logit_rows = np - score_start;   /* the positions scored       */
+    else if (tf_check)   logit_rows = np;                 /* every position             */
+    else if (spec_n > 0) logit_rows = spec_n + 1;         /* one verify sweep; a draft
+                                                           * trunk has set spec_n above */
+    if (logit_rows > K3_LOGIT_ROWS) logit_rows = K3_LOGIT_ROWS;
+    if (logit_rows < 1) logit_rows = 1;
+
     /* Add up EVERYTHING before allocating anything. Being OOM-killed halfway through
      * binding wastes the whole load and reports nothing useful; a refusal with the two
      * numbers side by side says exactly what box this needs. */
@@ -1255,7 +1422,8 @@ int main(int argc, char **argv)
             if (cached > scratch) scratch = cached;
         }
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
-                              + (double)scratch + (double)c.vocab) * 4;
+                              + (double)scratch + (double)c.vocab
+                              + (logit_rows > 1 ? (double)logit_rows * c.vocab : 0.0)) * 4;
         /* The KV cache MUST be in this total: it is the only term that grows with
          * context, so a guard that omits it is blind to the one thing it exists to
          * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
@@ -1269,8 +1437,25 @@ int main(int argc, char **argv)
             ? (double)Tm * n_mla
               * ((double)kv_floats_per_pos(&c, kv_latent) + c.qk_rope) * 4
             : 0.0;
-        const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv;
+        /* Speculative decode: per KDA layer, one log row per position a sweep can commit
+         * (spec_n + 1, for the exact model and again for a hybrid draft), plus a single
+         * layer's work state that every tentative call runs on. No copy of the carried
+         * state, and nothing for MLA layers. See the allocation below. */
+        int n_kda = 0;
+        for (int L = 0; L < NL; L++) if (!k3_is_mla(&c, L)) n_kda++;
+        const double w_spec = spec_n > 0
+            ? 4.0 * ((double)n_kda * (spec_n + 1) * (draft_dir ? 2.0 : 1.0)
+                     * (double)k3_kda_log_row(&c) + (double)k3_kda_state_floats(&c))
+            : 0.0;
+        /* --dump-all-logits under --spec (or a draft trunk) keeps every position of a verify
+         * sweep's logits until the kept ones are written: K3_SPEC_MAX + 1 vectors, the
+         * allocation made with the dump file below. */
+        const double w_dump = (all_logits_path && spec_n > 0)
+            ? (double)(K3_SPEC_MAX + 1) * c.vocab * sizeof(float) : 0.0;
+        const double need_b = w_trunk + w_model + w_cache + w_state + w_buf + w_kv + w_spec
+                            + w_dump;
         memory_plan_bytes = need_b;
+        all_logits_bytes = w_dump;
         const double have = mem_available_bytes();
 
         char b2[32], b3[32], b4[32], b5[32], b6[32], b7[32];
@@ -1280,11 +1465,25 @@ int main(int argc, char **argv)
         human(w_buf, b5, sizeof b5);   human(need_b, b6, sizeof b6);
         printf("\nmemory plan\n");
         printf("  trunk %-10s %s\n  embed + lm_head  %s %s\n  expert cache     %s\n"
-               "  recurrent state  %s\n  buffers          %s\n  KV cache         %s%s\n"
-               "  TOTAL            %s\n",
-               trunk_dir ? "(STREAMED)" : "(resident)", b1, b2,
+               "  recurrent state  %s\n  buffers          %s\n  KV cache         %s%s\n",
+               trunk_rows ? "(ROWS)" : trunk_dir ? "(STREAMED)" : "(resident)", b1, b2,
                ultra ? "(STREAMED)" : (head_streamed ? "(lm_head streamed)" : "(resident)"),
-               b3, b4, b5, b7, kv_latent ? "  (latent layout)" : "", b6);
+               b3, b4, b5, b7, kv_latent ? "  (latent layout)" : "");
+        /* The plan charges a row budget as given; say so, since the row pipeline itself
+         * never holds more than two 8 MiB buffers and one layer's vectors. */
+        if (trunk_rows)
+            printf("                   (the whole --trunk-gb budget is charged; rows allocate "
+                   "at most two 8 MiB buffers\n                    and the current layer's "
+                   "vectors, reported once the trunk is open)\n");
+        if (w_spec > 0.0) {
+            human(w_spec, b7, sizeof b7);
+            printf("  spec log         %s  (KDA recurrence inputs per position)\n", b7);
+        }
+        if (w_dump > 0.0) {
+            human(w_dump, b7, sizeof b7);
+            printf("  all-logits dump  %s  (every position of one verify sweep)\n", b7);
+        }
+        printf("  TOTAL            %s\n", b6);
         if (have > 0.0) {
             human(have, b1, sizeof b1);
             printf("  available        %s\n", b1);
@@ -1432,6 +1631,11 @@ int main(int argc, char **argv)
     float *sc = (float *)malloc(sc_need * sizeof(float));
     float *lg = (float *)malloc((size_t)c.vocab * sizeof(float));
     if (!h || !br || !ks || !sc || !lg) { fprintf(stderr, "buffer allocation failed\n"); return 1; }
+    if (logit_rows > 1) {
+        w.logit_block = (float *)malloc((size_t)logit_rows * c.vocab * sizeof(float));
+        if (!w.logit_block) { fprintf(stderr, "logit block allocation failed\n"); return 1; }
+        w.logit_rows = logit_rows;
+    }
     human((double)(kper * state_layers) * 4, b1, sizeof b1);
     if (state_layers == 1 && NL > 1)
         printf("recurrent state: one %s slot, cleared and reused across %d layers\n\n",
@@ -1494,24 +1698,37 @@ int main(int argc, char **argv)
         }
     }
 
-    /* --spec needs a snapshot of the carried KDA/ShortConv state to roll back a
-     * partially-rejected draft batch: the recurrent state is updated in place and is
-     * not positional, so the only sound recovery is restore-and-replay the accepted
-     * prefix. The snapshot is one memcpy; the replay is one short batched sweep. */
-    const size_t kperP  = (size_t)c.kda_heads * c.kda_head_dim;
-    const size_t kper_f = kperP * c.kda_head_dim + 3 * kperP * (c.conv_k - 1);
-    float *spec_snap = NULL;
+    /* ---- speculative decode: tentative sweeps ----
+     * A verify sweep feeds the pending token and nd drafts through every layer at once,
+     * and the model may reject some of them. MLA layers need nothing undone, because
+     * their KV rows are positional (see K3KdaLog in k3.h for why no stale row can be
+     * read). KDA layers fold every position into their state in place, so the old scheme
+     * copied the whole carried state before each sweep, restored it on a rejection and
+     * replayed the accepted prefix through a SECOND forward: at K3 scale that re-reads the
+     * 108.81 GB trunk and the prefix's experts, part of why an eager drafter measured
+     * 0.91x on code (spec_draft says what the rest was).
+     *
+     * Instead the sweep is tentative. Each KDA layer runs on a one-layer work copy and
+     * leaves its carried state alone, recording its recurrence inputs per position; once
+     * the accepted count is known, spec_commit applies exactly the kept positions with
+     * k3_kda_advance. The result is bit-identical to serial decode, no weight is read
+     * twice, and no copy of the carried state exists at all. A sweep can commit all
+     * spec_n + 1 of its positions, so that is the row count. */
     if (spec_n > 0) {
-        if (!incremental) {
-            fprintf(stderr, "--spec needs --incremental; ignoring --spec\n");
-            spec_n = 0;
-        } else {
-            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
-            spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
-            if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
-            printf("speculative decode: up to %d drafted tokens per sweep, n-gram lookup, "
-                   "verified batched\n\n", spec_n);
+        if (spec_log_alloc(&w, &c, NL, spec_n + 1, NULL) != 0) {
+            fprintf(stderr, "OOM for the --spec log\n");
+            return 1;
         }
+        char lb[32], rb[32], wb[32];
+        human((double)w.log_floats * w.n_kda * sizeof(float), lb, sizeof lb);
+        human((double)k3_kda_log_row(&c) * w.n_kda * sizeof(float), rb, sizeof rb);
+        human((double)k3_kda_state_floats(&c) * sizeof(float), wb, sizeof wb);
+        printf("speculative decode: up to %d drafted tokens per sweep, %s, verified "
+               "batched\n  sweep log %s (%d positions x %s across %d KDA layers) + one "
+               "work layer %s;\n  no state snapshot, and a rejected draft costs no second "
+               "sweep\n\n", spec_n, draft_dir ? "proposed by the draft trunk"
+                                              : "n-gram lookup",
+               lb, spec_n + 1, rb, w.n_kda, wb);
     }
 
     /* ---- hybrid decode: a second, typically quantized, trunk drafts ----
@@ -1526,46 +1743,53 @@ int main(int argc, char **argv)
      * what makes the draft worth consulting at all. */
     static K3Trunk trunk_d;
     Weights dw; memset(&dw, 0, sizeof dw);
-    float *dks = NULL, *dsnap = NULL;
-    long hyb_rounds = 0, hyb_drafted = 0, hyb_accepted = 0;
+    /* The draft writes its logits into dlg, never into lg: lg holds the EXACT model's
+     * vector for the step, which is what --dump-logits and --dump-all-logits record. */
+    float *dks = NULL, *dlg = NULL;
+    long hyb_rounds = 0, hyb_drafted = 0, hyb_accepted = 0, draft_dropped = 0;
     if (draft_dir) {
-        if (!incremental || !trunk_dir) {
-            fprintf(stderr, "--draft-trunk needs --incremental and --trunk; ignoring\n");
-            draft_dir = NULL;
-        } else {
-            if (spec_n <= 0) spec_n = 4;
-            if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
-            if (!spec_snap) {
-                spec_snap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
-                if (!spec_snap) { fprintf(stderr, "OOM for the --spec snapshot\n"); return 1; }
-            }
-            if (k3_trunk_open(&trunk_d, draft_dir, &c, (int64_t)(draft_gb * 1e9)) != 0)
-                return 1;
-            dw.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
-            dks   = (float *)calloc(kper_f * (size_t)w.n_bound, sizeof(float));
-            dsnap = (float *)malloc(kper_f * (size_t)w.n_bound * sizeof(float));
-            const size_t kvperd = (size_t)w.kv_cap * kv_floats_per_pos(&c, kv_latent);
-            const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
-            dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
-            dw.ropec = (float *)calloc(rpperd * (size_t)w.n_mla, sizeof(float));
-            if (!dw.lay || !dks || !dsnap || !dw.kvc || !dw.ropec) {
-                fprintf(stderr, "OOM for the draft model state\n"); return 1;
-            }
-            dw.mb = w.mb;              /* embed + lm_head are the same tensors */
-            dw.trunk = &trunk_d;
-            dw.n_bound = w.n_bound;
-            dw.mla_slot = w.mla_slot;  /* read-only map, safely shared */
-            dw.n_mla = w.n_mla;
-            dw.kv_cap = w.kv_cap;
-            dw.kv_latent = w.kv_latent;   /* one layout for both models, or one stride
-                                           * is wrong and the draft reads garbage */
-            dw.cached = 0;
-            dw.draft_mode = 1;   /* cache-only routing: draft tokens read no new experts */
-            printf("hybrid decode: draft trunk %s (%.1f GB budget) proposes up to %d "
-                   "tokens per sweep;\n               the exact model verifies every one "
-                   "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
+        /* --draft-trunk was checked against --incremental/--trunk and given its spec depth
+         * before the memory plan. */
+        if (k3_trunk_open(&trunk_d, draft_dir, &c, (int64_t)(draft_gb * 1e9)) != 0)
+            return 1;
+        dw.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
+        dks   = (float *)calloc(k3_kda_state_floats(&c) * (size_t)w.n_bound,
+                                sizeof(float));
+        dlg   = (float *)malloc((size_t)c.vocab * sizeof(float));
+        const size_t kvperd = (size_t)w.kv_cap * kv_floats_per_pos(&c, kv_latent);
+        const size_t rpperd = (size_t)w.kv_cap * c.qk_rope;
+        dw.kvc   = (float *)calloc(kvperd * (size_t)w.n_mla, sizeof(float));
+        dw.ropec = (float *)calloc(rpperd * (size_t)w.n_mla, sizeof(float));
+        /* The draft proposes through tentative calls too, and commits what the exact
+         * model keeps, from its own log. It needs spec_n + 1 rows as well: after a
+         * fully accepted round it has not fed the last accepted draft yet, and its
+         * next round's first call feeds that token together with the new pending one
+         * instead of paying a sweep of its own to catch up. It shares the exact
+         * model's work layer, since the two never run at once. */
+        if (!dw.lay || !dks || !dlg || !dw.kvc || !dw.ropec ||
+            spec_log_alloc(&dw, &c, NL, spec_n + 1, w.kda_work) != 0) {
+            fprintf(stderr, "OOM for the draft model state\n"); return 1;
         }
+        dw.mb = w.mb;              /* embed + lm_head are the same tensors */
+        dw.trunk = &trunk_d;
+        dw.n_bound = w.n_bound;
+        dw.mla_slot = w.mla_slot;  /* read-only map, safely shared */
+        dw.n_mla = w.n_mla;
+        dw.kv_cap = w.kv_cap;
+        dw.kv_latent = w.kv_latent;   /* one layout for both models, or one stride
+                                       * is wrong and the draft reads garbage */
+        dw.cached = 0;
+        dw.draft_mode = 1;   /* cache-only routing: draft tokens read no new experts */
+        printf("hybrid decode: draft trunk %s (%.1f GB budget) proposes up to %d "
+               "tokens per sweep;\n               the exact model verifies every one "
+               "before it is emitted\n\n", draft_dir, draft_gb, spec_n);
     }
+
+    /* What --spec allocated, for the report: log rows for each model plus the one work
+     * layer they share. */
+    const double spec_log_bytes = (double)sizeof(float)
+        * ((w.kda_log ? w.log_floats * w.n_kda + k3_kda_state_floats(&c) : 0)
+           + (dw.kda_log ? dw.log_floats * dw.n_kda : 0));
 
     if (score_prompt) {
         double *losses = (double *)calloc((size_t)np - 1, sizeof(double));
@@ -1653,6 +1877,25 @@ int main(int argc, char **argv)
     double expert_s_total = 0.0, expert_gb_total = 0.0;
     uint64_t expert_reqs_total = 0, expert_evict_total = 0, expert_bytes_total = 0;
     uint64_t expert_reuses_total = 0;
+    /* Speculative accounting. Every decode step runs exactly ONE exact-model forward, a
+     * verify sweep included, so forwards == steps is the proof that nothing was replayed. */
+    long spec_sweeps = 0, spec_drafted = 0, spec_accepted = 0, spec_full = 0;
+    long spec_partial = 0, spec_cut = 0, spec_dropped = 0;
+    int steps = 0;
+    /* (drafted, accepted, kept) per verify sweep, for the JSON: a sweep emits at least
+     * one id, so there are at most gen of them. */
+    int *spec_trace = (int *)malloc((size_t)3 * (gen + 1) * sizeof(int));
+    if (!spec_trace) { fprintf(stderr, "OOM for the --spec trace\n"); return 1; }
+    FILE *all_logits_f = NULL;
+    if (all_logits_path) {
+        all_logits_f = fopen(all_logits_path, "wb");
+        if (!all_logits_f) { perror(all_logits_path); return 1; }
+        if (w.kda_log) {
+            w.all_logits = (float *)malloc((size_t)(K3_SPEC_MAX + 1) * c.vocab
+                                           * sizeof(float));
+            if (!w.all_logits) { fprintf(stderr, "OOM for --dump-all-logits\n"); return 1; }
+        }
+    }
     /* `nout < gen` drives generation; the `g == 0` disjunct additionally runs the
      * incremental prefill once even when --gen 0, so the prompt's KV and recurrent
      * state are computed and can be saved with ZERO generated tokens. That is what
@@ -1664,6 +1907,8 @@ int main(int argc, char **argv)
         int frc;
         int emit[K3_SPEC_MAX + 1];
         int emitn = 0;
+        int keep = -1;                   /* ids of emit[] the output keeps; see emit_keep */
+        const float *step_logits = NULL; /* per-position logits of a verify sweep */
         if (incremental && g == 0) {
             /* Step 0 feeds everything not yet consumed: the whole prompt on a fresh
              * run, and on a resume the carried pending token PLUS the new prompt.
@@ -1681,94 +1926,119 @@ int main(int argc, char **argv)
              * acceptance does. */
             if (dw.trunk && frc == 0) {
                 const int db = load_state ? 0 : base;
-                if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, lg, sc, h, br,
+                if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, dlg, sc, h, br,
                             dks, NULL) == 0)
                     dw.cached = base + nT0;
                 else frc = -1;
             }
         } else if (incremental) {
             const int base = w.cached;
-            int d[K3_SPEC_MAX], nd = 0;
-            if (spec_snap && T + spec_n + 1 < Tmax && base + spec_n + 1 <= w.kv_cap) {
+            int d[K3_SPEC_MAX], nd = 0, dlag = 0;
+            frc = 0;
+            if (w.kda_log && T + spec_n + 1 < Tmax && base + spec_n + 1 <= w.kv_cap) {
                 if (dw.trunk) {
-                    /* The draft model proposes: k sequential one-token steps through
-                     * the draft trunk, chaining its own argmax. Its state is
-                     * snapshotted first so a partial acceptance can rewind it the
-                     * same way the exact side rewinds. */
-                    memcpy(dsnap, dks, kper_f * (size_t)w.n_bound * sizeof(float));
-                    int prev = seq[base];
-                    while (nd < spec_n) {
-                        if (forward(&dw, &c, &cache, &prev, 1, lg, sc, h, br,
-                                    dks, NULL) != 0) break;
-                        dw.cached += 1;
-                        prev = argmax_(lg, c.vocab);
-                        d[nd++] = prev;
+                    /* The draft model proposes, chaining its own argmax one position at a
+                     * time. Its first call also feeds any accepted token it has not seen:
+                     * after a fully accepted round that is the last draft, which the exact
+                     * model consumed but the draft never fed. Folding it in here saves the
+                     * draft a sweep per fully accepted round. Every call is tentative and
+                     * recorded in the draft's own log, so once the exact model has decided,
+                     * the draft commits exactly the positions it keeps, and a rejected
+                     * draft costs the draft no replay either. */
+                    dlag = base - dw.cached;
+                    if (dlag < 0) {
+                        fprintf(stderr, "draft model is ahead of the exact model\n");
+                        frc = -1;
+                    } else if (dlag + spec_n > dw.log_cap) {
+                        /* Drafting stops for good once the run nears its end, so the
+                         * draft trails by at most one token whenever it drafts. Should
+                         * that change, absorb the backlog unrecorded, never past the
+                         * log. */
+                        if (forward(&dw, &c, &cache, seq + dw.cached, dlag, dlg, sc, h, br,
+                                    dks, NULL) != 0) frc = -1;
+                        else { dw.cached = base; dlag = 0; }
                     }
-                    hyb_rounds  += 1;
-                    hyb_drafted += nd;
+                    if (frc == 0) {
+                        dw.log_row0 = 0;
+                        if (forward(&dw, &c, &cache, seq + dw.cached, dlag + 1, dlg, sc, h,
+                                    br, dks, NULL) != 0) frc = -1;
+                        else { dw.cached = base + 1; d[nd++] = argmax_(dlg, c.vocab); }
+                        while (frc == 0 && nd < spec_n) {
+                            int prev = d[nd - 1];
+                            dw.log_row0 = dlag + nd;
+                            if (forward(&dw, &c, &cache, &prev, 1, dlg, sc, h, br,
+                                        dks, NULL) != 0) frc = -1;
+                            else { dw.cached += 1; d[nd++] = argmax_(dlg, c.vocab); }
+                        }
+                        dw.log_row0 = -1;
+                        hyb_rounds  += 1;
+                        hyb_drafted += nd;
+                    }
                 } else {
                     nd = spec_draft(seq, T, spec_n, d);
                 }
             }
-            if (nd > 0) {
+            if (frc == 0 && nd > 0) {
                 /* One sweep verifies the pending token plus nd drafts. arg[i] is the
                  * model's own next token after batch position i; the accepted prefix is
                  * exactly what serial decode would have emitted, and arg[m] after it is
-                 * clean because its context contains only accepted tokens. */
+                 * clean because its context contains only accepted tokens. The sweep is
+                 * tentative: every KDA layer leaves its carried state alone and records
+                 * its recurrence inputs instead. */
                 int arg[K3_SPEC_MAX + 1];
-                memcpy(spec_snap, ks, kper_f * (size_t)w.n_bound * sizeof(float));
                 for (int i = 0; i < nd; i++) seq[T + i] = d[i];
+                w.log_row0 = 0;
                 frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg);
+                w.log_row0 = -1;
                 if (frc == 0) {
                     int m = 0;
                     while (m < nd && arg[m] == d[m]) m++;
-                    if (m == nd) {
-                        /* every fed position had true context; state is exact */
-                        w.cached = base + nd + 1;
-                    } else {
-                        /* the recurrent state absorbed rejected tokens: restore, then
-                         * replay only the accepted prefix. The replay also rewrites the
-                         * KV rows those positions touched, so nothing stale survives. */
-                        memcpy(ks, spec_snap, kper_f * (size_t)w.n_bound * sizeof(float));
-                        w.cached = base;
-                        frc = forward(&w, &c, &cache, seq + base, m + 1, lg, sc, h, br,
-                                      ks, NULL);
-                        if (frc == 0) w.cached = base + m + 1;
+                    for (int i = 0; i < m; i++) emit[emitn++] = d[i];
+                    emit[emitn++] = arg[m];
+                    /* Commit exactly the positions behind the ids that will be emitted.
+                     * Batch position i fed the id just before emit[i], so keeping `keep`
+                     * ids keeps positions 0..keep-1 and leaves emit[keep-1] pending, as
+                     * serial decode would. Normally keep is m+1; a --stop-id can cut it
+                     * shorter, even after a full acceptance, and --save-state must then
+                     * see the state serial decode would have saved there.
+                     *
+                     * The KDA layers get the kept positions applied from the log
+                     * (k3_kda_advance, bit-exact); the MLA layers need only `cached`,
+                     * since their rows past it are positional and are overwritten by the
+                     * next sweep before anything reads them. No second forward runs, so
+                     * no weight is read twice. */
+                    keep = emit_keep(emit, emitn, nout, gen, T, Tmax, stop_id, n_stop);
+                    spec_commit(&w, &c, ks, keep);
+                    w.cached = base + keep;
+                    step_logits = w.all_logits;
+                    if (spec_sweeps < gen + 1) {
+                        spec_trace[3 * spec_sweeps]     = nd;
+                        spec_trace[3 * spec_sweeps + 1] = m;
+                        spec_trace[3 * spec_sweeps + 2] = keep;
                     }
-                    /* Resync the draft model to the ACCEPTED sequence. On full
-                     * acceptance its state already contains every fed token except
-                     * the last draft, so one step closes the gap; on partial
-                     * acceptance it rewinds to its snapshot and replays only the
-                     * accepted prefix, mirroring the exact side. */
-                    if (dw.trunk && frc == 0) {
+                    spec_sweeps++;
+                    spec_drafted += nd;
+                    spec_accepted += m;
+                    spec_dropped += nd + 1 - keep;
+                    if (m == nd) spec_full++; else spec_partial++;
+                    if (keep < m + 1) spec_cut++;
+                    /* The draft fed positions base-dlag .. base+nd-1 tentatively. It
+                     * commits what the exact model kept, up to what it fed: after a full
+                     * acceptance it ends one token short, which its next round absorbs. */
+                    if (dw.trunk) {
+                        const int dkeep = keep < nd ? keep : nd;
                         hyb_accepted += m;
-                        if (m == nd) {
-                            int last = d[nd - 1];
-                            if (forward(&dw, &c, &cache, &last, 1, lg, sc, h, br,
-                                        dks, NULL) == 0) dw.cached += 1;
-                            else frc = -1;
-                        } else {
-                            memcpy(dks, dsnap, kper_f * (size_t)w.n_bound * sizeof(float));
-                            dw.cached = base;
-                            if (forward(&dw, &c, &cache, seq + base, m + 1, lg, sc,
-                                        h, br, dks, NULL) == 0) dw.cached = base + m + 1;
-                            else frc = -1;
-                        }
-                    }
-                    if (frc == 0) {
-                        for (int i = 0; i < m; i++) emit[emitn++] = d[i];
-                        emit[emitn++] = arg[m];
+                        spec_commit(&dw, &c, dks, dlag + dkeep);
+                        draft_dropped += nd - dkeep;
+                        dw.cached = base + dkeep;
                     }
                 }
-            } else {
+            } else if (frc == 0) {
+                /* Nothing drafted: one serial step. The draft model does not follow it;
+                 * with a draft trunk this only happens once the run is too close to its
+                 * end to draft again, so feeding the draft here would be wasted. */
                 frc = forward(&w, &c, &cache, seq + base, 1, lg, sc, h, br, ks, NULL);
                 if (frc == 0) { w.cached = base + 1; emit[emitn++] = argmax_(lg, c.vocab); }
-                /* keep the draft in lockstep through non-drafted steps */
-                if (dw.trunk && frc == 0) {
-                    if (forward(&dw, &c, &cache, seq + base, 1, lg, sc, h, br,
-                                dks, NULL) == 0) dw.cached = base + 1;
-                    else frc = -1;
-                }
             }
         } else {
             frc = forward(&w, &c, &cache, seq, T, lg, sc, h, br, ks, NULL);
@@ -1779,7 +2049,21 @@ int main(int argc, char **argv)
             fprintf(stderr, "forward pass failed at generation step %d; aborting.\n", g);
             return 1;
         }
+        if (keep < 0) keep = emit_keep(emit, emitn, nout, gen, T, Tmax, stop_id, n_stop);
+        steps++;
         const int nxt = emit[emitn - 1];
+        /* The logits behind every kept id, in order: a verify sweep's position i for its
+         * i-th id, otherwise the step's one vector. */
+        if (all_logits_f) {
+            for (int i = 0; i < keep; i++) {
+                const float *v = step_logits ? step_logits + (size_t)i * c.vocab : lg;
+                if (fwrite(v, sizeof(float), (size_t)c.vocab, all_logits_f)
+                        != (size_t)c.vocab) {
+                    fprintf(stderr, "cannot write %s\n", all_logits_path);
+                    return 1;
+                }
+            }
+        }
         /* Dump the FIRST step's logits as raw float32 bits.
          * Comparing generated tokens against a reference only compares argmax, which
          * hides near-ties: two engines can agree on every token while disagreeing
@@ -1811,15 +2095,19 @@ int main(int argc, char **argv)
         expert_reqs_total  += cache.demand_requests;
         expert_reuses_total += cache.demand_reuses;
         expert_evict_total += cache.evictions;
-        for (int i = 0; i < emitn && nout < gen && T < Tmax; i++) {
+        /* emit_keep already stopped at --gen, the context limit and the first stop id,
+         * so a speculative sweep that verified past a stop id is truncated at the stop,
+         * exactly like serial decode, and its committed state ends there too. */
+        for (int i = 0; i < keep; i++) {
             seq[T++] = emit[i];
             outtok[nout++] = emit[i];
-            /* Checked here rather than per step so a speculative sweep that verifies
-             * past a stop id is truncated at the stop, exactly like serial decode. */
-            for (int s = 0; s < n_stop; s++)
-                if (emit[i] == stop_id[s]) { hit_stop = 1; stopped_at = emit[i]; break; }
-            if (hit_stop) break;
         }
+        for (int s = 0; keep > 0 && s < n_stop; s++)
+            if (emit[keep - 1] == stop_id[s]) {
+                hit_stop = 1;
+                stopped_at = emit[keep - 1];
+                break;
+            }
         if (hit_stop) {
             printf("stop id %d reached after %d of %d tokens\n", stopped_at, nout, gen);
             break;
@@ -1846,16 +2134,33 @@ int main(int argc, char **argv)
         }
     }
 
-    if (dw.trunk && hyb_rounds > 0) {
-        printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
-               "mean accepted run %.2f\n",
-               hyb_rounds, hyb_drafted, hyb_accepted,
-               hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
-               (double)hyb_accepted / hyb_rounds);
-        k3_trunk_close(&trunk_d);
-        free(dw.lay); free(dks); free(dsnap); free(dw.kvc); free(dw.ropec);
+    if (all_logits_f) {
+        if (fclose(all_logits_f) != 0) { perror(all_logits_path); return 1; }
+        printf("wrote %s (the logits behind all %d generated tokens)\n",
+               all_logits_path, nout);
     }
-    free(spec_snap);
+    if (w.kda_log) {
+        printf("\nspeculative decode: %ld verify sweeps, %ld drafted, %ld accepted "
+               "(%.1f%%); %ld fully accepted, %ld partially\n",
+               spec_sweeps, spec_drafted, spec_accepted,
+               spec_drafted ? 100.0 * spec_accepted / spec_drafted : 0.0,
+               spec_full, spec_partial);
+        printf("  %ld swept positions dropped at commit (%ld sweeps cut short by a stop "
+               "id); %ld exact forward sweeps for %d decode steps, so none replayed\n",
+               spec_dropped, spec_cut, w.forwards, steps);
+    }
+    if (dw.trunk) {
+        if (hyb_rounds > 0)
+            printf("\nhybrid decode: %ld rounds, %ld drafted, %ld accepted (%.1f%%), "
+                   "mean accepted run %.2f; %ld draft sweeps, %ld drafted positions "
+                   "dropped at commit\n",
+                   hyb_rounds, hyb_drafted, hyb_accepted,
+                   hyb_drafted ? 100.0 * hyb_accepted / hyb_drafted : 0.0,
+                   (double)hyb_accepted / hyb_rounds, dw.forwards, draft_dropped);
+        k3_trunk_close(&trunk_d);
+        free(dw.lay); free(dks); free(dlg); free(dw.kvc); free(dw.ropec);
+        free(dw.kda_log); free(dw.kda_slot);
+    }
     printf("--------------------------------------------------------------------\n");
     if (nout > 0)
         printf("%d tokens in %.1f s, %.2f s/token average\n",
@@ -1910,7 +2215,14 @@ int main(int argc, char **argv)
                 "\"trunk_row_buffer_bytes\":%llu,\"trunk_small_buffer_bytes\":%llu,"
                 "\"trunk_matrix_calls\":%llu,"
                 "\"stopped_at\":%d,"
-                "\"generated_text\":",
+                "\"decode_steps\":%d,\"forward_sweeps\":%ld,\"spec_n\":%d,"
+                "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
+                "\"spec_full_accepts\":%ld,\"spec_partial_accepts\":%ld,"
+                "\"spec_cut_by_stop\":%ld,\"spec_dropped_positions\":%ld,"
+                "\"spec_log_bytes\":%.0f,\"logit_block_bytes\":%.0f,\"all_logits_bytes\":%.0f,"
+                "\"draft_forward_sweeps\":%ld,"
+                "\"draft_accepted\":%ld,\"draft_dropped_positions\":%ld,"
+                "\"spec_trace\":[",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
                 nout ? t_total / nout : 0.0, (unsigned long long)expert_bytes_total,
                 (unsigned long long)expert_reqs_total,
@@ -1926,12 +2238,23 @@ int main(int argc, char **argv)
                 memory_plan_bytes, trunk_rows ? "true" : "false",
                 (unsigned long long)(w.trunk ? w.trunk->row_buffer_bytes : 0),
                 (unsigned long long)(w.trunk ? w.trunk->small_buffer_bytes : 0),
-                (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0), stopped_at);
+                (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0), stopped_at,
+                steps, w.forwards, spec_n, spec_sweeps, spec_drafted, spec_accepted,
+                spec_full, spec_partial, spec_cut, spec_dropped,
+                spec_log_bytes,
+                (double)sizeof(float) * (w.logit_block ? (double)w.logit_rows * c.vocab : 0.0),
+                w.all_logits ? all_logits_bytes : 0.0,
+                dw.forwards, hyb_accepted, draft_dropped);
+        for (long i = 0; i < spec_sweeps && i < gen + 1; i++)
+            fprintf(f, "%s[%d,%d,%d]", i ? "," : "", spec_trace[3 * i],
+                    spec_trace[3 * i + 1], spec_trace[3 * i + 2]);
+        fputs("],\"generated_text\":", f);
         json_string(f, generated_text);
         fputs("}\n", f);
         fclose(f);
         printf("\nwrote %s\n", outp);
     }
+    free(spec_trace);
     if (trace_dir) {
         char p[4096];
         snprintf(p, sizeof p, "%s/expert_hist.json", trace_dir);
@@ -1980,6 +2303,7 @@ int main(int argc, char **argv)
     }
 cleanup:
     free(w.kvc); free(w.ropec); free(w.mla_slot);
+    free(w.kda_log); free(w.kda_slot); free(w.kda_work); free(w.all_logits);
     if (w.trunk) { k3_trunk_report(w.trunk, "final"); k3_trunk_close(w.trunk); }
     k3_cache_free(&cache);
     for (int L = 0; L < w.n_bound; L++) k3_bind_free(&w.lay[L]);
@@ -1987,7 +2311,7 @@ cleanup:
     k3_model_stream_free(&w.ms);
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
-    free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
+    free(h); free(br); free(ks); free(sc); free(lg); free(w.logit_block); free(generated_text);
     free(prompt); free(seq); free(outtok);
 
     /* A dropped expert means some token was computed with part of its routed sum

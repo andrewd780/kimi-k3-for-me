@@ -343,6 +343,211 @@ static void t_recur(const char *dir, const char *file)
     free(txt); free(ar);
 }
 
+/* The router as it was written before experts were interleaved: one expert at a time,
+ * one double chain over i = 0..hidden-1. The R_RIGHT branch is kept verbatim as the
+ * bitwise reference; the other two are WRONG orders, computed on the same data only to
+ * prove that data can tell them from the right one (see router_matches_plain_form). */
+enum { R_RIGHT, R_REVERSED, R_TWO_CHAINS, R_COUNT };
+static const char *RNAME[R_COUNT] = { "right", "reversed chain", "even/odd chains" };
+
+static void router_plain(int *idx, float *w, const float *x, const float *W,
+                         const float *bias, int hidden, int n_experts, int topk,
+                         int renorm, float routed_scale, int mut)
+{
+    float *score  = (float *)malloc((size_t)n_experts * sizeof(float));
+    float *choice = (float *)malloc((size_t)n_experts * sizeof(float));
+    if (!score || !choice) { free(score); free(choice); return; }
+    for (int e = 0; e < n_experts; e++) {
+        const float *row = W + (size_t)e * hidden;
+        double acc = 0.0;
+        if (mut == R_REVERSED) {
+            for (int i = hidden - 1; i >= 0; i--) acc += (double)row[i] * (double)x[i];
+        } else if (mut == R_TWO_CHAINS) {
+            double a0 = 0.0, a1 = 0.0;
+            for (int i = 0; i < hidden; i++) {
+                if (i & 1) a1 += (double)row[i] * (double)x[i];
+                else       a0 += (double)row[i] * (double)x[i];
+            }
+            acc = a0 + a1;
+        } else {
+            for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
+        }
+        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
+        choice[e] = score[e] + (bias ? bias[e] : 0.0f);
+    }
+    for (int j = 0; j < topk; j++) {
+        int best = -1; float bv = -INFINITY;
+        for (int e = 0; e < n_experts; e++)
+            if (choice[e] > bv) { bv = choice[e]; best = e; }
+        if (best < 0) { idx[j] = 0; w[j] = 0.0f; continue; }
+        idx[j] = best; w[j] = score[best]; choice[best] = -INFINITY;
+    }
+    if (renorm && topk > 1) {
+        double s = 0.0;
+        for (int j = 0; j < topk; j++) s += (double)w[j];
+        const float inv = (float)(1.0 / (s + 1e-20));
+        for (int j = 0; j < topk; j++) w[j] *= inv;
+    }
+    for (int j = 0; j < topk; j++) w[j] *= routed_scale;
+    free(score); free(choice);
+}
+
+/* xorshift32, for the generated tests below that carry their own seed. */
+static unsigned xs32(unsigned *s)
+{
+    *s ^= *s << 13; *s ^= *s >> 17; *s ^= *s << 5;
+    return *s;
+}
+
+/* Uniform in [-a, a). */
+static float xs_unit(unsigned *s, float a)
+{
+    return ((float)(xs32(s) >> 8) / 8388608.0f - 1.0f) * a;
+}
+
+/* Router inputs. ORDINARY: W in +-0.05, x in +-1, bias in +-0.01, the distribution a
+ * router sees. CANCELLING, what makes a wrong summation order VISIBLE: each expert's row
+ * also carries +2^40 and -2^40 on two of four slots shared by the matrix, where x holds
+ * one value v. The exact logit is still just the ordinary terms, but in double every
+ * ordinary term added while the +-2^40 partial sum is live is rounded to its grid of
+ * 2^-12, and which terms those are, and what the running sum is at each rounding, is
+ * fixed by the order of the chain. So a reordered or split chain moves the logit by
+ * 3e-7 to 2.4e-4 (measured for a reversed chain over these shapes), where the float
+ * spacing of these logits, all below 5 in magnitude, is 5e-7 or finer, not by a last
+ * double bit that the narrowing to float erases; the sigmoid carries it into the score. 2^40 and not larger: at 2^60 the grid is 256, every term that meets
+ * the big sum is lost outright, and two wrong orders could lose the same terms and
+ * agree. A float times a float is exact in double and the pair cancels exactly, so
+ * nothing overflows and the exact logit is unchanged. */
+static void router_fill(float *W, float *x, float *b, int E, int H, int cancel,
+                        unsigned *s)
+{
+    for (size_t i = 0; i < (size_t)E * H; i++)
+        W[i] = xs_unit(s, 0.05f);
+    for (int i = 0; i < H; i++)
+        x[i] = xs_unit(s, 1.0f);
+    for (int e = 0; e < E; e++)
+        b[e] = xs_unit(s, 0.01f);
+    if (!cancel || H < 4) return;
+    int big[4];
+    for (int k = 0; k < 4; k++) {
+        int dup;
+        do {
+            big[k] = (int)(xs32(s) % (unsigned)H);
+            dup = 0;
+            for (int m = 0; m < k; m++) if (big[m] == big[k]) dup = 1;
+        } while (dup);
+    }
+    const float v = ((xs32(s) & 1u) ? -1.0f : 1.0f)
+                  * (1.0f + (float)(xs32(s) & 0xFFu) / 256.0f);
+    for (int k = 0; k < 4; k++) x[big[k]] = v;
+    for (int e = 0; e < E; e++) {
+        float *row = W + (size_t)e * H;
+        for (int k = 0; k < 4; k++) row[big[k]] = 0.0f;
+        const int p = (int)(xs32(s) % 4u);
+        int q = (int)(xs32(s) % 3u);
+        if (q >= p) q++;
+        row[big[p]] =  1099511627776.0f;   /* +2^40 */
+        row[big[q]] = -1099511627776.0f;   /* -2^40 */
+    }
+}
+
+/* Every expert's score back in expert order: with topk == n_experts, renorm off and a
+ * routed_scale of 1, w[j] IS score[idx[j]]. */
+static void router_scores(float *sc, const int *idx, const float *w, int E)
+{
+    for (int j = 0; j < E; j++) sc[idx[j]] = w[j];
+}
+
+/* k3_router held BITWISE to router_plain, which it replaced, over expert counts that fill
+ * whole blocks, leave a tail, or are smaller than one block, including the released
+ * 896 x 7168. Two legs per shape:
+ *
+ *   ordinary data with the released settings (renorm, routed_scale, top-k), which is
+ *   what the kernel sees; and cancelling data with topk == n_experts, renorm off and a
+ *   routed_scale of 1, so every expert's score is compared, not only the top-k.
+ *
+ * The cancelling leg is what gives this teeth. On ordinary data a reordered double chain
+ * does not reach the float logit: measured on this distribution at 896 x 7168 over 100
+ * inputs, a reversed or an even/odd split chain changed the double in about 97% of the
+ * 89,600 logits and the float logit, and so the score, in none. So every shape also computes two WRONG orders on the cancelling data
+ * -- the chain reversed, and split into even and odd chains added at the end -- and each
+ * must change the scores of at least one expert in every shape and of most experts
+ * overall; if the data ever stops telling orders apart, this fails instead of passing
+ * vacuously. The full-block and tail paths each have shapes of their own here. */
+static int router_matches_plain_form(long teeth[R_COUNT], long *scored)
+{
+    const int shapes[][3] = {           /* n_experts, hidden, topk */
+        {1, 33, 1}, {7, 64, 3}, {8, 130, 2}, {9, 257, 4}, {17, 1000, 16}, {896, 7168, 16}
+    };
+    const int nshape = (int)(sizeof shapes / sizeof *shapes);
+    int ok = 1;
+    unsigned s = 20260922u;
+    for (int c = 0; c < nshape; c++) {
+        const int E = shapes[c][0], H = shapes[c][1], K = shapes[c][2];
+        float *W  = (float *)malloc((size_t)E * H * sizeof(float));
+        float *x  = (float *)malloc((size_t)H * sizeof(float));
+        float *b  = (float *)malloc((size_t)E * sizeof(float));
+        int   *ia = (int *)malloc((size_t)E * sizeof(int));
+        int   *ib = (int *)malloc((size_t)E * sizeof(int));
+        float *wa = (float *)malloc((size_t)E * sizeof(float));
+        float *wb = (float *)malloc((size_t)E * sizeof(float));
+        float *sr = (float *)malloc((size_t)E * sizeof(float));
+        float *sm = (float *)malloc((size_t)E * sizeof(float));
+        if (!W || !x || !b || !ia || !ib || !wa || !wb || !sr || !sm) {
+            free(W); free(x); free(b); free(ia); free(ib); free(wa); free(wb);
+            free(sr); free(sm);
+            return 0;
+        }
+
+        /* ordinary data, released settings */
+        router_fill(W, x, b, E, H, 0, &s);
+        router_plain(ia, wa, x, W, b, H, E, K, 1, 2.5f, R_RIGHT);
+        k3_router(ib, wb, x, W, b, H, E, K, 1, 2.5f);
+        if (memcmp(ia, ib, (size_t)K * sizeof(int)) != 0 ||
+            memcmp(wa, wb, (size_t)K * sizeof(float)) != 0) {
+            printf("        router blocked form differs at n_experts=%d hidden=%d "
+                   "(ordinary data)\n", E, H);
+            ok = 0;
+        }
+
+        /* cancelling data, every expert's score */
+        router_fill(W, x, b, E, H, 1, &s);
+        router_plain(ia, wa, x, W, b, H, E, E, 0, 1.0f, R_RIGHT);
+        k3_router(ib, wb, x, W, b, H, E, E, 0, 1.0f);
+        if (memcmp(ia, ib, (size_t)E * sizeof(int)) != 0 ||
+            memcmp(wa, wb, (size_t)E * sizeof(float)) != 0) {
+            printf("        router blocked form differs at n_experts=%d hidden=%d "
+                   "(cancelling data)\n", E, H);
+            ok = 0;
+        }
+        router_scores(sr, ia, wa, E);
+        for (int m = R_REVERSED; m < R_COUNT; m++) {
+            router_plain(ib, wb, x, W, b, H, E, E, 0, 1.0f, m);
+            router_scores(sm, ib, wb, E);
+            int differ = 0;
+            for (int e = 0; e < E; e++)
+                differ += memcmp(&sr[e], &sm[e], sizeof(float)) != 0;
+            teeth[m] += differ;
+            if (differ == 0) {
+                printf("        cancelling data cannot see a %s at n_experts=%d "
+                       "hidden=%d\n", RNAME[m], E, H);
+                ok = 0;
+            }
+        }
+        *scored += E;
+        free(W); free(x); free(b); free(ia); free(ib); free(wa); free(wb);
+        free(sr); free(sm);
+    }
+    for (int m = R_REVERSED; m < R_COUNT; m++) {
+        if (2 * teeth[m] < *scored) {
+            printf("        cancelling data sees a %s in only %ld of %ld scores\n",
+                   RNAME[m], teeth[m], *scored);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
 /* Router. The fixture's frozen bias reorders the top-k in 5 of 6 rows, so an engine
  * that ignored e_score_correction_bias, or that gathered the weights from the BIASED
  * scores, fails here rather than silently degrading. Indices are compared as SETS
@@ -386,15 +591,32 @@ static void t_router(const char *dir)
                 }
             }
         }
-        if (set_ok && worst_w <= 1.0) {
+        /* k3_router walks experts in interleaved blocks; the fixture's handful of experts
+         * cannot tell that apart from a one-expert-at-a-time loop, and neither can a
+         * tolerance. So the blocked kernel is also held BITWISE to the plain form it
+         * replaced, on cancelling data that makes a wrong chain order change the scores
+         * (see router_matches_plain_form).
+         *
+         * Mutants run against it, each FAILING: the full-block chain reversed, the tail
+         * block's chain reversed, the full block summed as even and odd chains added at
+         * the end, a block reading the wrong expert's row, a tail block that drops its
+         * last expert, and an accumulator rounded to float per term. Before the
+         * cancelling leg existed the three reorderings all PASSED. */
+        long teeth[R_COUNT] = {0}, scored = 0;
+        const int bit_ok = router_matches_plain_form(teeth, &scored);
+        if (set_ok && worst_w <= 1.0 && bit_ok) {
             printf("  PASS  router         rows=%-4d k=%d  index sets match, "
-                   "worst weight=%.2fx tol\n", rows, K, worst_w);
+                   "worst weight=%.2fx tol, blocked form bitwise\n", rows, K, worst_w);
             g_pass++;
         } else {
-            printf("  FAIL  router         index_sets=%s worst weight=%.2fx tol\n",
-                   set_ok ? "ok" : "MISMATCH", worst_w);
+            printf("  FAIL  router         index_sets=%s worst weight=%.2fx tol "
+                   "blocked=%s\n", set_ok ? "ok" : "MISMATCH", worst_w,
+                   bit_ok ? "bitwise" : "DIFFERS");
             g_fail++;
         }
+        printf("        wrong orders on cancelling data change: %s %ld/%ld, "
+               "%s %ld/%ld scores\n", RNAME[R_REVERSED], teeth[R_REVERSED], scored,
+               RNAME[R_TWO_CHAINS], teeth[R_TWO_CHAINS], scored);
         free(gi); free(gw);
     }
     free(W); free(bias); free(x); free(eidx); free(ewt); free(txt); free(ar);
@@ -525,7 +747,7 @@ static void t_moe(const char *dir)
         const int T = din[1];
         int   *idx = (int   *)malloc((size_t)c.topk * sizeof(int));
         float *wt  = (float *)malloc((size_t)c.topk * sizeof(float));
-        float *sc  = (float *)malloc(k3_moe_scratch(&c) * sizeof(float));
+        float *sc  = (float *)malloc(k3_moe_scratch(&c, T) * sizeof(float));
         float *y   = (float *)malloc((size_t)T * c.hidden * sizeof(float));
         if (idx && wt && sc && y) {
             k3_moe(y, x, &w, &c, T, idx, wt, sc);
@@ -542,6 +764,246 @@ static void t_moe(const char *dir)
     free((void *)w.gate); free((void *)w.bias); free((void *)w.down); free((void *)w.up);
     free((void *)w.latent_norm); free((void *)w.sh1); free((void *)w.sh3); free((void *)w.sh2);
     free(txt); free(ar);
+}
+
+/* A streamed expert source over experts held in memory as MXFP4, counting get() calls. */
+typedef struct {
+    K3ExpertSrc src;
+    unsigned char *p13, *s13, *p2, *s2;   /* gate and up share a shape; down its own  */
+    size_t pb13, sb13, pb2, sb2;          /* bytes per expert of each                 */
+    long gets;
+} MemExperts;
+
+static int mem_get(K3ExpertSrc *self, int layer, int e, K3ExpertQ *q)
+{
+    MemExperts *m = (MemExperts *)self->ctx;
+    (void)layer;
+    m->gets++;
+    q->p1 = m->p13 + (size_t)(2 * e) * m->pb13;
+    q->s1 = m->s13 + (size_t)(2 * e) * m->sb13;
+    q->p3 = m->p13 + (size_t)(2 * e + 1) * m->pb13;
+    q->s3 = m->s13 + (size_t)(2 * e + 1) * m->sb13;
+    q->p2 = m->p2  + (size_t)e * m->pb2;
+    q->s2 = m->s2  + (size_t)e * m->sb2;
+    return 0;
+}
+
+/* Orders in which a position's routed contributions can be summed: the top-k order k3_moe
+ * uses, and two WRONG ones -- reversed, and the order the batched path fetches experts in
+ * (first appearance in the 64-position sub-chunk), which is the natural mistake there. */
+enum { S_RIGHT, S_REVERSED, S_FETCH, S_COUNT };
+static const char *SNAME[S_COUNT] = { "top-k", "reversed", "fetch order" };
+
+/* The MoE of k3_moe with a streamed source, written out with public ops, one position at
+ * a time, summing each position's routed contributions in the order `mut` names. With
+ * S_RIGHT it must match k3_moe bit for bit, which is what licenses using the other two as
+ * the wrong orders the data has to be able to see. Every matrix here is fp32, so each
+ * k3_matmul is the per-position form of the k3_mmw_batch the engine calls. */
+static void moe_ref(float *out, const float *x, const K3MoeW *w, const K3Cfg *c, int T,
+                    int chunk, int mut)
+{
+    const int E = c->hidden, L = c->latent, I = c->moe_inter, K = c->topk;
+    const int SI = I * c->n_shared;
+    float *z    = (float *)malloc((size_t)L * sizeof(float));
+    float *acc  = (float *)malloc((size_t)L * sizeof(float));
+    float *cb   = (float *)malloc((size_t)K * L * sizeof(float));
+    float *gu   = (float *)malloc((size_t)2 * I * sizeof(float));
+    float *sgu  = (float *)malloc((size_t)2 * SI * sizeof(float));
+    float *sdn  = (float *)malloc((size_t)E * sizeof(float));
+    float *wt   = (float *)malloc((size_t)T * K * sizeof(float));
+    int   *idx  = (int *)malloc((size_t)T * K * sizeof(int));
+    int   *rank = (int *)malloc((size_t)c->n_experts * sizeof(int));
+    if (!z || !acc || !cb || !gu || !sgu || !sdn || !wt || !idx || !rank) {
+        printf("        moe_ref: out of memory\n");
+        exit(1);
+    }
+    for (int t = 0; t < T; t++)
+        k3_router(idx + (size_t)t * K, wt + (size_t)t * K, x + (size_t)t * E, w->gate,
+                  w->bias, E, c->n_experts, K, c->moe_renorm, c->routed_scale);
+    for (int t = 0; t < T; t++) {
+        const float *xt = x + (size_t)t * E;
+        const int *it = idx + (size_t)t * K;
+        const float *wtt = wt + (size_t)t * K;
+        if (t % chunk == 0) {           /* first-appearance rank within the sub-chunk */
+            int nu = 0;
+            for (int e = 0; e < c->n_experts; e++) rank[e] = -1;
+            for (int u = t; u < T && u < t + chunk; u++)
+                for (int j = 0; j < K; j++)
+                    if (rank[idx[(size_t)u * K + j]] < 0) rank[idx[(size_t)u * K + j]] = nu++;
+        }
+        k3_matmul(z, xt, (const float *)w->down, E, L);
+        for (int j = 0; j < K; j++) {
+            K3ExpertQ q;
+            w->src->get(w->src, w->layer, it[j], &q);
+            k3_matmul_mxfp4(gu,     z, q.p1, q.s1, L, I, K3_MXFP4_GROUP);
+            k3_matmul_mxfp4(gu + I, z, q.p3, q.s3, L, I, K3_MXFP4_GROUP);
+            k3_situ_glu(gu, gu, I, c->situ_b1, c->situ_b2);
+            k3_matmul_mxfp4(cb + (size_t)j * L, gu, q.p2, q.s2, I, L, K3_MXFP4_GROUP);
+        }
+        int order[K3_MAX_TOPK];
+        for (int j = 0; j < K; j++) order[j] = mut == S_REVERSED ? K - 1 - j : j;
+        if (mut == S_FETCH)             /* slots by their expert's rank: insertion sort */
+            for (int a = 1; a < K; a++)
+                for (int b = a; b > 0 && rank[it[order[b]]] < rank[it[order[b - 1]]]; b--) {
+                    const int tmp = order[b]; order[b] = order[b - 1]; order[b - 1] = tmp;
+                }
+        for (int i = 0; i < L; i++) acc[i] = 0.0f;
+        for (int a = 0; a < K; a++) {
+            const int j = order[a];
+            for (int i = 0; i < L; i++) acc[i] += wtt[j] * cb[(size_t)j * L + i];
+        }
+        if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, L, c->rms_eps);
+        float *ot = out + (size_t)t * E;
+        k3_matmul(ot, acc, (const float *)w->up, L, E);
+        k3_matmul(sgu,      xt, (const float *)w->sh1, E, SI);
+        k3_matmul(sgu + SI, xt, (const float *)w->sh3, E, SI);
+        k3_situ_glu(sgu, sgu, SI, c->situ_b1, c->situ_b2);
+        k3_matmul(sdn, sgu, (const float *)w->sh2, SI, E);
+        for (int i = 0; i < E; i++) ot[i] += sdn[i];
+    }
+    free(z); free(acc); free(cb); free(gu); free(sgu); free(sdn); free(wt); free(idx);
+    free(rank);
+}
+
+/* The batched prefill MoE, bitwise against the per-token k3_moe, at K3's top-16.
+ *
+ * k3_moe_prefill fetches each unique routed expert once per 64-position sub-chunk and
+ * applies it to every (position, slot) that chose it; the hazard particular to it is
+ * summing a position's contributions in that fetch order instead of the top-k order
+ * k3_moe uses. Nothing else reaches it: the oracle and t_moe run resident experts
+ * through k3_moe, and the CLI's 65/129/130-token gate runs the tiny checkpoint, which
+ * routes to the top 2, where 0 + a + b and 0 + b + a are the same float in either order.
+ * Here a position sums sixteen contributions, as on K3, over T = 130 positions (two full
+ * sub-chunks and a remainder of two), with 40 experts so that every sub-chunk reuses
+ * each expert many times.
+ *
+ * The data proves it can see the order: the same MoE written out with public ops must
+ * match k3_moe bitwise when it sums in top-k order, and must DIFFER on most positions
+ * when it sums reversed or in fetch order. The dedup itself is checked by count: one
+ * get() per unique expert per sub-chunk, against T * 16 for the per-token path. */
+static void t_moe_prefill(void)
+{
+    K3Cfg c; memset(&c, 0, sizeof c);
+    c.hidden = 64; c.latent = 64; c.moe_inter = 64; c.n_experts = 40; c.topk = 16;
+    c.n_shared = 1; c.routed_scale = 2.5f; c.moe_renorm = 1; c.latent_norm = 1;
+    c.rms_eps = 1e-5f; c.situ_b1 = 4.0f; c.situ_b2 = 25.0f;
+    const int T = 130, CHUNK = 64;
+    const int E = c.hidden, L = c.latent, I = c.moe_inter, NE = c.n_experts, K = c.topk;
+    const int SI = I * c.n_shared;
+
+    unsigned s = 0x6D6F65u;
+    float *x    = (float *)malloc((size_t)T * E * sizeof(float));
+    float *gate = (float *)malloc((size_t)NE * E * sizeof(float));
+    float *bias = (float *)malloc((size_t)NE * sizeof(float));
+    float *down = (float *)malloc((size_t)L * E * sizeof(float));
+    float *up   = (float *)malloc((size_t)E * L * sizeof(float));
+    float *sh1  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh3  = (float *)malloc((size_t)SI * E * sizeof(float));
+    float *sh2  = (float *)malloc((size_t)E * SI * sizeof(float));
+    float *lnw  = (float *)malloc((size_t)L * sizeof(float));
+    MemExperts m; memset(&m, 0, sizeof m);
+    m.pb13 = (size_t)I * (L / 2); m.sb13 = (size_t)I * ((L + 31) / 32);
+    m.pb2  = (size_t)L * (I / 2); m.sb2  = (size_t)L * ((I + 31) / 32);
+    m.p13 = (unsigned char *)malloc(2 * NE * m.pb13);
+    m.s13 = (unsigned char *)malloc(2 * NE * m.sb13);
+    m.p2  = (unsigned char *)malloc(NE * m.pb2);
+    m.s2  = (unsigned char *)malloc(NE * m.sb2);
+    const size_t nout = (size_t)T * E;
+    float *yb = (float *)malloc(nout * sizeof(float));      /* k3_moe_prefill */
+    float *yt = (float *)malloc(nout * sizeof(float));      /* k3_moe         */
+    float *yr = (float *)malloc(nout * sizeof(float));      /* moe_ref        */
+    float *sc = (float *)malloc(k3_moe_scratch(&c, T) * sizeof(float));
+    int   *idx = (int *)malloc((size_t)K * sizeof(int));
+    float *wt  = (float *)malloc((size_t)K * sizeof(float));
+    if (!x || !gate || !bias || !down || !up || !sh1 || !sh3 || !sh2 || !lnw || !m.p13 ||
+        !m.s13 || !m.p2 || !m.s2 || !yb || !yt || !yr || !sc || !idx || !wt) {
+        printf("  FAIL  moe_prefill    out of memory\n");
+        g_fail++;
+        exit(1);
+    }
+    for (size_t i = 0; i < nout; i++) x[i] = xs_unit(&s, 1.0f);
+    for (int i = 0; i < NE * E; i++) gate[i] = xs_unit(&s, 0.05f);
+    for (int i = 0; i < NE; i++) bias[i] = xs_unit(&s, 0.01f);
+    for (int i = 0; i < L * E; i++) down[i] = xs_unit(&s, 0.2f);
+    for (int i = 0; i < E * L; i++) up[i] = xs_unit(&s, 0.2f);
+    for (int i = 0; i < SI * E; i++) { sh1[i] = xs_unit(&s, 0.2f); sh3[i] = xs_unit(&s, 0.2f); }
+    for (int i = 0; i < E * SI; i++) sh2[i] = xs_unit(&s, 0.2f);
+    for (int i = 0; i < L; i++) lnw[i] = 1.0f + xs_unit(&s, 0.25f);
+    /* random FP4 nibbles, and E8M0 scales 2^-6 .. 2^-3 (bytes 121..124) */
+    for (size_t i = 0; i < 2 * NE * m.pb13; i++) m.p13[i] = (unsigned char)(xs32(&s) >> 8);
+    for (size_t i = 0; i < NE * m.pb2; i++)      m.p2[i]  = (unsigned char)(xs32(&s) >> 8);
+    for (size_t i = 0; i < 2 * NE * m.sb13; i++)
+        m.s13[i] = (unsigned char)(121 + (xs32(&s) >> 8) % 4);
+    for (size_t i = 0; i < NE * m.sb2; i++)
+        m.s2[i]  = (unsigned char)(121 + (xs32(&s) >> 8) % 4);
+    m.src.get = mem_get;                 /* getmany and resident stay NULL */
+    m.src.ctx = &m;
+
+    K3MoeW w; memset(&w, 0, sizeof w);
+    w.gate = gate; w.bias = bias; w.latent_norm = lnw;
+    w.down = down; w.up = up; w.sh1 = sh1; w.sh3 = sh3; w.sh2 = sh2; w.wdt = K3_WF32;
+    w.src = &m.src; w.layer = 1;
+
+    const long drops0 = k3_expert_drops;
+    m.gets = 0;
+    k3_moe(yt, x, &w, &c, T, idx, wt, sc);
+    const long gets_token = m.gets;
+    m.gets = 0;
+    k3_moe_prefill(yb, x, &w, &c, T, idx, wt, sc);
+    const long gets_batch = m.gets;
+
+    /* unique experts per sub-chunk, from the router itself */
+    long uniq = 0;
+    {
+        char  *seen = (char *)malloc((size_t)NE);
+        int   *ri = (int *)malloc((size_t)K * sizeof(int));
+        float *rw = (float *)malloc((size_t)K * sizeof(float));
+        if (!seen || !ri || !rw) { printf("  FAIL  moe_prefill    out of memory\n"); exit(1); }
+        for (int t0 = 0; t0 < T; t0 += CHUNK) {
+            memset(seen, 0, (size_t)NE);
+            for (int t = t0; t < T && t < t0 + CHUNK; t++) {
+                k3_router(ri, rw, x + (size_t)t * E, gate, bias, E, NE, K,
+                          c.moe_renorm, c.routed_scale);
+                for (int j = 0; j < K; j++) if (!seen[ri[j]]) { seen[ri[j]] = 1; uniq++; }
+            }
+        }
+        free(seen); free(ri); free(rw);
+    }
+
+    const int batch_ok = memcmp(yb, yt, nout * sizeof(float)) == 0;
+    moe_ref(yr, x, &w, &c, T, CHUNK, S_RIGHT);
+    const int ref_ok = memcmp(yr, yt, nout * sizeof(float)) == 0;
+    int teeth[S_COUNT] = {0}, teeth_ok = 1;
+    for (int mu = S_REVERSED; mu < S_COUNT; mu++) {
+        float *ym = (float *)malloc(nout * sizeof(float));
+        if (!ym) { printf("  FAIL  moe_prefill    out of memory\n"); exit(1); }
+        moe_ref(ym, x, &w, &c, T, CHUNK, mu);
+        for (int t = 0; t < T; t++)
+            teeth[mu] += memcmp(ym + (size_t)t * E, yr + (size_t)t * E,
+                                (size_t)E * sizeof(float)) != 0;
+        if (2 * teeth[mu] < T) teeth_ok = 0;
+        free(ym);
+    }
+    const int count_ok = gets_token == (long)T * K && gets_batch == uniq;
+    const int drops_ok = k3_expert_drops == drops0;
+
+    if (batch_ok && ref_ok && teeth_ok && count_ok && drops_ok) {
+        printf("  PASS  moe_prefill    T=%d top%d of %d  bitwise == per-token k3_moe, "
+               "%ld expert gets vs %ld\n", T, K, NE, gets_batch, gets_token);
+        g_pass++;
+    } else {
+        printf("  FAIL  moe_prefill    batched=%s reference=%s gets=%ld/%ld (want %ld/%d) "
+               "drops=%ld\n", batch_ok ? "bitwise" : "DIFFERS",
+               ref_ok ? "bitwise" : "DIFFERS", gets_batch, gets_token, uniq, T * K,
+               k3_expert_drops - drops0);
+        g_fail++;
+    }
+    printf("        wrong routed-sum orders change: %s %d/%d, %s %d/%d positions\n",
+           SNAME[S_REVERSED], teeth[S_REVERSED], T, SNAME[S_FETCH], teeth[S_FETCH], T);
+
+    free(x); free(gate); free(bias); free(down); free(up); free(sh1); free(sh3); free(sh2);
+    free(lnw); free(m.p13); free(m.s13); free(m.p2); free(m.s2);
+    free(yb); free(yt); free(yr); free(sc); free(idx); free(wt);
 }
 
 /* The full KDA layer. This is the last and hardest component before the decoder
@@ -847,6 +1309,342 @@ static void t_matmul_bf16(void)
     free(Wb); free(Wf); free(x); free(ya); free(yb);
 }
 
+/* The batched trunk matmul must equal the per-position kernels BIT FOR BIT.
+ *
+ * k3_matmul_bf16_batch and k3_matmul_batch exist so that prefill and speculative
+ * verification read and widen each trunk matrix once for T positions instead of T times.
+ * Their whole claim is that no output moves: the same operands, accumulator partition,
+ * fma order, reduction tree and tail as k3_matmul_bf16 / k3_matmul on one position. So the
+ * comparison is on bits, over shapes chosen to reach every branch -- in below, at and
+ * above one 16-element chunk and every in % 16 remainder that matters, out below and
+ * above the OpenMP threshold, position counts that fill 1, 2 and 3 register blocks of
+ * every width the build may pick (K3_MM_TB: 2 on NEON, 4 on AVX2, 8 with AVX-512VL) and
+ * leave every remainder after them -- 1 to 7 for a block of 8, which takes a block of 4
+ * before its last 1 to 3 -- and an `in` wide enough that the positions are split into
+ * several passes over the matrix, including a final pass of one. Weights are arbitrary finite
+ * bf16 bit patterns (denormals and huge exponents included); activations mix signs,
+ * zeros, denormals and wide magnitudes. The strided forms are checked to write exactly
+ * their rows and nothing between them, and k3_mmw_batch is checked through every weight
+ * tag, including a streamed matrix with and without an apply_batch callback. */
+static unsigned g_rng = 0x5EEDu;
+static unsigned rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 17; g_rng ^= g_rng << 5; return g_rng; }
+
+static float rnd_x(void)
+{
+    const unsigned r = rnd();
+    switch (r & 15u) {
+    case 0:  return 0.0f;
+    case 1:  return -0.0f;
+    case 2:  return (float)((int)(r >> 8) - 8388608) * 1e-44f;   /* denormal range */
+    case 3:  return (float)((int)(r >> 8) - 8388608) * 1e-3f;    /* up to ~8e3     */
+    default: return (float)(r >> 8) / 8388608.0f - 1.0f;
+    }
+}
+
+static uint16_t rnd_bf16(void)
+{
+    uint16_t h = (uint16_t)(rnd() >> 8);
+    if (((h >> 7) & 0xFF) == 0xFF) h &= 0x7F7Fu;   /* finite only; NaN proves nothing */
+    return h;
+}
+
+/* CANCELLING operands, the ones that make a wrong summation order VISIBLE.
+ *
+ * With ordinary values a reassociated double sum differs from the right one in its last
+ * bit or two, and the final rounding to float erases that almost every time: measured, a
+ * kernel with a deliberately wrong reduction tree passed thousands of random cases. Wide
+ * random magnitudes do not help either, because the largest terms dominate every order
+ * alike. What exposes the order is exact cancellation: each row carries one product of
+ * +2^60*v and one of -2^60*v (same activation v, opposite weights) on top of ordinary
+ * terms. The exact sum is just the ordinary terms, but in double every ordinary term that
+ * meets the 2^60 partial sum BEFORE the two cancel is absorbed and lost, and which terms
+ * those are is decided precisely by the accumulator partition, the order within each
+ * accumulator, the reduction tree and the tail. Get any of them wrong and the float result
+ * changes outright. The pair's slots are drawn per row from a few indices shared by the
+ * matrix, since v must be the same in both slots for every position. */
+static uint16_t bf16_of(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)(u >> 16); }
+
+static void fill_cancelling(uint16_t *Wb, float *Wf, float *X, int in, int out, int T, int ldx)
+{
+    int big[4], nbig = in < 4 ? in : 4;
+    for (int k = 0; k < nbig; k++) {
+        int dup;
+        do {
+            big[k] = (int)(rnd() % (unsigned)in);
+            dup = 0;
+            for (int m = 0; m < k; m++) if (big[m] == big[k]) dup = 1;
+        } while (dup);
+    }
+    for (int t = 0; t < T; t++) {
+        float *xt = X + (size_t)t * ldx;
+        for (int i = 0; i < ldx; i++) xt[i] = (float)(rnd() >> 8) / 8388608.0f - 1.0f;
+        const float v = ((rnd() & 1u) ? -1.0f : 1.0f) * (1.0f + (float)(rnd() & 0xFFu) / 256.0f);
+        for (int k = 0; k < nbig; k++) xt[big[k]] = v;
+    }
+    for (int o = 0; o < out; o++) {
+        uint16_t *wb = Wb + (size_t)o * in;
+        float    *wf = Wf + (size_t)o * in;
+        for (int i = 0; i < in; i++) {
+            const uint16_t h = bf16_of((float)(rnd() >> 8) / 8388608.0f - 1.0f);
+            wb[i] = h; wf[i] = k3_bf16f(h);
+        }
+        if (nbig < 2) continue;
+        for (int k = 0; k < nbig; k++) { wb[big[k]] = 0; wf[big[k]] = 0.0f; }
+        const int p = (int)(rnd() % (unsigned)nbig);
+        int q = (int)(rnd() % (unsigned)(nbig - 1));
+        if (q >= p) q++;
+        wb[big[p]] = 0x5D80u; wf[big[p]] = k3_bf16f(0x5D80u);    /* +2^60 */
+        wb[big[q]] = 0xDD80u; wf[big[q]] = k3_bf16f(0xDD80u);    /* -2^60 */
+    }
+}
+
+typedef struct { K3WeightStream s; const uint16_t *W; int calls, batch_calls; } MockStream;
+static void mock_apply(const K3WeightStream *s, float *y, const float *x, int in, int out)
+{
+    MockStream *m = (MockStream *)(void *)s;
+    m->calls++;
+    k3_matmul_bf16(y, x, m->W, in, out);
+}
+static void mock_apply_batch(const K3WeightStream *s, float *Y, int ldy, const float *X,
+                             int ldx, int in, int out, int T)
+{
+    MockStream *m = (MockStream *)(void *)s;
+    m->batch_calls++;
+    k3_matmul_bf16_batch_ld(Y, ldy, X, ldx, m->W, in, out, T);
+}
+
+static int same_bits(const float *a, const float *b, size_t n)
+{
+    return memcmp(a, b, n * sizeof(float)) == 0;
+}
+
+static void t_matmul_batch(void)
+{
+    static const int ins[]  = {1, 5, 15, 16, 17, 31, 32, 33, 47, 100, 257, 1000};
+    static const int outs[] = {1, 3, 64, 65, 129, 300};
+    static const int Ts[]   = {1, 2, 3, 4, 5, 6, 7, 8, 15, 17, 26};
+    const int nin = (int)(sizeof ins / sizeof *ins), nout = (int)(sizeof outs / sizeof *outs);
+    const int nT = (int)(sizeof Ts / sizeof *Ts);
+    long cases = 0, bad = 0;
+    char where[160] = "";
+
+    for (int a = 0; a <= nin; a++) {
+        /* the last "in" is wide enough that 17 positions take several passes */
+        const int in = a < nin ? ins[a] : 33000;
+        for (int b = 0; b < nout; b++) {
+            const int out = a < nin ? outs[b] : 70;
+            if (a == nin && b > 0) break;
+            for (int c = 0; c < nT; c++) {
+                const int T = Ts[c];
+                const int ldx = in + 5, ldy = out + 3;
+                const size_t nw = (size_t)in * out;
+                uint16_t *Wb = (uint16_t *)malloc(nw * sizeof(uint16_t));
+                float *Wf = (float *)malloc(nw * sizeof(float));
+                float *X  = (float *)malloc((size_t)T * ldx * sizeof(float));
+                float *Yr = (float *)malloc((size_t)T * ldy * sizeof(float));
+                float *Yb = (float *)malloc((size_t)T * ldy * sizeof(float));
+                if (!Wb || !Wf || !X || !Yr || !Yb) {
+                    printf("  FAIL  matmul_batch   allocation\n"); g_fail++;
+                    free(Wb); free(Wf); free(X); free(Yr); free(Yb); return;
+                }
+                /* odd cases draw arbitrary values, even cases cancelling ones */
+                if ((a + b + c) % 2 == 0) {
+                    fill_cancelling(Wb, Wf, X, in, out, T, ldx);
+                } else {
+                    for (size_t i = 0; i < nw; i++) { Wb[i] = rnd_bf16(); Wf[i] = rnd_x(); }
+                    for (size_t i = 0; i < (size_t)T * ldx; i++) X[i] = rnd_x();
+                }
+
+                for (int dt = 0; dt < 2; dt++) {
+                    /* reference: the single-position kernel, one position at a time */
+                    for (int t = 0; t < T; t++) {
+                        if (dt) k3_matmul_bf16(Yr + (size_t)t * out, X + (size_t)t * ldx,
+                                               Wb, in, out);
+                        else    k3_matmul(Yr + (size_t)t * out, X + (size_t)t * ldx,
+                                          Wf, in, out);
+                    }
+                    /* dense form, from a compact copy of X */
+                    float *Xc = (float *)malloc((size_t)T * in * sizeof(float));
+                    for (int t = 0; t < T; t++)
+                        memcpy(Xc + (size_t)t * in, X + (size_t)t * ldx, (size_t)in * sizeof(float));
+                    for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                    if (dt) k3_matmul_bf16_batch(Yb, Xc, Wb, in, out, T);
+                    else    k3_matmul_batch(Yb, Xc, Wf, in, out, T);
+                    cases++;
+                    if (!same_bits(Yr, Yb, (size_t)T * out)) {
+                        bad++;
+                        snprintf(where, sizeof where, "%s dense in=%d out=%d T=%d",
+                                 dt ? "bf16" : "fp32", in, out, T);
+                    }
+                    /* strided form: rows land at ldy, gaps untouched */
+                    for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                    if (dt) k3_matmul_bf16_batch_ld(Yb, ldy, X, ldx, Wb, in, out, T);
+                    else    k3_matmul_batch_ld(Yb, ldy, X, ldx, Wf, in, out, T);
+                    cases++;
+                    int ok = 1;
+                    for (int t = 0; t < T && ok; t++) {
+                        if (!same_bits(Yr + (size_t)t * out, Yb + (size_t)t * ldy, (size_t)out)) ok = 0;
+                        for (int g = out; g < ldy; g++)
+                            if (Yb[(size_t)t * ldy + g] != -12345.0f) ok = 0;
+                    }
+                    if (!ok) {
+                        bad++;
+                        snprintf(where, sizeof where, "%s strided in=%d out=%d T=%d",
+                                 dt ? "bf16" : "fp32", in, out, T);
+                    }
+                    /* the dispatcher, through the tag that selects this kernel */
+                    for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                    k3_mmw_batch(Yb, Xc, dt ? (const void *)Wb : (const void *)Wf,
+                                 dt ? K3_WBF16 : K3_WF32, in, out, T);
+                    cases++;
+                    if (!same_bits(Yr, Yb, (size_t)T * out)) {
+                        bad++;
+                        snprintf(where, sizeof where, "%s k3_mmw_batch in=%d out=%d T=%d",
+                                 dt ? "bf16" : "fp32", in, out, T);
+                    }
+                    free(Xc);
+                }
+
+                /* a streamed matrix: apply_batch when present, per-position apply when not */
+                if (in <= 257) {
+                    for (int with_batch = 0; with_batch < 2; with_batch++) {
+                        MockStream ms; memset(&ms, 0, sizeof ms);
+                        ms.s.apply = mock_apply;
+                        ms.s.apply_batch = with_batch ? mock_apply_batch : NULL;
+                        ms.W = Wb;
+                        for (int t = 0; t < T; t++)
+                            k3_matmul_bf16(Yr + (size_t)t * out, X + (size_t)t * ldx, Wb, in, out);
+                        for (size_t i = 0; i < (size_t)T * ldy; i++) Yb[i] = -12345.0f;
+                        k3_mmw_batch_ld(Yb, ldy, X, ldx, &ms, K3_WSTREAM, in, out, T);
+                        cases++;
+                        int ok = 1;
+                        for (int t = 0; t < T; t++)
+                            if (!same_bits(Yr + (size_t)t * out, Yb + (size_t)t * ldy, (size_t)out)) ok = 0;
+                        /* T == 1 must take the single-position path; otherwise one batch
+                         * call when the callback exists, T calls of apply when it does not */
+                        const int want_batch = (with_batch && T > 1) ? 1 : 0;
+                        const int want_calls = want_batch ? 0 : T;
+                        if (ms.batch_calls != want_batch || ms.calls != want_calls) ok = 0;
+                        if (!ok) {
+                            bad++;
+                            snprintf(where, sizeof where, "stream%s in=%d out=%d T=%d calls=%d/%d",
+                                     with_batch ? "+batch" : "", in, out, T, ms.calls, ms.batch_calls);
+                        }
+                    }
+                }
+                free(Wb); free(Wf); free(X); free(Yr); free(Yb);
+            }
+        }
+    }
+
+    /* NaN OUTPUTS. The per-position kernels store every NaN as the one quiet NaN
+     * 0x7FC00000 (k3_out_f32 in k3_ops.c), because which input NaN an operation passes
+     * on is not fixed by IEEE 754 and differs between instruction sequences. The
+     * batched tiles are other instruction sequences again, so a NaN they produce must be
+     * stored the same way or a prefill and a decode of the same position disagree in
+     * the NaN's sign and payload. The finite draws above cannot see this, so here each
+     * position's x and each row's weights carry NaNs of random sign and payload, in the
+     * whole chunks and in the tail, plus an infinite x beside a zero weight (0 * inf is
+     * the default NaN), and positions differ in which rows go NaN. */
+    {
+        static const int nins[] = {17, 33, 100};
+        static const int nouts[] = {3, 65};
+        static const int nTs[] = {2, 3, 5, 8, 9, 17};
+        long nan_outputs = 0;
+        for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 2; b++)
+                for (int c = 0; c < 6; c++) {
+                    const int in = nins[a], out = nouts[b], T = nTs[c];
+                    const size_t nw = (size_t)in * out;
+                    uint16_t *Wb = (uint16_t *)malloc(nw * sizeof(uint16_t));
+                    float *Wf = (float *)malloc(nw * sizeof(float));
+                    float *X  = (float *)malloc((size_t)T * in * sizeof(float));
+                    float *Yr = (float *)malloc((size_t)T * out * sizeof(float));
+                    float *Yb = (float *)malloc((size_t)T * out * sizeof(float));
+                    if (!Wb || !Wf || !X || !Yr || !Yb) {
+                        bad++; snprintf(where, sizeof where, "nan allocation");
+                        free(Wb); free(Wf); free(X); free(Yr); free(Yb); continue;
+                    }
+                    for (size_t i = 0; i < nw; i++) { Wb[i] = rnd_bf16(); Wf[i] = rnd_x(); }
+                    for (size_t i = 0; i < (size_t)T * in; i++) X[i] = rnd_x();
+                    for (int o = 0; o < out; o++) {
+                        if (rnd() % 3u == 0) continue;                  /* some rows stay finite */
+                        for (int k = 1 + (int)(rnd() % 3u); k > 0; k--) {
+                            const int at = (int)(rnd() % (unsigned)in);
+                            const uint32_t u = 0x7FC00000u | (rnd() & 0x803FFFFFu);
+                            float f; memcpy(&f, &u, 4);
+                            Wf[(size_t)o * in + at] = f;
+                            Wb[(size_t)o * in + at] = (uint16_t)(u >> 16);
+                        }
+                    }
+                    for (int t = 0; t < T; t++) {
+                        if (rnd() % 4u == 0) {                          /* one NaN x: all rows */
+                            const uint32_t u = 0x7FC00000u | (rnd() & 0x803FFFFFu);
+                            memcpy(&X[(size_t)t * in + rnd() % (unsigned)in], &u, 4);
+                        } else if (rnd() % 3u == 0) {                   /* 0 * inf in row 0 */
+                            const int at = (int)(rnd() % (unsigned)in);
+                            X[(size_t)t * in + at] = (rnd() & 1u) ? INFINITY : -INFINITY;
+                            Wb[at] = 0; Wf[at] = 0.0f;
+                        }
+                    }
+                    for (int dt = 0; dt < 2; dt++) {
+                        for (int t = 0; t < T; t++) {
+                            if (dt) k3_matmul_bf16(Yr + (size_t)t * out, X + (size_t)t * in,
+                                                   Wb, in, out);
+                            else    k3_matmul(Yr + (size_t)t * out, X + (size_t)t * in,
+                                              Wf, in, out);
+                        }
+                        if (dt) k3_matmul_bf16_batch(Yb, X, Wb, in, out, T);
+                        else    k3_matmul_batch(Yb, X, Wf, in, out, T);
+                        cases++;
+                        for (size_t i = 0; i < (size_t)T * out; i++) nan_outputs += Yr[i] != Yr[i];
+                        if (!same_bits(Yr, Yb, (size_t)T * out)) {
+                            bad++;
+                            snprintf(where, sizeof where, "%s NaN in=%d out=%d T=%d",
+                                     dt ? "bf16" : "fp32", in, out, T);
+                        }
+                    }
+                    free(Wb); free(Wf); free(X); free(Yr); free(Yb);
+                }
+        if (nan_outputs == 0) {                           /* the check must see some NaN */
+            bad++; snprintf(where, sizeof where, "NaN cases produced no NaN output");
+        }
+    }
+
+    /* K3_WI8 carries no exactness contract; the dispatcher must simply be the per-position
+     * draft kernel, so it is compared to exactly that. */
+    {
+        const int in = 100, out = 70, T = 5;
+        const size_t rowb = (size_t)4 + (size_t)in;
+        unsigned char *W8 = (unsigned char *)malloc(rowb * out);
+        float *X  = (float *)malloc((size_t)T * in * sizeof(float));
+        float *Yr = (float *)malloc((size_t)T * out * sizeof(float));
+        float *Yb = (float *)malloc((size_t)T * out * sizeof(float));
+        for (int o = 0; o < out; o++) {
+            const float sc = 0.01f * (float)(o + 1);
+            memcpy(W8 + (size_t)o * rowb, &sc, 4);
+            for (int i = 0; i < in; i++) W8[(size_t)o * rowb + 4 + i] = (unsigned char)rnd();
+        }
+        for (int i = 0; i < T * in; i++) X[i] = rnd_x();
+        for (int t = 0; t < T; t++)
+            k3_matmul_q8(Yr + (size_t)t * out, X + (size_t)t * in, W8, in, out);
+        k3_mmw_batch(Yb, X, W8, K3_WI8, in, out, T);
+        cases++;
+        if (!same_bits(Yr, Yb, (size_t)T * out)) { bad++; snprintf(where, sizeof where, "int8 draft"); }
+        free(W8); free(X); free(Yr); free(Yb);
+    }
+
+    if (bad) {
+        printf("  FAIL  matmul_batch   %ld/%ld cases differ from the per-position kernels, "
+               "e.g. %s\n", bad, cases, where);
+        g_fail++;
+    } else {
+        printf("  PASS  matmul_batch   %ld cases, T in {1..8,15,17,26}, bit-identical to "
+               "per-position k3_matmul_bf16 / k3_matmul\n", cases);
+        g_pass++;
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -882,8 +1680,10 @@ int main(int argc, char **argv)
     t_router(dir);
     t_mla(dir);
     t_moe(dir);
+    t_moe_prefill();
     t_mxfp4(dir);
     t_matmul_bf16();
+    t_matmul_batch();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

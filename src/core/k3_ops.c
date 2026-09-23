@@ -26,6 +26,17 @@
  *
  * Matmul accumulators are double; the KDA recurrence retains float sums. Hidden size is 7168 and expert rows are 2048
  * wide; a float32 accumulator loses precision the reference comparisons can see.
+ *
+ * NaN outputs are canonical. When two NaNs meet in one operation, which payload and
+ * sign survive is left open by C and IEEE 754 and decided by the compiler's instruction
+ * selection (vfmadd132/213/231, the operand order of a commutative add): measured, the
+ * same fma(w, x, acc) tail keeps the weight's NaN in the scalar build and the
+ * activation's in the AVX2 build. So k3_matmul, k3_matmul_bf16 and both batched tiles
+ * store every NaN result through k3_out_f32 as the one quiet NaN 0x7FC00000, which makes
+ * a NaN output the same bits on every path, and test_ops injects NaNs of random sign and
+ * payload into the batched gate to hold it. k3_matmul_mxfp4 is outside that rule (it
+ * never runs on a row range that another path also computes). A NaN logit still means
+ * the weights or the state are already corrupt; greedy selection reads no payload bits.
  */
 #include "k3.h"
 
@@ -338,43 +349,525 @@ void k3_kda_step(float *S, float *o, const float *q, const float *k,
  *      by exactly one thread in exactly the order below. Results are therefore
  *      identical at any thread count, which the fixtures rely on.
  *
- *   2. FOUR ACCUMULATORS, PARTITIONED BY i%4, REDUCED AS (a0+a1)+(a2+a3). The split
- *      keeps the FMA pipeline full, a single accumulator serialises on the latency
- *      chain, but it is written out explicitly rather than left to the compiler
- *      because it fixes a summation ORDER. k3_matmul_bf16 and both AVX2 paths
- *      reproduce this exact partition and this exact tree, which is what makes the
- *      three implementations agree bit for bit.
+ *   2. SIXTEEN ACCUMULATORS, PARTITIONED BY i%16, REDUCED BY ONE FIXED TREE (see
+ *      k3_tree16). The split keeps the FMA pipeline full, a single accumulator
+ *      serialises on the latency chain, but it is written out explicitly rather than
+ *      left to the compiler because it fixes a summation ORDER. k3_matmul_bf16 and
+ *      every vector path (AVX2, AVX-512, NEON) reproduce this exact partition and this
+ *      exact tree, which is what makes the implementations agree bit for bit.
  *
- * Floating-point addition is not associative, so the four-way split is a real change
+ * Floating-point addition is not associative, so the sixteen-way split is a real change
  * to the arithmetic relative to a sequential sum. Keeping the accumulators in double
  * bounds the difference far below fp32 output precision; making them float would not.
  */
+
+/* THE PARTITION, WRITTEN DOWN ONCE. For every element i below n16 = in & ~15, the
+ * product row[i] * x[i] is fused (one fma() in double, one rounding) into accumulator
+ * a[i % 16], each accumulator in ascending i. The sixteen are then reduced by the tree
+ * below, and the last in % 16 elements are fused sequentially into the result. Every
+ * implementation of k3_matmul and k3_matmul_bf16 -- scalar, AVX2, AVX-512, NEON, one row
+ * at a time or two, x widened in place or read from a hoisted copy -- computes exactly
+ * this, which tests/unit/test_matmul_exact.c checks against a plain re-implementation
+ * on data built so that any other order changes the result. */
+static inline double k3_tree16(const double *a)
+{
+    const double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
+    const double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
+    const double b2 = (a[2] + a[6]) + (a[10] + a[14]);
+    const double b3 = (a[3] + a[7]) + (a[11] + a[15]);
+    return (b0 + b1) + (b2 + b3);
+}
+
+/* EVERY NaN OUTPUT IS THE SAME NaN. The partition and tree fix every other output's
+ * bits, but not a NaN's sign and payload: IEEE 754 leaves unspecified which input NaN
+ * an operation passes on, x86 takes the one in the first source operand of whichever
+ * instruction form the compiler picked, and compilers treat the operands of a*b, a+b
+ * and fma's product as interchangeable. k3_matmul_bf16 sums the two rows of a pair
+ * with separate instruction sequences, so the same row can leave with different NaN
+ * bits as the first of a pair or the second (observed on the AVX2 and scalar builds),
+ * and the row pipeline in k3_trunk.c splits a matrix into calls whose length follows
+ * the memory budget, which moves rows between the two. Storing every NaN as the one
+ * quiet NaN 0x7FC00000 makes a NaN output, like every other output, the same bits at
+ * every budget and on every path. Nothing else changes: a value that is not NaN is
+ * stored exactly as (float)acc. k3_matmul does the same so that the two kernels, which
+ * share one order, also share one NaN. */
+static inline float k3_out_f32(double acc)
+{
+    union { uint32_t u; float f; } v;
+    v.f = (float)acc;
+    if (v.f != v.f) v.u = 0x7FC00000u;
+    return v.f;
+}
+
+/* The vector paths read x from a double copy made once per call (see "WIDEN x ONCE" in
+ * k3_matmul_mxfp4); without a vector unit there is nothing to hoist. */
+#if defined(__AVX2__) || (defined(__ARM_NEON) && defined(__aarch64__))
+#define K3_MM_HOIST 1
+#else
+#define K3_MM_HOIST 0
+#endif
+
+/* The whole-chunk part of one fp32 row, the reference form: portable C, x widened per
+ * element. It is the scalar build's path and the vector builds' fallback when the
+ * hoisted copy of x could not be allocated, so that failure costs speed and nothing
+ * else: the partition and tree are the ones every vector path reproduces. */
+static inline double k3_f32_row_c(const float *row, const float *x, int n16)
+{
+    double a[16] = {0};
+    for (int i = 0; i < n16; i += 16)
+        for (int l = 0; l < 16; l++)
+            a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
+    return k3_tree16(a);
+}
+
+#if K3_MM_HOIST
+/* The same sum from the hoisted xd[i] == (double)x[i]. Float to double is exact, so the
+ * operands of every fma are the ones k3_f32_row_c forms in place.
+ *
+ *   AVX-512  two __m512d: z0 lane l is a[l], z1 lane l is a[8 + l].
+ *   AVX2     four __m256d: v0..v3 hold a[0..3], a[4..7], a[8..11], a[12..15]; the
+ *            lanewise (v0+v1)+(v2+v3) is b0..b3 of k3_tree16, then (b0+b1)+(b2+b3).
+ *   NEON     eight float64x2_t: wk holds {a[2k], a[2k+1]}; (w0+w2)+(w4+w6) is {b0,b1}
+ *            and (w1+w3)+(w5+w7) is {b2,b3}.
+ *
+ * _mm512_fmadd_pd, _mm256_fmadd_pd and vfmaq_f64 are the IEEE fused multiply-add per
+ * lane, the same single rounding as fma(). */
+static inline double k3_f32_row_v(const float *row, const double *xd, int n16)
+{
+#if defined(__AVX512F__)
+    __m512d z0 = _mm512_setzero_pd(), z1 = _mm512_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        z0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(row + i)),
+                             _mm512_loadu_pd(xd + i), z0);
+        z1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_loadu_ps(row + i + 8)),
+                             _mm512_loadu_pd(xd + i + 8), z1);
+    }
+    double a[16];
+    _mm512_storeu_pd(a, z0);
+    _mm512_storeu_pd(a + 8, z1);
+    return k3_tree16(a);
+#elif defined(__AVX2__)
+    __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
+    __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        v0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i)),
+                             _mm256_loadu_pd(xd + i), v0);
+        v1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i + 4)),
+                             _mm256_loadu_pd(xd + i + 4), v1);
+        v2 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i + 8)),
+                             _mm256_loadu_pd(xd + i + 8), v2);
+        v3 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_loadu_ps(row + i + 12)),
+                             _mm256_loadu_pd(xd + i + 12), v3);
+    }
+    double b[4];
+    _mm256_storeu_pd(b, _mm256_add_pd(_mm256_add_pd(v0, v1), _mm256_add_pd(v2, v3)));
+    return (b[0] + b[1]) + (b[2] + b[3]);
+#else
+    float64x2_t w0 = vdupq_n_f64(0.0), w1 = vdupq_n_f64(0.0);
+    float64x2_t w2 = vdupq_n_f64(0.0), w3 = vdupq_n_f64(0.0);
+    float64x2_t w4 = vdupq_n_f64(0.0), w5 = vdupq_n_f64(0.0);
+    float64x2_t w6 = vdupq_n_f64(0.0), w7 = vdupq_n_f64(0.0);
+    for (int i = 0; i < n16; i += 16) {
+        const float32x4_t f0 = vld1q_f32(row + i),     f1 = vld1q_f32(row + i + 4);
+        const float32x4_t f2 = vld1q_f32(row + i + 8), f3 = vld1q_f32(row + i + 12);
+        w0 = vfmaq_f64(w0, vcvt_f64_f32(vget_low_f32(f0)), vld1q_f64(xd + i));
+        w1 = vfmaq_f64(w1, vcvt_high_f64_f32(f0),          vld1q_f64(xd + i + 2));
+        w2 = vfmaq_f64(w2, vcvt_f64_f32(vget_low_f32(f1)), vld1q_f64(xd + i + 4));
+        w3 = vfmaq_f64(w3, vcvt_high_f64_f32(f1),          vld1q_f64(xd + i + 6));
+        w4 = vfmaq_f64(w4, vcvt_f64_f32(vget_low_f32(f2)), vld1q_f64(xd + i + 8));
+        w5 = vfmaq_f64(w5, vcvt_high_f64_f32(f2),          vld1q_f64(xd + i + 10));
+        w6 = vfmaq_f64(w6, vcvt_f64_f32(vget_low_f32(f3)), vld1q_f64(xd + i + 12));
+        w7 = vfmaq_f64(w7, vcvt_high_f64_f32(f3),          vld1q_f64(xd + i + 14));
+    }
+    const float64x2_t t0 = vaddq_f64(vaddq_f64(w0, w2), vaddq_f64(w4, w6));
+    const float64x2_t t1 = vaddq_f64(vaddq_f64(w1, w3), vaddq_f64(w5, w7));
+    return vaddvq_f64(t0) + vaddvq_f64(t1);
+#endif
+}
+#endif /* K3_MM_HOIST */
+
 void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+{
+    const int n16 = in & ~15;
+
+    /* x widened once per call rather than once per row; see k3_matmul_mxfp4. A failed
+     * allocation selects k3_f32_row_c, the same sum without the copy. */
+#if K3_MM_HOIST
+    double *const xd = (double *)malloc((size_t)in * sizeof(double));
+    if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+#endif
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const float *row = W + (size_t)o * in;
+#if K3_MM_HOIST
+        double acc = xd ? k3_f32_row_v(row, xd, n16) : k3_f32_row_c(row, x, n16);
+#else
+        double acc = k3_f32_row_c(row, x, n16);
+#endif
+        for (int i = n16; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
+        y[o] = k3_out_f32(acc);
+    }
+
+#if K3_MM_HOIST
+    free(xd);                                     /* free(NULL) is a no-op */
+#endif
+}
+
+/* ------------------------------------------------------- batched matmul ---- */
+/* Y[t][o] = W[o] . X[t] for T positions in one call, every output BIT-IDENTICAL to
+ * k3_matmul or k3_matmul_bf16 applied to that position alone.
+ *
+ * WHY THIS EXISTS
+ *   Prefill, speculative verification and draft prefill apply every trunk matrix to T
+ *   positions. Called once per position, the matrix streams through the core T times and
+ *   the single-position kernel's real bottleneck, widening bf16 -> f32 -> f64, is redone
+ *   T times for the same weights; under the row pipeline each call also rereads the matrix
+ *   from disk. Here a row's weights are widened ONCE per register block of positions and
+ *   every position in the block consumes the same widened register, and a streamed matrix
+ *   is applied through K3WeightStream.apply_batch so it is read once per batch.
+ *
+ * WHY IT IS EXACT
+ *   A block of positions is several independent copies of the single-position
+ *   computation that happen to share the register holding the widened weight. For every
+ *   (position, output) pair nothing else differs:
+ *     - same operands. The weight goes through the same widening (bf16 -> f32 is a 16-bit
+ *       shift, f32 -> f64 is exact) and x through the same f32 -> f64 conversion. A
+ *       widened value is a value, whichever position it is shared with.
+ *     - same partition. Element i of the row lands in accumulator i % 16 of ITS position:
+ *       four __m256d per position on AVX2 (lane l of vector j is accumulator 4j+l), eight
+ *       float64x2_t per position on NEON (vector k holds accumulators 2k and 2k+1), a
+ *       [16] array per position in scalar C. Positions never share an accumulator.
+ *     - same order within an accumulator: i ascending, one fma per element, the product
+ *       first and the running sum last, exactly as the single-position kernels issue it.
+ *     - same reduction tree: (a[l] + a[4+l]) + (a[8+l] + a[12+l]) for each l, then
+ *       (b0 + b1) + (b2 + b3), per position.
+ *     - same tail: the elements past the last full 16 are fma'd into the reduced sum in
+ *       ascending order, and the final (float) rounding is the same.
+ *     - same store: k3_out_f32, so a NaN output is the one quiet NaN here too. The tiles
+ *       are other instruction sequences than the single-position kernels and may pass
+ *       on a different input NaN; without it a NaN's sign and payload would depend on
+ *       whether its position was prefilled in a batch or decoded alone.
+ *   OpenMP splits OUTPUT ROWS across threads, as the single-position kernels do, so each
+ *   output is still summed by one thread in the order above, at any thread count.
+ *   test_ops compares every output bitwise against the per-position kernels over many
+ *   shapes, tails and position counts, in whatever ISA the binary was built for.
+ *
+ * WHAT IS NOT DONE, AND WHY
+ *   AVX-512 is not used. Measured on an AVX-512 Xeon, a 512-bit form of this loop was no
+ *   faster than the 256-bit one: with the weight widened once per block, what remains is
+ *   the per-position f32 -> f64 conversion of x, and the wider form does not remove it.
+ *   Widening X to double once per call instead turns the loop into an L2 stream of
+ *   doubles, and that measured slower still, including with the tile packed for L1.
+ *   So an AVX-512 build runs the 256-bit tiles below beside the single-position
+ *   kernels' 512-bit rows. That is not a second arithmetic: the tiles and every
+ *   k3_matmul / k3_matmul_bf16 path hold the same sixteen accumulators, each fed its
+ *   own elements in ascending order and reduced by the one tree (k3_tree16); the lane
+ *   layouts differ only in which register lane holds which accumulator.
+ *   test_matmul_exact holds the single-position kernels to that partition and tree,
+ *   and test_ops holds these tiles to the single-position kernels, on every ISA.
+ *
+ * POSITIONS PER REGISTER BLOCK (K3_MM_TB)
+ *   Each position in a block holds four __m256d accumulators on AVX2, so the block size
+ *   is set by the vector register file. With 16 ymm registers (plain AVX2) a block of 4
+ *   fills them, and 8 spills: bench_batch at 12288 x 7168 on the reference VM, built
+ *   with -mavx2 -mfma, measured blocks of 8 2% to 9% SLOWER than 4 at T = 8, 9 and 16,
+ *   on one thread and on four. With
+ *   AVX-512VL the compiler may use ymm16-31 for the same 256-bit code, and there a block
+ *   of 8 measured 7% to 13% faster than 4 at T = 8, 9 and 16 on one thread and at T = 8
+ *   and 9 on four, tying at 16 on four (runs in docs/notes/research-results.md).
+ *   So 8 when __AVX512VL__ is defined, else 4; NEON keeps 2, since each position needs
+ *   eight of its 32 registers for accumulators. The block size is a loop shape only:
+ *   each position keeps its own accumulators whatever the block, so no output can
+ *   depend on it, and test_ops checks every block size and remainder bitwise. It may be
+ *   forced with -DK3_MM_TB=1, 2, 4 or 8 to compare them. */
+
+/* Force inlining so that each call below, made with a literal block size, gets its own
+ * copy with the position loops unrolled and the accumulators held in registers. */
+#if defined(__GNUC__)
+#define K3_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define K3_ALWAYS_INLINE static inline
+#endif
+
+#ifndef K3_MM_TB
+#if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
+#define K3_MM_TB 2
+#elif defined(__AVX2__) && defined(__AVX512VL__)
+#define K3_MM_TB 8
+#else
+#define K3_MM_TB 4
+#endif
+#endif
+#if K3_MM_TB != 1 && K3_MM_TB != 2 && K3_MM_TB != 4 && K3_MM_TB != 8
+#error "K3_MM_TB must be 1, 2, 4 or 8: the remainder dispatch below covers those"
+#endif
+
+/* Positions per pass over the matrix. Every row reads the X rows of all positions in the
+ * pass, so the pass is sized to keep them (about 512 KiB of floats) cache resident while
+ * the weights stream past; the matrix is then read once per pass rather than once per
+ * position. This chooses a loop order only. It cannot change an output. */
+static int k3_mm_pass(int in)
+{
+    long g = (512L * 1024L) / ((long)(in > 0 ? in : 1) * (long)sizeof(float));
+    g -= g % K3_MM_TB;
+    if (g < K3_MM_TB) g = K3_MM_TB;
+    if (g > 4096)     g = 4096;
+    return (int)g;
+}
+
+/* One output row for nb positions: y[t*ldy] for t < nb. fp32 weights, k3_matmul's
+ * arithmetic. */
+K3_ALWAYS_INLINE void k3_mm_f32_tile(float *y, int ldy, const float *X, int ldx,
+                                     const float *row, int in, const int nb)
+{
+    double a[K3_MM_TB][16];
+    double acc[K3_MM_TB];
+    for (int t = 0; t < nb; t++)
+        for (int l = 0; l < 16; l++) a[t][l] = 0.0;
+    int i = 0;
+    for (; i + 15 < in; i += 16)
+        for (int t = 0; t < nb; t++) {
+            const float *xt = X + (size_t)t * ldx + i;
+            for (int l = 0; l < 16; l++)
+                a[t][l] = fma((double)row[i + l], (double)xt[l], a[t][l]);
+        }
+    for (int t = 0; t < nb; t++) {
+        const double b0 = (a[t][0] + a[t][4]) + (a[t][8]  + a[t][12]);
+        const double b1 = (a[t][1] + a[t][5]) + (a[t][9]  + a[t][13]);
+        const double b2 = (a[t][2] + a[t][6]) + (a[t][10] + a[t][14]);
+        const double b3 = (a[t][3] + a[t][7]) + (a[t][11] + a[t][15]);
+        acc[t] = (b0 + b1) + (b2 + b3);
+    }
+    for (; i < in; i++) {
+        const double wi = (double)row[i];
+        for (int t = 0; t < nb; t++) acc[t] = fma(wi, (double)X[(size_t)t * ldx + i], acc[t]);
+    }
+    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = k3_out_f32(acc[t]);
+}
+
+/* One output row for nb positions, bf16 weights, k3_matmul_bf16's arithmetic: its
+ * partition, fma order, tree and tail, in a lane layout of the tile's own (AVX2 and
+ * scalar forms below; NEON the same layout as k3_matmul_bf16's NEON rows). */
+K3_ALWAYS_INLINE void k3_mm_bf16_tile(float *y, int ldy, const float *X, int ldx,
+                                      const uint16_t *row, int in, const int nb)
+{
+    double acc[K3_MM_TB];
+    int i = 0;
+#if defined(__AVX2__)
+    {
+        __m256d v[K3_MM_TB][4];
+        for (int t = 0; t < nb; t++)
+            for (int j = 0; j < 4; j++) v[t][j] = _mm256_setzero_pd();
+        for (; i + 15 < in; i += 16) {
+            /* Sixteen weights, widened once: bf16 -> f32 is the 16-bit shift and
+             * f32 -> f64 exact, so each is the value k3_matmul_bf16 multiplies (its x86
+             * rows split even and odd elements with a shift and a mask instead, which
+             * yields the same floats). wv[j] holds elements i+4j .. i+4j+3, i.e.
+             * accumulators 4j .. 4j+3, in natural order. */
+            __m256d wv[4];
+            for (int j = 0; j < 4; j++) {
+                const __m128i h = _mm_loadl_epi64((const __m128i *)(row + i + 4 * j));
+                wv[j] = _mm256_cvtps_pd(
+                    _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h), 16)));
+            }
+            for (int t = 0; t < nb; t++) {
+                const float *xt = X + (size_t)t * ldx + i;
+                for (int j = 0; j < 4; j++)
+                    v[t][j] = _mm256_fmadd_pd(wv[j], _mm256_cvtps_pd(_mm_loadu_ps(xt + 4 * j)),
+                                              v[t][j]);
+            }
+        }
+        /* (v0+v1)+(v2+v3) lanewise is b0..b3 of k3_tree16, then (b0+b1)+(b2+b3): the one
+         * tree, per position */
+        for (int t = 0; t < nb; t++) {
+            const __m256d vt = _mm256_add_pd(_mm256_add_pd(v[t][0], v[t][1]),
+                                             _mm256_add_pd(v[t][2], v[t][3]));
+            double a[4];
+            _mm256_storeu_pd(a, vt);
+            acc[t] = (a[0] + a[1]) + (a[2] + a[3]);
+        }
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    {
+        /* v[t][k] holds accumulators {2k, 2k+1} of position t, as w0..w7 do in
+         * k3_matmul_bf16's NEON path: quad q of the chunk feeds v[t][2q] with its low
+         * half and v[t][2q+1] with its high half, vfmaq_f64(acc, weight, x). */
+        float64x2_t v[K3_MM_TB][8];
+        for (int t = 0; t < nb; t++)
+            for (int k = 0; k < 8; k++) v[t][k] = vdupq_n_f64(0.0);
+        for (; i + 15 < in; i += 16) {
+            const uint16x8_t h0 = vld1q_u16(row + i);
+            const uint16x8_t h1 = vld1q_u16(row + i + 8);
+            const float32x4_t f[4] = {
+                vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16)),
+                vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16)),
+                vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16)),
+                vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16))
+            };
+            float64x2_t wv[8];
+            for (int q = 0; q < 4; q++) {
+                wv[2 * q]     = vcvt_f64_f32(vget_low_f32(f[q]));
+                wv[2 * q + 1] = vcvt_high_f64_f32(f[q]);
+            }
+            for (int t = 0; t < nb; t++) {
+                const float *xt = X + (size_t)t * ldx + i;
+                for (int q = 0; q < 4; q++) {
+                    const float32x4_t xq = vld1q_f32(xt + 4 * q);
+                    v[t][2 * q]     = vfmaq_f64(v[t][2 * q], wv[2 * q],
+                                                vcvt_f64_f32(vget_low_f32(xq)));
+                    v[t][2 * q + 1] = vfmaq_f64(v[t][2 * q + 1], wv[2 * q + 1],
+                                                vcvt_high_f64_f32(xq));
+                }
+            }
+        }
+        /* {b0,b1} = (v0+v2)+(v4+v6), {b2,b3} = (v1+v3)+(v5+v7), then (b0+b1)+(b2+b3):
+         * the scalar tree, as k3_matmul_bf16's NEON path reduces it. */
+        for (int t = 0; t < nb; t++) {
+            const float64x2_t s0 = vaddq_f64(vaddq_f64(v[t][0], v[t][2]),
+                                             vaddq_f64(v[t][4], v[t][6]));
+            const float64x2_t s1 = vaddq_f64(vaddq_f64(v[t][1], v[t][3]),
+                                             vaddq_f64(v[t][5], v[t][7]));
+            acc[t] = vaddvq_f64(s0) + vaddvq_f64(s1);
+        }
+    }
+#else
+    {
+        double a[K3_MM_TB][16];
+        for (int t = 0; t < nb; t++)
+            for (int l = 0; l < 16; l++) a[t][l] = 0.0;
+        for (; i + 15 < in; i += 16)
+            for (int l = 0; l < 16; l++) {
+                const double wl = (double)k3_bf16f(row[i + l]);
+                for (int t = 0; t < nb; t++)
+                    a[t][l] = fma(wl, (double)X[(size_t)t * ldx + i + l], a[t][l]);
+            }
+        for (int t = 0; t < nb; t++) {
+            const double b0 = (a[t][0] + a[t][4]) + (a[t][8]  + a[t][12]);
+            const double b1 = (a[t][1] + a[t][5]) + (a[t][9]  + a[t][13]);
+            const double b2 = (a[t][2] + a[t][6]) + (a[t][10] + a[t][14]);
+            const double b3 = (a[t][3] + a[t][7]) + (a[t][11] + a[t][15]);
+            acc[t] = (b0 + b1) + (b2 + b3);
+        }
+    }
+#endif
+    for (; i < in; i++) {
+        const double wi = (double)k3_bf16f(row[i]);
+        for (int t = 0; t < nb; t++) acc[t] = fma(wi, (double)X[(size_t)t * ldx + i], acc[t]);
+    }
+    for (int t = 0; t < nb; t++) y[(size_t)t * ldy] = k3_out_f32(acc[t]);
+}
+
+/* One pass: every row, positions in register blocks of K3_MM_TB, the remainder in at
+ * most two smaller blocks (a block of 4 first when K3_MM_TB is 8). Each literal block
+ * size below is its own inlined copy of the tile. */
+static void k3_mm_f32_pass(float *Y, int ldy, const float *X, int ldx,
+                           const float *W, int in, int out, int T)
 {
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
     for (int o = 0; o < out; o++) {
         const float *row = W + (size_t)o * in;
-        /* Sixteen accumulators, EXPLICITLY fused products. fma() in double is the
-         * same IEEE operation as _mm256_fmadd_pd per lane, so the scalar and vector
-         * paths stay bit-identical while the dependent-add latency chain that made
-         * one accumulator ~10x slower than the machine's floor disappears. The
-         * reduction pairs lanes exactly the way the vector path's (v0+v1)+(v2+v3)
-         * then cross-lane tree does; change one and you must change the other. */
-        double a[16] = {0};
-        int i = 0;
-        for (; i + 15 < in; i += 16)
-            for (int l = 0; l < 16; l++)
-                a[l] = fma((double)row[i + l], (double)x[i + l], a[l]);
-        double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
-        double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
-        double b2 = (a[2] + a[6]) + (a[10] + a[14]);
-        double b3 = (a[3] + a[7]) + (a[11] + a[15]);
-        double acc = (b0 + b1) + (b2 + b3);
-        for (; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
-        y[o] = (float)acc;
+        int t = 0;
+        for (; t + K3_MM_TB <= T; t += K3_MM_TB)
+            k3_mm_f32_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                           row, in, K3_MM_TB);
+#if K3_MM_TB > 4
+        if (T - t >= 4) {
+            k3_mm_f32_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                           row, in, 4);
+            t += 4;
+        }
+#endif
+        float *yt = Y + (size_t)t * ldy + o;
+        const float *xt = X + (size_t)t * ldx;
+        switch (T - t) {
+#if K3_MM_TB > 3
+        case 3: k3_mm_f32_tile(yt, ldy, xt, ldx, row, in, 3); break;
+#endif
+#if K3_MM_TB > 2
+        case 2: k3_mm_f32_tile(yt, ldy, xt, ldx, row, in, 2); break;
+#endif
+        case 1: k3_mm_f32_tile(yt, ldy, xt, ldx, row, in, 1); break;
+        default: break;
+        }
     }
+}
+
+static void k3_mm_bf16_pass(float *Y, int ldy, const float *X, int ldx,
+                            const uint16_t *W, int in, int out, int T)
+{
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (out > 64)
+#endif
+    for (int o = 0; o < out; o++) {
+        const uint16_t *row = W + (size_t)o * in;
+        int t = 0;
+        for (; t + K3_MM_TB <= T; t += K3_MM_TB)
+            k3_mm_bf16_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                            row, in, K3_MM_TB);
+#if K3_MM_TB > 4
+        if (T - t >= 4) {
+            k3_mm_bf16_tile(Y + (size_t)t * ldy + o, ldy, X + (size_t)t * ldx, ldx,
+                            row, in, 4);
+            t += 4;
+        }
+#endif
+        float *yt = Y + (size_t)t * ldy + o;
+        const float *xt = X + (size_t)t * ldx;
+        switch (T - t) {
+#if K3_MM_TB > 3
+        case 3: k3_mm_bf16_tile(yt, ldy, xt, ldx, row, in, 3); break;
+#endif
+#if K3_MM_TB > 2
+        case 2: k3_mm_bf16_tile(yt, ldy, xt, ldx, row, in, 2); break;
+#endif
+        case 1: k3_mm_bf16_tile(yt, ldy, xt, ldx, row, in, 1); break;
+        default: break;
+        }
+    }
+}
+
+void k3_matmul_batch_ld(float *Y, int ldy, const float *X, int ldx, const float *W,
+                        int in, int out, int T)
+{
+    if (T <= 0 || out <= 0) return;
+    const int g = k3_mm_pass(in);
+    for (int t0 = 0; t0 < T; t0 += g) {
+        const int n = T - t0 < g ? T - t0 : g;
+        float *Yp = Y + (size_t)t0 * ldy;
+        const float *Xp = X + (size_t)t0 * ldx;
+        if (n == 1) k3_matmul(Yp, Xp, W, in, out);         /* the decode kernel itself */
+        else        k3_mm_f32_pass(Yp, ldy, Xp, ldx, W, in, out, n);
+    }
+}
+
+void k3_matmul_bf16_batch_ld(float *Y, int ldy, const float *X, int ldx,
+                             const uint16_t *W, int in, int out, int T)
+{
+    if (T <= 0 || out <= 0) return;
+    const int g = k3_mm_pass(in);
+    for (int t0 = 0; t0 < T; t0 += g) {
+        const int n = T - t0 < g ? T - t0 : g;
+        float *Yp = Y + (size_t)t0 * ldy;
+        const float *Xp = X + (size_t)t0 * ldx;
+        if (n == 1) k3_matmul_bf16(Yp, Xp, W, in, out);    /* the decode kernel itself */
+        else        k3_mm_bf16_pass(Yp, ldy, Xp, ldx, W, in, out, n);
+    }
+}
+
+void k3_matmul_batch(float *Y, const float *X, const float *W, int in, int out, int T)
+{
+    k3_matmul_batch_ld(Y, out, X, in, W, in, out, T);
+}
+
+void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, int out,
+                          int T)
+{
+    k3_matmul_bf16_batch_ld(Y, out, X, in, W, in, out, T);
 }
 
 /* ------------------------------------------------------------- Gated MLA ---- */
@@ -421,7 +914,17 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  * from x and caches nothing. All three paths must produce identical output; the op
  * fixtures gate the uncached path and tests/unit/k3_model.c gates them against each
  * other, logit for logit.
+ *
+ * THE TRACE HOOK (k3_mla_trace, see k3.h) copies out the raw scores, the double
+ * normaliser z, the double quotient e/z and the pre-gate accumulator of every row, which
+ * is how tests/unit/test_mla_variants.c holds the two layouts to each other on the
+ * doubles the output rounds away. The quotient is named before it is rounded so that the
+ * value recorded IS the value used: `pq = sc[s] / z; (float)pq` is `(float)(sc[s] / z)`,
+ * since a double quotient is evaluated in double on every target this file builds for
+ * (FLT_EVAL_METHOD 0 on x86-64 and aarch64). Nothing else here reads the trace.
  */
+K3MlaTrace *k3_mla_trace = NULL;
+
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
                    float *kvc, float *ropec, int cached, int cap, int kv_latent)
@@ -438,20 +941,29 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     const int last = cached + T - 1;              /* highest absolute position      */
     if (kvc && last >= cap)
         k3_fatal_bound("MLA KV cache position", (long)last, (long)cap - 1);
+    /* The test hook, read once per call: NULL outside tests. */
+    K3MlaTrace *const tr = k3_mla_trace;
+    if (tr && (tr->scores || tr->quot) && last + 1 > tr->n)
+        k3_fatal_bound("MLA trace row length", (long)last + 1, (long)tr->n);
 
     /* Scratch layout. Every region below is DISJOINT and must stay so. Overlapping
      * any two of them can appear to work, aliasing the gate buffer onto q, say, is
      * safe only while H*vh < H*qh holds, but that is an accident of the released
      * dimensions, not an invariant, and it breaks silently the moment v_head grows.
-     * Size the buffer with k3_mla_scratch_cached(); do not compute it by hand. */
+     * Size the buffer with k3_mla_scratch_cached(); do not compute it by hand.
+     *
+     * ct, ql, acc and gbuf hold one row PER POSITION so that every projection is applied
+     * to all T positions in one pass (k3_mmw_batch): the matrix is read and widened once
+     * per call rather than once per position. Nothing about a position's arithmetic
+     * changes; only where its intermediate rows live. */
     float *q    = scratch;                          /* [T][H][qh]     */
-    float *ct   = q    + (size_t)T * H * qh;        /* [kvw] transient, one token */
-    float *ql   = ct   + (size_t)kvw;               /* [q_lora]       */
-    float *acc  = ql   + (size_t)c->q_lora;         /* [H][vh]        */
-    float *gbuf = acc  + (size_t)H * vh;            /* [H][vh] gate   */
+    float *ct   = q    + (size_t)T * H * qh;        /* [T][kvw] latent + rope slot */
+    float *ql   = ct   + (size_t)T * kvw;           /* [T][q_lora]    */
+    float *acc  = ql   + (size_t)T * c->q_lora;     /* [T][H][vh]     */
+    float *gbuf = acc  + (size_t)T * H * vh;        /* [T][H][vh] gate */
     /* Scores are per head in the latent layout, because the s loop moves outside the h
      * loop there and every head's row must survive until its own softmax runs. */
-    float *sc   = gbuf + (size_t)H * vh;            /* [last+1], latent [H][last+1] */
+    float *sc   = gbuf + (size_t)T * H * vh;        /* [last+1], latent [H][last+1] */
     const size_t scn = lat ? (size_t)H * (size_t)(last + 1) : (size_t)(last + 1);
     float *kb   = sc   + scn;                       /* latent: [H][kvd] one position */
     /* Without a cache the keys/values live in scratch and cover only this call. */
@@ -462,28 +974,39 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     #define K3_ROPE_AT(p) (ropec ? ropec + (size_t)(p) * qr      : rps + (size_t)(p) * qr)
     #define K3_LAT_AT(p)  (kvc + (size_t)(p) * c->kv_lora)
 
-    /* ---- per-token projections ---- */
+    /* ---- projections, each matrix applied to every position in one pass ---- */
+    k3_mmw_batch(ql, x, w->q_a, w->wdt, E, c->q_lora, T);
     for (int t = 0; t < T; t++) {
-        const int p = cached + t;
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(ql, xt, w->q_a, w->wdt, E, c->q_lora);
-        k3_rmsnorm(ql, ql, w->q_a_norm, c->q_lora, c->rms_eps);
-        k3_mmw(q + (size_t)t * H * qh, ql, w->q_b, w->wdt, c->q_lora, H * qh);
-
-        /* ONE projection emits the compressed latent AND the shared rope slot */
-        k3_mmw(ct, xt, w->kv_a, w->wdt, E, kvw);
-        /* the norm covers the latent only, never the rope slot */
-        k3_rmsnorm(ct, ct, w->kv_a_norm, c->kv_lora, c->rms_eps);
-        memcpy(K3_ROPE_AT(p), ct + c->kv_lora, (size_t)qr * sizeof(float));
-        /* The latent layout stores the kv_b INPUT and expands below; the expanded
-         * layout stores the kv_b OUTPUT. Same bytes into the same kernel either way. */
-        if (lat) memcpy(K3_LAT_AT(p), ct, (size_t)c->kv_lora * sizeof(float));
-        else     k3_mmw(K3_KV_AT(p), ct, w->kv_b, w->wdt, c->kv_lora, H * kvd);
+        float *qlt = ql + (size_t)t * c->q_lora;
+        k3_rmsnorm(qlt, qlt, w->q_a_norm, c->q_lora, c->rms_eps);
     }
+    k3_mmw_batch(q, ql, w->q_b, w->wdt, c->q_lora, H * qh, T);
 
-    /* ---- attention, per head, causal ---- */
+    /* ONE projection emits the compressed latent AND the shared rope slot */
+    k3_mmw_batch(ct, x, w->kv_a, w->wdt, E, kvw, T);
     for (int t = 0; t < T; t++) {
         const int p = cached + t;
+        float *ctt = ct + (size_t)t * kvw;
+        /* the norm covers the latent only, never the rope slot */
+        k3_rmsnorm(ctt, ctt, w->kv_a_norm, c->kv_lora, c->rms_eps);
+        memcpy(K3_ROPE_AT(p), ctt + c->kv_lora, (size_t)qr * sizeof(float));
+        /* The latent layout stores the kv_b INPUT and expands on use; the expanded
+         * layout stores the kv_b OUTPUT, below. Same bytes into the same kernel either
+         * way. */
+        if (lat) memcpy(K3_LAT_AT(p), ctt, (size_t)c->kv_lora * sizeof(float));
+    }
+    /* Positions cached .. cached+T-1 are consecutive rows of the expanded cache (or of
+     * kvs), so kv_b writes all of them in one pass, reading each position's normalised
+     * latent in place at stride kvw. */
+    if (!lat)
+        k3_mmw_batch_ld(K3_KV_AT(cached), H * kvd, ct, kvw, w->kv_b, w->wdt,
+                        c->kv_lora, H * kvd, T);
+
+    /* ---- attention, per head, causal. Position t leaves its heads' outputs in its own
+     * row of acc, so the gate and o_proj below can take every position in one pass. ---- */
+    for (int t = 0; t < T; t++) {
+        const int p = cached + t;
+        float *acct = acc + (size_t)t * H * vh;
         if (lat) {
             /* Pass one: rebuild each cached position ONCE and score it against every
              * head. Transposing the loops is what keeps the rebuild count at one per
@@ -505,12 +1028,21 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
              * per-head denominator: (float)(sc[s]/z) is the same value either way. */
             for (int h = 0; h < H; h++) {
                 float *sh = sc + (size_t)h * (last + 1);
+                const size_t row = (size_t)t * H + h;          /* trace row (t, h) */
+                if (tr && tr->scores)
+                    memcpy(tr->scores + row * tr->n, sh, (size_t)(p + 1) * sizeof(float));
                 float m = -INFINITY;
                 for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
                 double z = 0.0;
                 for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
-                for (int s = 0; s <= p; s++) sh[s] = (float)(sh[s] / z);
-                float *o = acc + (size_t)h * vh;
+                if (tr && tr->z) tr->z[row] = z;
+                double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
+                for (int s = 0; s <= p; s++) {
+                    const double pq = sh[s] / z;
+                    if (qrow) qrow[s] = pq;
+                    sh[s] = (float)pq;
+                }
+                float *o = acct + (size_t)h * vh;
                 for (int j = 0; j < vh; j++) o[j] = 0.0f;
             }
             /* Pass two: rebuild again and accumulate the values. Each o[j] still
@@ -519,7 +1051,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 k3_mmw(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd);
                 for (int h = 0; h < H; h++) {
                     const float pr = sc[(size_t)h * (last + 1) + s];
-                    float *o = acc + (size_t)h * vh;
+                    float *o = acct + (size_t)h * vh;
                     const float *vs = kb + (size_t)h * kvd + qn;
                     for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
                 }
@@ -538,27 +1070,37 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 sc[s] = (float)d * scale;
                 if (sc[s] > m) m = sc[s];
             }
+            const size_t row = (size_t)t * H + h;              /* trace row (t, h) */
+            if (tr && tr->scores)
+                memcpy(tr->scores + row * tr->n, sc, (size_t)(p + 1) * sizeof(float));
             double z = 0.0;
             for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
+            if (tr && tr->z) tr->z[row] = z;
+            double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
 
-            float *o = acc + (size_t)h * vh;
+            float *o = acct + (size_t)h * vh;
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
             for (int s = 0; s <= p; s++) {
-                const float pr = (float)(sc[s] / z);
+                const double pq = sc[s] / z;
+                if (qrow) qrow[s] = pq;
+                const float pr = (float)pq;
                 const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
                 for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
         }
 
-        /* ---- output gate then projection. Gate BEFORE o_proj, and no norm on it,
-         * unlike KDA which norms first. :470-473 ---- */
-        if (w->g) {
-            k3_mmw(gbuf, x + (size_t)t * E, w->g, w->wdt, E, H * vh);
-            for (int i = 0; i < H * vh; i++)
-                acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
-        }
-        k3_mmw(out + (size_t)t * E, acc, w->o, w->wdt, H * vh, E);
+        if (tr && tr->acc)
+            memcpy(tr->acc + (size_t)t * H * vh, acct, (size_t)H * vh * sizeof(float));
     }
+
+    /* ---- output gate then projection, every position in one pass each. Gate BEFORE
+     * o_proj, and no norm on it, unlike KDA which norms first. :470-473 ---- */
+    if (w->g) {
+        k3_mmw_batch(gbuf, x, w->g, w->wdt, E, H * vh, T);
+        for (size_t i = 0; i < (size_t)T * H * vh; i++)
+            acc[i] *= 1.0f / (1.0f + expf(-gbuf[i]));
+    }
+    k3_mmw_batch(out, acc, w->o, w->wdt, H * vh, E, T);
     #undef K3_KV_AT
     #undef K3_ROPE_AT
     #undef K3_LAT_AT
@@ -595,16 +1137,52 @@ void k3_router(int *idx, float *w, const float *x, const float *W,
      * Each iteration writes only its own score[e] and choice[e], and the ACCUMULATION
      * ORDER INSIDE an expert is untouched: thread t still sums i = 0..hidden-1 in
      * sequence into its own double. Splitting the outer loop therefore cannot change a
-     * single bit, which is why this needs no tolerance and no re-gating. */
+     * single bit, which is why this needs no tolerance and no re-gating.
+     *
+     * EIGHT EXPERTS PER PASS OVER x, for the same reason. One expert's sum is a single
+     * chain of 7168 dependent double adds, so a core running one expert at a time waits
+     * out the add latency on every element and leaves the rest of its pipeline idle.
+     * Walking K3_ROUTER_BLOCK experts side by side gives the core that many independent
+     * chains, each still receiving its terms i = 0..hidden-1 in order, one add per term,
+     * exactly as before: the interleaving changes WHEN each add issues, never which adds
+     * happen or in what order within an expert, so every score is bit-identical to the
+     * one-expert loop. The product needs no care either way: a float times a float fits
+     * in double's 53 bits, so it is exact whether or not the compiler fuses it. Timed
+     * with bench_router at the released shape (896 x 7168) against the one-expert loop,
+     * on a 4-vCPU AVX-512 guest with GCC 13.3, -march=native: 8.4 -> 4.6 ms per call on
+     * one thread, and 2.1 -> 1.2 ms on four, the engine's threaded case, which is about
+     * 0.09 s per token across the 92 MoE layers; the output hash was the same in all 40
+     * runs. docs/notes/decode-kernels.md has every run. test_ops holds this form bitwise
+     * to the one-expert loop on data where a reordered chain changes the scores. The
+     * tail block (n_experts % K3_ROUTER_BLOCK experts) runs the same per-expert loop. */
+    enum { K3_ROUTER_BLOCK = 8 };
+    const int nblk = (n_experts + K3_ROUTER_BLOCK - 1) / K3_ROUTER_BLOCK;
 #ifdef _OPENMP
 #   pragma omp parallel for schedule(static)
 #endif
-    for (int e = 0; e < n_experts; e++) {
-        const float *row = W + (size_t)e * hidden;
-        double acc = 0.0;
-        for (int i = 0; i < hidden; i++) acc += (double)row[i] * (double)x[i];
-        score[e]  = 1.0f / (1.0f + expf(-(float)acc));
-        choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+    for (int b = 0; b < nblk; b++) {
+        const int e0 = b * K3_ROUTER_BLOCK;
+        const int n  = (n_experts - e0) < K3_ROUTER_BLOCK ? (n_experts - e0)
+                                                          : K3_ROUTER_BLOCK;
+        double acc[K3_ROUTER_BLOCK] = {0};
+        const float *row[K3_ROUTER_BLOCK];
+        for (int k = 0; k < n; k++) row[k] = W + (size_t)(e0 + k) * hidden;
+        if (n == K3_ROUTER_BLOCK) {
+            for (int i = 0; i < hidden; i++) {
+                const double xi = (double)x[i];
+                for (int k = 0; k < K3_ROUTER_BLOCK; k++)
+                    acc[k] += (double)row[k][i] * xi;
+            }
+        } else {
+            for (int k = 0; k < n; k++)
+                for (int i = 0; i < hidden; i++)
+                    acc[k] += (double)row[k][i] * (double)x[i];
+        }
+        for (int k = 0; k < n; k++) {
+            const int e = e0 + k;
+            score[e]  = 1.0f / (1.0f + expf(-(float)acc[k]));
+            choice[e] = score[e] + (bias ? bias[e] : 0.0f);   /* selection score only */
+        }
     }
 
     /* top-k by repeated max. n_experts is 896 and topk is 16, so this is 14k
@@ -680,10 +1258,11 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
     /* The latent layout keeps one score row per head, and one rebuilt position. */
     size_t scores = (size_t)(cap > T ? cap : T);
     if (lat) scores *= (size_t)H;
+    /* ct, ql, acc and gbuf are per position so each projection is one batched pass */
     size_t n = (size_t)T * H * qh                      /* q            */
-             + (size_t)(c->kv_lora + c->qk_rope)       /* ct transient */
-             + (size_t)c->q_lora
-             + (size_t)2 * H * vh                      /* acc, gbuf    */
+             + (size_t)T * (c->kv_lora + c->qk_rope)   /* ct           */
+             + (size_t)T * c->q_lora                   /* ql           */
+             + (size_t)2 * T * H * vh                  /* acc, gbuf    */
              + scores;
     if (lat) n += (size_t)H * kvd;                     /* rebuilt k/v  */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
@@ -714,26 +1293,73 @@ size_t k3_mla_scratch(const K3Cfg *c, int T)
  * numbers rather than an invariant, and it is the same class of hazard documented at
  * the scratch layout in k3_mla_cached. Size with k3_moe_scratch().
  */
+/* The MoE scratch, laid out in ONE place so k3_moe, k3_moe_prefill and
+ * k3_moe_scratch cannot disagree. The [T] regions hold one row per position, so each
+ * trunk matrix -- down, up and the shared expert's three -- is applied to every position
+ * in one pass (k3_mmw_batch) instead of once per position; the three per-expert buffers
+ * are reused for each routed expert in turn. */
+typedef struct {
+    float *z;      /* [T][L]     latent inputs, the down projection            */
+    float *accL;   /* [T][L]     weighted expert aggregates                    */
+    float *sgu;    /* [T][2*SI]  shared gate|up; SiTU overwrites the gate half */
+    float *sdn;    /* [T][E]     shared down projection                        */
+    float *gu;     /* [2*I]      gate|up, one routed expert                    */
+    float *act;    /* [I]        after SiTU                                    */
+    float *edn;    /* [L]        expert down projection                        */
+} K3MoeScratch;
+
+static K3MoeScratch moe_layout(float *scratch, const K3Cfg *c, int T)
+{
+    const size_t n = T > 0 ? (size_t)T : 1;
+    const size_t L = (size_t)c->latent, I = (size_t)c->moe_inter;
+    const size_t SI = I * (size_t)c->n_shared;
+    K3MoeScratch s;
+    s.z    = scratch;
+    s.accL = s.z    + n * L;
+    s.sgu  = s.accL + n * L;
+    s.sdn  = s.sgu  + n * 2 * SI;
+    s.gu   = s.sdn  + n * (size_t)c->hidden;
+    s.act  = s.gu   + 2 * I;
+    s.edn  = s.act  + I;
+    return s;
+}
+
+/* 6. The shared expert on the ORIGINAL full-width input, for every position, added
+ * UNWEIGHTED to out. sh1 and sh3 land interleaved per position as [gate | up]; SiTU
+ * writes its result over the gate half, which k3_situ_glu permits because element i of
+ * the output depends only on element i of each half; sh2 then reads that half at stride
+ * 2*SI. Per position this is exactly the sequence of k3_mmw calls it replaces. */
+static void moe_shared(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
+                       int T, const K3MoeScratch *s)
+{
+    const int E = c->hidden, SI = c->moe_inter * c->n_shared;
+    k3_mmw_batch_ld(s->sgu,      2 * SI, x, E, w->sh1, w->wdt, E, SI, T);
+    k3_mmw_batch_ld(s->sgu + SI, 2 * SI, x, E, w->sh3, w->wdt, E, SI, T);
+    for (int t = 0; t < T; t++) {
+        float *sg = s->sgu + (size_t)t * 2 * SI;
+        k3_situ_glu(sg, sg, SI, c->situ_b1, c->situ_b2);
+    }
+    k3_mmw_batch_ld(s->sdn, E, s->sgu, 2 * SI, w->sh2, w->wdt, SI, E, T);
+    for (size_t i = 0; i < (size_t)T * E; i++) out[i] += s->sdn[i];
+}
+
 void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             int T, int *idx, float *wt, float *scratch)
 {
     const int E = c->hidden, L = c->latent, I = c->moe_inter;
-    const int SI = I * c->n_shared;
+    const K3MoeScratch s = moe_layout(scratch, c, T);
+    float *gu = s.gu, *act = s.act, *edn = s.edn;
 
-    float *z    = scratch;              /* [L]    latent input              */
-    float *accL = z    + L;             /* [L]    weighted expert aggregate */
-    float *gu   = accL + L;             /* [2*I]  gate|up, one expert       */
-    float *act  = gu   + 2 * I;         /* [I]    after SiTU                */
-    float *edn  = act  + I;             /* [L]    expert down-projection    */
-    float *sgu  = edn  + L;             /* [2*SI] shared gate|up            */
-    float *sact = sgu  + 2 * SI;        /* [SI]   shared after SiTU         */
-    float *sdn  = sact + SI;            /* [E]    shared down-projection    */
+    /* 2. down-project every position into the latent space, one pass over `down`. It
+     * reads x, exactly as routing does, so hoisting it above step 1 changes nothing. */
+    k3_mmw_batch(s.z, x, w->down, w->wdt, E, L, T);
 
     for (int t = 0; t < T; t++) {
         const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
+        const float *z  = s.z + (size_t)t * L;
+        float *accL = s.accL + (size_t)t * L;
 
-        /* 1. route on the FULL width, before the down-projection */
+        /* 1. route on the FULL width x, never on the latent z */
         k3_router(idx, wt, xt, w->gate, w->bias, E, c->n_experts, c->topk,
                   c->moe_renorm, c->routed_scale);
 
@@ -752,9 +1378,6 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             nk = m;
             if (wsum > 0.0f) for (int j = 0; j < nk; j++) wt[j] /= wsum;
         }
-
-        /* 2. down-project into the latent space */
-        k3_mmw(z, xt, w->down, w->wdt, E, L);
 
         /* 3. the selected experts, in latent space, weighted and summed */
         for (int i = 0; i < L; i++) accL[i] = 0.0f;
@@ -803,30 +1426,28 @@ void k3_moe(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
             for (int i = 0; i < L; i++) accL[i] += wj * edn[i];
         }
 
-        /* 4. RMSNorm the AGGREGATE (not per expert), then 5. up-project */
+        /* 4. RMSNorm the AGGREGATE (not per expert) */
         if (c->latent_norm) k3_rmsnorm(accL, accL, w->latent_norm, L, c->rms_eps);
-        k3_mmw(ot, accL, w->up, w->wdt, L, E);
-
-        /* 6. shared expert on the ORIGINAL full-width input, added UNWEIGHTED */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
+
+    /* 5. up-project every position, one pass over `up`, then 6. the shared expert */
+    k3_mmw_batch(out, s.accL, w->up, w->wdt, L, E, T);
+    moe_shared(out, x, w, c, T, &s);
 }
 
-size_t k3_moe_scratch(const K3Cfg *c)
+/* Floats of scratch k3_moe and k3_moe_prefill need for T positions: see moe_layout. */
+size_t k3_moe_scratch(const K3Cfg *c, int T)
 {
-    const int SI = c->moe_inter * c->n_shared;
-    return (size_t)2 * c->latent          /* z, accL            */
-         + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I) */
-         + (size_t)c->latent              /* edn                */
-         + (size_t)3 * SI                 /* sgu (2*SI) + sact  */
-         + (size_t)c->hidden;             /* sdn                */
+    const size_t n  = T > 0 ? (size_t)T : 1;
+    const size_t SI = (size_t)c->moe_inter * c->n_shared;
+    return n * ((size_t)2 * c->latent     /* z, accL             */
+              + 2 * SI                    /* shared gate|up      */
+              + (size_t)c->hidden)        /* shared down         */
+         + (size_t)3 * c->moe_inter       /* gu (2*I) + act (I)  */
+         + (size_t)c->latent;             /* edn                 */
 }
 
-/* Batched MoE for PREFILL over a chunk of T tokens, streamed experts only.
+/* Batched MoE for PREFILL over T tokens, streamed experts only.
  *
  * k3_moe walks the top-k for each token independently, so across a T-token chunk it
  * fetches an expert once per token that routes to it. Under near-uniform routing that is
@@ -841,11 +1462,32 @@ size_t k3_moe_scratch(const K3Cfg *c)
  * the shared expert exactly as before. Only the ORDER in which experts are fetched from
  * disk changes, and that touches no floating-point result.
  *
- * out/x are [T][E], idx/wt scratch are topk-wide (reused per token), scratch is one
- * k3_moe_scratch. This path requires w->src (streamed); the resident path stays on
- * k3_moe, which is what the oracle gates exercise. */
-static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
-                              const K3Cfg *c, int T, float *scratch);
+ * Two widths, deliberately different. The trunk matrices -- down, up and the shared
+ * expert's three -- are each applied to ALL T positions in one pass (k3_mmw_batch), so
+ * under --trunk-rows a forward reads each of them once however long the prompt is; their
+ * [T] scratch rows are already sized by k3_moe_scratch(c, T). Only the routed-expert
+ * dedup runs in sub-chunks of MOE_DEDUP_CHUNK positions, because its contribution buffer
+ * is [n][K][L] and would otherwise grow with the prompt. Neither width reaches a
+ * floating-point result: k3_mmw_batch is per-position bit-identical to k3_mmw at any T,
+ * and a token's routed sum reads only its own contribution rows.
+ *
+ * out/x are [T][E], idx/wt scratch are topk-wide (reused per token), scratch holds
+ * k3_moe_scratch(c, T) floats. This path requires w->src (streamed); the resident path
+ * stays on k3_moe, which is what the oracle gates exercise. */
+#define MOE_DEDUP_CHUNK 64
+
+/* Per-sub-chunk buffers of the routed dedup, allocated once per k3_moe_prefill call and
+ * reused by every sub-chunk; each is sized for MOE_DEDUP_CHUNK positions at most. */
+typedef struct {
+    int   *ridx;     /* [n][K]    routing decisions; -1 marks a dropped expert */
+    float *rwt;      /* [n][K]    routing weights                             */
+    float *contrib;  /* [n][K][L] every routed expert's latent output         */
+    int   *uniq;     /* [n*K]     the sub-chunk's unique experts, first-seen  */
+    char  *seen;     /* [n_experts]                                           */
+} K3MoeDedup;
+
+static void moe_prefill_routed(const K3MoeScratch *s, const float *x, const K3MoeW *w,
+                               const K3Cfg *c, int t0, int T, const K3MoeDedup *d);
 
 void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
                     int T, int *idx, float *wt, float *scratch)
@@ -861,59 +1503,70 @@ void k3_moe_prefill(float *out, const float *x, const K3MoeW *w, const K3Cfg *c,
         k3_moe(out, x, w, c, T, idx, wt, scratch);
         return;
     }
+    const int E = c->hidden, Ll = c->latent, K = c->topk;
+    const K3MoeScratch s = moe_layout(scratch, c, T);
+
     /* Fixed sub-chunks bound the contribution buffer (14.7 MB at 64 tokens) no matter
      * how long the prompt is; a 32k prefill would otherwise want 7.3 GB of it. Most of
      * the dedup is already captured at this width: the unique-expert count grows far
      * slower than the request count under near-uniform routing. */
-    const int CHUNK = 64;
-    for (int t0 = 0; t0 < T; t0 += CHUNK) {
-        const int n = (T - t0) < CHUNK ? (T - t0) : CHUNK;
-        if (n == 1) { k3_moe(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
-                             w, c, 1, idx, wt, scratch); continue; }
-        moe_prefill_chunk(out + (size_t)t0 * c->hidden, x + (size_t)t0 * c->hidden,
-                          w, c, n, scratch);
+    const int nmax = T < MOE_DEDUP_CHUNK ? T : MOE_DEDUP_CHUNK;
+    K3MoeDedup d;
+    d.ridx    = (int *)  malloc((size_t)nmax * K * sizeof(int));
+    d.rwt     = (float *)malloc((size_t)nmax * K * sizeof(float));
+    d.contrib = (float *)malloc((size_t)nmax * K * Ll * sizeof(float));
+    d.uniq    = (int *)  malloc((size_t)nmax * K * sizeof(int));
+    d.seen    = (char *) malloc((size_t)c->n_experts);
+    if (!d.ridx || !d.rwt || !d.contrib || !d.uniq || !d.seen)
+        k3_fatal_oom("MoE prefill batch", (size_t)nmax * K * Ll * sizeof(float));
+
+    /* 2. down-project every position in one pass over `down`. Routing (step 1) reads x,
+     * not z, so hoisting this above it changes nothing, as in k3_moe. */
+    k3_mmw_batch(s.z, x, w->down, w->wdt, E, Ll, T);
+    /* 1, 3, 4. route, run the unique experts and aggregate, one sub-chunk at a time; each
+     * leaves its positions' normalised aggregates in s.accL. */
+    for (int t0 = 0; t0 < T; t0 += MOE_DEDUP_CHUNK) {
+        const int n = (T - t0) < MOE_DEDUP_CHUNK ? (T - t0) : MOE_DEDUP_CHUNK;
+        moe_prefill_routed(&s, x, w, c, t0, n, &d);
     }
+    /* 5, 6. up-project every position and add the shared expert: one pass per matrix. */
+    k3_mmw_batch(out, s.accL, w->up, w->wdt, Ll, E, T);
+    moe_shared(out, x, w, c, T, &s);
+
+    free(d.ridx); free(d.rwt); free(d.contrib); free(d.uniq); free(d.seen);
 }
 
-static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
-                              const K3Cfg *c, int T, float *scratch)
+/* The routed half of the batched MoE for positions [t0, t0 + T), T <= MOE_DEDUP_CHUNK:
+ * route each position, fetch each unique expert once, and leave each position's
+ * normalised aggregate in its s->accL row. Reads x and s->z rows t0.. only. */
+static void moe_prefill_routed(const K3MoeScratch *s, const float *x, const K3MoeW *w,
+                               const K3Cfg *c, int t0, int T, const K3MoeDedup *d)
 {
     const int E = c->hidden, Ll = c->latent, I = c->moe_inter;
-    const int SI = I * c->n_shared, K = c->topk;
+    const int K = c->topk;
+    int   *ridx = d->ridx, *uniq = d->uniq;
+    float *rwt = d->rwt, *contrib = d->contrib;
+    const float *z = s->z + (size_t)t0 * Ll;
 
-    /* Per-token routing decisions and latent inputs, plus a contribution buffer holding
-     * every routed expert's latent output for every token: [T][K][Ll]. At T=32, K=16,
-     * Ll=3584 that is ~7.3 MB, trivial beside the tens of GB already reserved. */
-    int   *ridx = (int *)  malloc((size_t)T * K * sizeof(int));
-    float *rwt  = (float *)malloc((size_t)T * K * sizeof(float));
-    float *zz   = (float *)malloc((size_t)T * Ll * sizeof(float));
-    float *contrib = (float *)malloc((size_t)T * K * Ll * sizeof(float));
-    if (!ridx || !rwt || !zz || !contrib)
-        k3_fatal_oom("MoE prefill batch", (size_t)T * K * Ll * sizeof(float));
-
-    /* 1. route every token and down-project it, and collect the batch's unique experts. */
-    int  *uniq = (int *)malloc((size_t)T * K * sizeof(int));
-    char *seen = (char *)calloc((size_t)c->n_experts, 1);
-    if (!uniq || !seen) k3_fatal_oom("MoE prefill index", (size_t)c->n_experts);
+    /* 1. route every token on the FULL width x and collect the sub-chunk's unique
+     * experts in first-seen order. */
+    memset(d->seen, 0, (size_t)c->n_experts);
     int nu = 0;
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
+        const float *xt = x + (size_t)(t0 + t) * E;
         int   *it = ridx + (size_t)t * K;
         float *wtt = rwt + (size_t)t * K;
         k3_router(it, wtt, xt, w->gate, w->bias, E, c->n_experts, K,
                   c->moe_renorm, c->routed_scale);
-        k3_mmw(zz + (size_t)t * Ll, xt, w->down, w->wdt, E, Ll);
         for (int j = 0; j < K; j++) {
             const int e = it[j];
-            if (e >= 0 && e < c->n_experts && !seen[e]) { seen[e] = 1; uniq[nu++] = e; }
+            if (e >= 0 && e < c->n_experts && !d->seen[e]) { d->seen[e] = 1; uniq[nu++] = e; }
         }
     }
 
-    /* 2. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
+    /* 3. expert-major: fetch each unique expert ONCE, apply it to every (token, slot)
      * that selected it. gu/act/edn are reused per (expert, token). */
-    float *gu  = scratch;                 /* [2*I] */
-    float *act = gu + 2 * I;              /* [I]   */
-    float *edn = act + I;                 /* [Ll]  */
+    float *gu = s->gu, *act = s->act, *edn = s->edn;
     if (w->src->getmany) w->src->getmany(w->src, w->layer, uniq, nu);
     for (int u = 0; u < nu; u++) {
         const int e = uniq[u];
@@ -922,11 +1575,14 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
             k3_expert_drops++;
             fprintf(stderr, "EXPERT DROP: layer %d expert %d failed to load; "
                             "this chunk is CORRUPT\n", w->layer, e);
+            /* k3_moe skips a dropped expert's term; mark its slots so the sum below
+             * does the same instead of reading a contribution row never written. */
+            for (int i = 0; i < T * K; i++) if (ridx[i] == e) ridx[i] = -1;
             continue;
         }
         for (int t = 0; t < T; t++) {
             const int   *it = ridx + (size_t)t * K;
-            const float *zt = zz  + (size_t)t * Ll;
+            const float *zt = z + (size_t)t * Ll;
             for (int j = 0; j < K; j++) {
                 if (it[j] != e) continue;
                 k3_matmul_mxfp4(gu,     zt, q.p1, q.s1, Ll, I, K3_MXFP4_GROUP);
@@ -938,34 +1594,25 @@ static void moe_prefill_chunk(float *out, const float *x, const K3MoeW *w,
         }
     }
 
-    /* 3. per token, sum contributions in the ORIGINAL top-k order, then the tail of the
-     * MoE exactly as k3_moe does it, so every float matches the per-token path. */
+    /* 4. per token, sum contributions in the ORIGINAL top-k order and normalise, exactly
+     * as k3_moe does it, so every float matches the per-token path. Summing in the
+     * fetch order of uniq[] instead is the natural slip here and changes the floats;
+     * test_ops's moe_prefill gate catches it at top-16. The CLI's K3_NO_BATCH_PREFILL
+     * comparison cannot: its tiny checkpoint routes to the top 2, where the order of
+     * two terms added to zero never changes a float. */
     for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = out + (size_t)t * E;
+        const int   *it  = ridx + (size_t)t * K;
         const float *wtt = rwt + (size_t)t * K;
-        /* Reuse this token's now-dead down-projection slot as the aggregate. */
-        float *acc = zz + (size_t)t * Ll;
+        float *acc = s->accL + (size_t)(t0 + t) * Ll;
         for (int i = 0; i < Ll; i++) acc[i] = 0.0f;
         for (int j = 0; j < K; j++) {
+            if (it[j] < 0) continue;
             const float wj = wtt[j];
             const float *cb = contrib + ((size_t)t * K + j) * Ll;
             for (int i = 0; i < Ll; i++) acc[i] += wj * cb[i];
         }
         if (c->latent_norm) k3_rmsnorm(acc, acc, w->latent_norm, Ll, c->rms_eps);
-        k3_mmw(ot, acc, w->up, w->wdt, Ll, E);
-
-        float *sgu  = gu;                 /* [2*SI] */
-        float *sact = sgu + 2 * SI;       /* [SI]   */
-        float *sdn  = sact + SI;          /* [E]    */
-        k3_mmw(sgu,      xt, w->sh1, w->wdt, E, SI);
-        k3_mmw(sgu + SI, xt, w->sh3, w->wdt, E, SI);
-        k3_situ_glu(sact, sgu, SI, c->situ_b1, c->situ_b2);
-        k3_mmw(sdn, sact, w->sh2, w->wdt, SI, E);
-        for (int i = 0; i < E; i++) ot[i] += sdn[i];
     }
-
-    free(ridx); free(rwt); free(zz); free(contrib); free(uniq); free(seen);
 }
 
 /* --------------------------------------------------------- KDA full layer ---- */
@@ -983,16 +1630,90 @@ static void l2norm_(float *v, int n, float eps)
 size_t k3_kda_scratch(const K3Cfg *c, int T)
 {
     const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
-    return 3 * (size_t)T * P        /* q, k, v after conv            */
-         + 2 * (size_t)T * P        /* z then alpha                  */
-         + (size_t)T * c->kda_heads /* beta                          */
-         + (size_t)T * P            /* recurrence output             */
-         + 2 * P                    /* gate buffer and one work row  */
-         + (size_t)c->kda_head_dim; /* f_a output                    */
+    return 3 * (size_t)T * P        /* q, k, v after conv                      */
+         + 2 * (size_t)T * P        /* z (then g, then the output gate), alpha */
+         + (size_t)T * c->kda_heads /* beta                                    */
+         + (size_t)T * P            /* recurrence output                       */
+         + P                        /* one work row, a slice per head          */
+         + (size_t)T * c->kda_head_dim; /* f_a output, per position            */
+}
+
+/* Floats in one row of a K3KdaLog: k and v as the recurrence reads them, alpha, beta, and
+ * the three pre-conv inputs. See the layout in k3.h. */
+size_t k3_kda_log_row(const K3Cfg *c)
+{
+    const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+    return 6 * P + (size_t)c->kda_heads;
+}
+
+size_t k3_kda_state_floats(const K3Cfg *c)
+{
+    const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+    return P * (size_t)c->kda_head_dim + 3 * P * (size_t)(c->conv_k - 1);
+}
+
+/* A log row or commit past the recorded rows would replay whatever the buffer held last
+ * time: a fluent, wrong state. Refuse loudly, as the other kernels do. */
+static void kda_log_bound_(const char *what, int n, int cap)
+{
+    fprintf(stderr, "k3: FATAL, %s is %d, but the KDA log holds %d rows.\n", what, n, cap);
+    abort();
+}
+
+/* Apply log rows [0, n) to ONE head's block of S, in place. The heart of every commit and
+ * of every replay into a work copy.
+ *
+ * WHY THE RESULT IS BIT-IDENTICAL, not merely close, to the sweep that recorded the rows:
+ * this is k3_kda_step, the function the sweep called, on the same S bits, with the same
+ * k, v, alpha and beta bits, in the same t order. Its update of S reads nothing else: q
+ * enters only the output o, in both the scalar and the SIMD build (the SIMD path tests q
+ * only to skip a row whose k is also zero, and a zero k never writes S). So passing zeros
+ * for q, which also lets the step skip its output pass, cannot move a bit of S. Heads are
+ * independent, so the thread count cannot either. */
+static void kda_replay_head_(float *Sh, const float *rows, size_t lrow, int n, int h,
+                             int D, int P, const float *qz, float *oh)
+{
+    for (int t = 0; t < n; t++) {
+        const float *r = rows + (size_t)t * lrow;
+        k3_kda_step(Sh, oh, qz, r + (size_t)h * D, r + P + (size_t)h * D,
+                    r + 2 * (size_t)P + (size_t)h * D, r[3 * (size_t)P + h], D, D);
+    }
+}
+
+/* The ShortConv history after n logged rows. k3_shortconv keeps, per channel, the last
+ * conv_k-1 inputs, oldest first, out of [history it started with, x_0, x_1, ...]; after n
+ * inputs that is entries n .. n+conv_k-2 of that sequence, and the log holds each of them
+ * bit for bit. Pure data movement.
+ *
+ * dst may be src. Writing slot j reads slot n+j of the same channel, and for n >= 1 that
+ * slot lies AHEAD of every slot written so far, so ascending j never reads a slot it has
+ * already overwritten. src == NULL is the zero history of a fresh sequence. */
+static void kda_replay_conv_(float *dst, const float *src, const float *rows, size_t lrow,
+                             int n, const K3Cfg *c)
+{
+    const int P = c->kda_heads * c->kda_head_dim, H = c->kda_heads, hist = c->conv_k - 1;
+    for (int which = 0; which < 3; which++) {
+        const size_t blk = (size_t)which * P * hist;
+        const size_t pre = 3 * (size_t)P + H + (size_t)which * P;   /* pre-conv slice */
+        for (int ch = 0; ch < P; ch++) {
+            for (int j = 0; j < hist; j++) {
+                const int i = n + j;
+                const size_t at = blk + (size_t)ch * hist;
+                dst[at + j] = i < hist ? (src ? src[at + i] : 0.0f)
+                                       : rows[(size_t)(i - hist) * lrow + pre + ch];
+            }
+        }
+    }
 }
 
 void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                   int T, float *state, float *scratch)
+{
+    k3_kda_layer_log(out, x, w, c, T, state, scratch, NULL);
+}
+
+void k3_kda_layer_log(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
+                      int T, float *state, float *scratch, const K3KdaLog *log)
 {
     const int E = c->hidden, H = c->kda_heads, D = c->kda_head_dim;
     const int P = H * D, K = c->conv_k, hist = K - 1;
@@ -1000,23 +1721,53 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
     float *q  = scratch;                 float *k  = q + (size_t)T * P;
     float *v  = k + (size_t)T * P;       float *z  = v + (size_t)T * P;
     float *al = z + (size_t)T * P;       float *bt = al + (size_t)T * P;
-    float *o  = bt + (size_t)T * H;      float *gb = o + (size_t)T * P;
-    float *wr = gb + P;                  float *fa = wr + P;
+    float *o  = bt + (size_t)T * H;      float *wr = o + (size_t)T * P;
+    float *fa = wr + P;                  /* [T][D] */
 
-    /* 1. projections */
-    for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        k3_mmw(q + (size_t)t * P, xt, w->q, w->wdt, E, P);
-        k3_mmw(k + (size_t)t * P, xt, w->k, w->wdt, E, P);
-        k3_mmw(v + (size_t)t * P, xt, w->v, w->wdt, E, P);
-        k3_mmw(bt + (size_t)t * H, xt, w->b, w->wdt, E, H);
-        /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
-        k3_mmw(fa, xt, w->f_a, w->wdt, E, D);
-        k3_mmw(z + (size_t)t * P, fa, w->f_b, w->wdt, D, P);
+    /* 1. projections, each matrix applied to every position in one pass (k3_mmw_batch):
+     * read and widened once per call, not once per position, and per position
+     * bit-identical to k3_mmw. */
+    k3_mmw_batch(q,  x, w->q, w->wdt, E, P, T);
+    k3_mmw_batch(k,  x, w->k, w->wdt, E, P, T);
+    k3_mmw_batch(v,  x, w->v, w->wdt, E, P, T);
+    k3_mmw_batch(bt, x, w->b, w->wdt, E, H, T);
+    /* ONE shared low-rank pair feeds every head: [E->D] then [D->H*D] */
+    k3_mmw_batch(fa, x,  w->f_a, w->wdt, E, D, T);
+    k3_mmw_batch(z,  fa, w->f_b, w->wdt, D, P, T);
+
+    /* A logged call is tentative (see K3KdaLog): it computes on log->work and leaves
+     * `state` as it found it. `st` is the state this call actually carries forward. The
+     * work copy starts as `state` advanced by the rows earlier calls recorded, so the call
+     * computes exactly what it would have computed had those calls updated `state` in
+     * place. Everything the log adds is a copy either into the work state or out of
+     * buffers the layer computes anyway, so the arithmetic below is unchanged and the
+     * output is the same bits with or without a log. */
+    const size_t lrow = log ? k3_kda_log_row(c) : 0;
+    float *st = state;
+    int nrec = 0;
+    if (log) {
+        if (log->row0 < 0 || log->row0 > log->cap) kda_log_bound_("KDA log row0", log->row0,
+                                                                  log->cap);
+        st = log->work;
+        /* Positions past cap are computed but not recorded: the caller sizes the log for
+         * the longest prefix it can keep. */
+        nrec = log->cap - log->row0;
+        if (nrec > T) nrec = T;
+        kda_replay_conv_(st + (size_t)H * D * D,
+                         state ? state + (size_t)H * D * D : NULL,
+                         log->rows, lrow, log->row0, c);
+        /* The pre-conv inputs, before k3_shortconv overwrites them in place. They are all
+         * the ShortConv history is ever made of. */
+        for (int t = 0; t < nrec; t++) {
+            float *r = log->rows + (size_t)(log->row0 + t) * lrow + 3 * (size_t)P + H;
+            memcpy(r,                 q + (size_t)t * P, (size_t)P * sizeof(float));
+            memcpy(r + P,             k + (size_t)t * P, (size_t)P * sizeof(float));
+            memcpy(r + 2 * (size_t)P, v + (size_t)t * P, (size_t)P * sizeof(float));
+        }
     }
 
     /* 2. ShortConv with fused SiLU, carrying state across calls */
-    float *cs = state ? state + (size_t)H * D * D : NULL;
+    float *cs = st ? st + (size_t)H * D * D : NULL;
     k3_shortconv(q, q, w->q_conv, cs ? cs : NULL, P, K, T);
     k3_shortconv(k, k, w->k_conv, cs ? cs + (size_t)P * hist : NULL, P, K, T);
     k3_shortconv(v, v, w->v_conv, cs ? cs + (size_t)2 * P * hist : NULL, P, K, T);
@@ -1035,8 +1786,19 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                      w->A_log, w->dt_bias, H, D, c->gate_lb);
     }
 
+    /* The recurrence operands, exactly as k3_kda_step is about to receive them below:
+     * k normalised, v raw, alpha, and beta after its sigmoid. Nothing between here and
+     * the step modifies them. */
+    if (log) for (int t = 0; t < nrec; t++) {
+        float *r = log->rows + (size_t)(log->row0 + t) * lrow;
+        memcpy(r,                 k  + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(r + P,             v  + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(r + 2 * (size_t)P, al + (size_t)t * P, (size_t)P * sizeof(float));
+        memcpy(r + 3 * (size_t)P, bt + (size_t)t * H, (size_t)H * sizeof(float));
+    }
+
     /* 6. recurrence, per head, with q pre-scaled by d_k^-0.5 */
-    float *S = state;
+    float *S = st;
     float *Sown = NULL;
     if (!S) {
         /* Dereferenced at a computed offset immediately below; an unchecked NULL here
@@ -1044,6 +1806,13 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
         Sown = (float *)calloc((size_t)H * D * D, sizeof(float));
         if (!Sown) k3_fatal_oom("KDA recurrent state", (size_t)H * D * D * sizeof(float));
         S = Sown;
+    }
+    /* Only a replay into the work copy needs these: a zero q and a throwaway output row
+     * per head for k3_kda_step, see kda_replay_head_. */
+    float *rtmp = NULL;
+    if (log && log->row0 > 0) {
+        rtmp = (float *)calloc((size_t)(H + 1) * D, sizeof(float));
+        if (!rtmp) k3_fatal_oom("KDA log replay", (size_t)(H + 1) * D * sizeof(float));
     }
     const float qscale = 1.0f / sqrtf((float)D);
     /* Heads are independent: each reads and writes only its own S block, its own D-wide
@@ -1059,6 +1828,17 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
 #endif
     for (int h = 0; h < H; h++) {
         float *wh = wr + (size_t)h * D;
+        /* The work copy of this head's block, taken here rather than by one big copy
+         * before the loop: the block is about to be streamed through the cache by the
+         * recurrence anyway, and every thread copies its own heads. */
+        if (log) {
+            float *Sh = S + (size_t)h * D * D;
+            if (state) memcpy(Sh, state + (size_t)h * D * D, (size_t)D * D * sizeof(float));
+            else       memset(Sh, 0, (size_t)D * D * sizeof(float));
+            if (log->row0 > 0)
+                kda_replay_head_(Sh, log->rows, lrow, log->row0, h, D, P, rtmp,
+                                 rtmp + (size_t)(h + 1) * D);
+        }
         for (int t = 0; t < T; t++) {
             const size_t off = (size_t)t * P + (size_t)h * D;
             for (int i = 0; i < D; i++) wh[i] = q[off + i] * qscale;
@@ -1066,34 +1846,88 @@ void k3_kda_layer(float *out, const float *x, const K3KdaW *w, const K3Cfg *c,
                         al + off, bt[(size_t)t * H + h], D, D);
         }
     }
+    free(rtmp);
 
-    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection */
-    for (int t = 0; t < T; t++) {
-        const float *xt = x + (size_t)t * E;
-        float *ot = o + (size_t)t * P;
-        for (int h = 0; h < H; h++)
-            k3_rmsnorm(ot + (size_t)h * D, ot + (size_t)h * D, w->o_norm, D, c->rms_eps);
-        k3_mmw(gb, xt, w->g, w->wdt, E, P);
-        for (int i = 0; i < P; i++) ot[i] *= sigmoidf_(gb[i]);
-        k3_mmw(out + (size_t)t * E, ot, w->o, w->wdt, P, E);
-    }
+    /* 7/8/9. head-wise RMSNorm, THEN the gate, THEN the output projection. Each stage
+     * covers every position before the next begins, so g_proj and o_proj are each one
+     * pass over their matrix. Positions share nothing here, so each position still sees
+     * exactly norm, then gate, then projection, on the same values.
+     *
+     * The gate rows reuse z. After step 5 z holds only the log-decay g, which nothing
+     * reads once alpha has been formed from it, and it is [T][P], exactly the gate's
+     * shape, so the batched gate costs no scratch beyond what the layer already had. */
+    for (int t = 0; t < T; t++)
+        for (int h = 0; h < H; h++) {
+            float *oh = o + (size_t)t * P + (size_t)h * D;
+            k3_rmsnorm(oh, oh, w->o_norm, D, c->rms_eps);
+        }
+    float *gt = z;
+    k3_mmw_batch(gt, x, w->g, w->wdt, E, P, T);
+    for (size_t i = 0; i < (size_t)T * P; i++) o[i] *= sigmoidf_(gt[i]);
+    k3_mmw_batch(out, o, w->o, w->wdt, P, E, T);
     free(Sown);
 }
 
+/* Commit n recorded positions to the carried state. See K3KdaLog in k3.h, and
+ * kda_replay_head_ and kda_replay_conv_ for why the result is the state feeding exactly
+ * those positions would have left, to the bit. Nothing is read from the weights, which is
+ * why a streamed trunk costs no I/O here. */
+void k3_kda_advance(float *state, const K3KdaLog *log, int n, const K3Cfg *c)
+{
+    const int H = c->kda_heads, D = c->kda_head_dim, P = H * D;
+    if (n < 0 || n > log->cap) kda_log_bound_("KDA commit length", n, log->cap);
+    if (n == 0) return;
+    const size_t lrow = k3_kda_log_row(c);
+
+    float *tmp = (float *)calloc((size_t)(H + 1) * D, sizeof(float));
+    if (!tmp) k3_fatal_oom("KDA commit temporaries", (size_t)(H + 1) * D * sizeof(float));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int h = 0; h < H; h++)
+        kda_replay_head_(state + (size_t)h * D * D, log->rows, lrow, n, h, D, P, tmp,
+                         tmp + (size_t)(h + 1) * D);
+    free(tmp);
+    kda_replay_conv_(state + (size_t)H * D * D, state + (size_t)H * D * D, log->rows, lrow,
+                     n, c);
+}
+
 /* ----------------------------------------------------------- decoder layer ---- */
-size_t k3_layer_scratch(const K3Cfg *c, int T)
+/* The region after the layer's own buffers, which attention, then the MLP, take turns
+ * in: [2*dense_inter][sub-block]. Attention and the MoE use the sub-block; the dense MLP
+ * (layer 0) uses the whole region, since nothing else is live by then. */
+static size_t layer_region(const K3Cfg *c, int T)
 {
     size_t a = k3_mla_scratch(c, T);
     size_t b = k3_kda_scratch(c, T);
-    size_t m = k3_moe_scratch(c);
+    size_t m = k3_moe_scratch(c, T);
     size_t sub = a > b ? a : b;
     if (m > sub) sub = m;
-    /* prefix_sum, tmp, fold vectors, one attn_res source stack, plus the sub-block */
+    return (size_t)2 * c->dense_inter + sub;
+}
+
+/* Positions per block of the dense MLP. Each position needs one [gate | up] row of
+ * 2*dense_inter floats (SiTU then writes over the gate half in place), and a block is as
+ * many rows as the region holds, so the three dense matrices are applied to a whole
+ * block per pass without reserving anything beyond what attention already needs. For the
+ * released config and the fixture config alike that covers every position: the KDA
+ * sub-block alone is larger than 2*dense_inter per position. */
+static int dense_block(const K3Cfg *c, int T)
+{
+    const size_t row = (size_t)2 * (c->dense_inter > 0 ? c->dense_inter : 1);
+    size_t n = layer_region(c, T) / row;
+    if (n < 1) n = 1;
+    if (n > (size_t)T) n = (size_t)(T > 0 ? T : 1);
+    return (int)n;
+}
+
+size_t k3_layer_scratch(const K3Cfg *c, int T)
+{
+    /* prefix_sum, tmp, hin, fold vectors, one attn_res source stack, plus the region */
     return (size_t)3 * T * c->hidden
          + (size_t)2 * c->hidden
          + (size_t)(c->n_layers / c->attn_res_block + 2) * c->hidden
-         + (size_t)2 * c->dense_inter
-         + sub;
+         + layer_region(c, T);
 }
 
 /* The incremental form. Everything except MLA already carries its own state:
@@ -1110,6 +1944,19 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
                           int T, float *state, float *scratch,
                           float *kvc, float *ropec, int cached, int cap, int kv_latent)
 {
+    k3_decoder_layer_inc_log(h, block_residual, n_blocks, w, c, layer_idx, T, state,
+                             scratch, kvc, ropec, cached, cap, kv_latent, NULL);
+}
+
+/* kda_log reaches only the KDA module; see K3KdaLog. Everything else in the layer is
+ * per token (norms, AttnRes, the MoE) or positional (the MLA cache), so the log is the
+ * only thing a speculative rollback needs from here. */
+void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
+                              const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                              int T, float *state, float *scratch,
+                              float *kvc, float *ropec, int cached, int cap, int kv_latent,
+                              const K3KdaLog *kda_log)
+{
     const int E = c->hidden;
     const int maxb = c->n_layers / c->attn_res_block + 2;
 
@@ -1119,8 +1966,8 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     float *foldA  = hin  + (size_t)T * E;       /* [E] attention aggregator      */
     float *foldM  = foldA + E;                  /* [E] mlp aggregator            */
     float *src    = foldM + E;                  /* [maxb+1][E] source stack      */
-    float *dgu    = src + (size_t)(maxb) * E;   /* [2*dense_inter]               */
-    float *sub    = dgu + (size_t)2 * c->dense_inter;
+    float *dgu    = src + (size_t)(maxb) * E;   /* the region: [2*dense_inter] ... */
+    float *sub    = dgu + (size_t)2 * c->dense_inter;   /* ... then the sub-block    */
 
     /* The norm gain and the scoring projection collapse to ONE vector. Folding them
      * here costs 2*hidden multiplies per layer; a real engine folds at load time. */
@@ -1157,7 +2004,7 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
     /* attention */
     for (int t = 0; t < T; t++)
         k3_rmsnorm(hin + (size_t)t * E, h + (size_t)t * E, w->in_norm, E, c->rms_eps);
-    if (w->kda) k3_kda_layer(tmp, hin, w->kda, c, T, state, sub);
+    if (w->kda) k3_kda_layer_log(tmp, hin, w->kda, c, T, state, sub, kda_log);
     else        k3_mla_cached(tmp, hin, w->mla, c, T, sub, kvc, ropec, cached, cap,
                               kv_latent);
 
@@ -1185,12 +2032,23 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
          * to k3_moe inside, byte-identical. */
         k3_moe_prefill(tmp, hin, w->moe, c, T, idx, wt, sub);
     } else {
-        for (int t = 0; t < T; t++) {
-            k3_mmw(dgu, hin + (size_t)t * E, w->dense_gate, w->wdt, E, c->dense_inter);
-            k3_mmw(dgu + c->dense_inter, hin + (size_t)t * E, w->dense_up, w->wdt,
-                      E, c->dense_inter);
-            k3_situ_glu(sub, dgu, c->dense_inter, c->situ_b1, c->situ_b2);
-            k3_mmw(tmp + (size_t)t * E, sub, w->dense_down, w->wdt, c->dense_inter, E);
+        /* Dense MLP (layer 0 only), in blocks of dense_block() positions: gate and up land
+         * interleaved per position as [gate | up], SiTU writes its result over the gate
+         * half (element i of the output depends only on element i of each half), and down
+         * reads that half at stride 2*dense_inter. Each matrix is one pass per block, and
+         * per position every value is what the per-position k3_mmw sequence produced. */
+        const int di = c->dense_inter, nb = dense_block(c, T);
+        for (int t0 = 0; t0 < T; t0 += nb) {
+            const int n = T - t0 < nb ? T - t0 : nb;
+            const float *ht = hin + (size_t)t0 * E;
+            k3_mmw_batch_ld(dgu,      2 * di, ht, E, w->dense_gate, w->wdt, E, di, n);
+            k3_mmw_batch_ld(dgu + di, 2 * di, ht, E, w->dense_up,   w->wdt, E, di, n);
+            for (int t = 0; t < n; t++) {
+                float *gu_t = dgu + (size_t)t * 2 * di;
+                k3_situ_glu(gu_t, gu_t, di, c->situ_b1, c->situ_b2);
+            }
+            k3_mmw_batch_ld(tmp + (size_t)t0 * E, E, dgu, 2 * di, w->dense_down, w->wdt,
+                            di, E, n);
         }
     }
 
@@ -1227,127 +2085,282 @@ static const float K3_E2M1[16] = {
  *   exactly the values an fp32 copy would have supplied. The only difference from
  *   k3_matmul is WHERE the widening happens, not what is widened.
  *
- * The accumulator layout mirrors k3_matmul deliberately, four partial sums in double,
- * reduced in the same order, so the two kernels agree to the bit on identical input.
+ * The accumulator layout mirrors k3_matmul deliberately: the same sixteen partial sums
+ * in double, reduced by the same k3_tree16, so the two kernels agree to the bit on
+ * identical input (test_ops asserts it).
  *
- * THE AVX2 PATH IS BIT-IDENTICAL TO THE SCALAR PATH, not merely close. A __m256d holds
- * exactly four doubles, and loading four consecutive elements per iteration places
- * element i in lane i%4: the same partition as the scalar accumulators, with the same
- * sequential order within each lane. Reducing with (a0+a1)+(a2+a3) then reproduces the
- * scalar result exactly. Two details carry that guarantee:
+ * WHERE THE DECODE TIME WENT. On x86 every conversion below issues on the one shuffle
+ * port, and that port, not the multiply-adds, was the limit: per 16 weights the old AVX2
+ * loop ran four zero-extends and four float-to-double conversions for the weights, and
+ * four more conversions that re-widened x, which does not depend on the row at all.
  *
- *   - MUL THEN ADD, never _mm256_fmadd_pd. The build sets -ffp-contract=off, so the
- *     scalar code rounds the product and the sum separately while an FMA rounds once.
- *     Here the product happens to be exact (a bf16 widens exactly, and float x float
- *     needs 48 mantissa bits, which fits double's 53), so the two would agree anyway
- *     but that is a proof about the inputs. Mul-then-add is a proof about the code.
- *   - The scalar tail loop is reused verbatim for the in % 4 remainder.
+ *   1. x is widened to double ONCE PER CALL (xd), as k3_matmul_mxfp4 already did.
+ *
+ *   2. No zero-extend. A 32-bit lane of the raw row holds TWO bf16, the even-indexed
+ *      element in its low half and the odd-indexed one in its high half. Shifting the
+ *      lane left by 16 turns the even one into its float; masking off the low half
+ *      turns the odd one into its float. Both are plain ALU operations. The vector loop
+ *      therefore sees the eight even-indexed weights of a 16-element chunk in one
+ *      register and the eight odd-indexed ones in another, and xd is stored to match
+ *      (k3_widen_eo16): per chunk, the eight even-indexed x, then the eight odd ones.
+ *
+ *   3. Two rows per iteration, sharing every xd load. At the trunk's widths xd is 57 KB,
+ *      larger than L1, so this halves the L2 traffic the loop generates; the two rows are
+ *      still two independent sums.
+ *
+ * THE VECTOR PATHS ARE BIT-IDENTICAL TO THE SCALAR PATH, not merely close. The even/odd
+ * split decides only which register lane holds which of the sixteen accumulators, never
+ * which accumulator an element goes to:
+ *
+ *   AVX-512  e0 lane k is a[2k], o0 lane k is a[2k + 1];
+ *   AVX2     el lane k is a[2k], eh lane k is a[8 + 2k], ol and oh the odd ones;
+ *   NEON     natural order, as in k3_f32_row_v (wk holds {a[2k], a[2k + 1]}).
+ *
+ * Each accumulator still takes the elements i == its index (mod 16) in ascending i, one
+ * fused multiply-add each: fma(), _mm256_fmadd_pd, _mm512_fmadd_pd and vfmaq_f64 are the
+ * same IEEE operation with a single rounding, and the build's -ffp-contract=off keeps
+ * the compiler from fusing anything else. The lanes are stored back to a[16] in natural
+ * order and reduced by k3_tree16, and every path finishes the in % 16 tail with the same
+ * sequential fma() loop. (The products are exact in any case: a bf16 times a float needs
+ * 8 + 24 = 32 significand bits of double's 53, so the only rounding is the sum's.)
  */
+
+/* The whole-chunk part of one bf16 row, the reference form. See k3_f32_row_c: it is the
+ * scalar build's path and the vector builds' fallback when xd could not be allocated. */
+static inline double k3_bf16_row_c(const uint16_t *row, const float *x, int n16)
+{
+    double a[16] = {0};
+    for (int i = 0; i < n16; i += 16)
+        for (int l = 0; l < 16; l++)
+            a[l] = fma((double)k3_bf16f(row[i + l]), (double)x[i + l], a[l]);
+    return k3_tree16(a);
+}
+
+#if defined(__AVX2__)
+/* SOFTWARE PREFETCH, x86 only. A decode-time matmul streams its weights from DRAM once
+ * per token. With compute between the loads, the hardware prefetcher may not run far
+ * enough ahead of a row's read pointer to keep enough misses in flight, and the loop
+ * then reads below the machine's streaming bandwidth. One prefetcht0 per 64-byte line,
+ * 1 KB ahead of each row's read pointer (512 B for MXFP4, whose 16-byte groups are
+ * consumed faster per byte), asks for the lines early. The distances come from
+ * exploratory runs on a shared x86 VM that are not recorded, so no speed figure is
+ * claimed for them: bench_kernels prints the bf16 kernel's weight traffic beside the
+ * machine's read bandwidth, which is the measurement to take on a quiet machine before
+ * tuning them. A prefetch is only a hint -- it reads nothing into a register, cannot
+ * fault, and changes no arithmetic -- so the one thing it can change is speed. The NEON
+ * loops are left without one. */
+#define K3_PF_BF16  1024
+#define K3_PF_MXFP4 512
+
+/* x widened to double in the EVEN/ODD CHUNK LAYOUT the x86 vector loops read: within the
+ * chunk starting at c, xd[c + k] = x[c + 2k] and xd[c + 8 + k] = x[c + 2k + 1] for
+ * k = 0..7. The in % 16 tail stays in natural order. Float to double is exact, so every
+ * xd value is the one the scalar path forms in place; only the addresses move. Shared
+ * with the AVX-512 path of k3_matmul_mxfp4, which splits its nibbles the same way. */
+static void k3_widen_eo16(double *xd, const float *x, int in)
+{
+    const int n16 = in & ~15;
+    for (int c = 0; c < n16; c += 16)
+        for (int k = 0; k < 8; k++) {
+            xd[c + k]     = (double)x[c + 2 * k];
+            xd[c + 8 + k] = (double)x[c + 2 * k + 1];
+        }
+    for (int i = n16; i < in; i++) xd[i] = (double)x[i];
+}
+
+/* ev[k] is accumulator a[2k] and od[k] is a[2k + 1]: put them back in natural order and
+ * reduce with the one tree. */
+static inline double k3_tree16_eo(const double *ev, const double *od)
+{
+    double a[16];
+    for (int k = 0; k < 8; k++) { a[2 * k] = ev[k]; a[2 * k + 1] = od[k]; }
+    return k3_tree16(a);
+}
+#endif
+
+#if defined(__AVX512F__)
+/* Rows r0 and r1 over the first n16 elements, xd in the even/odd chunk layout. Per 16
+ * elements and row: one 32-byte load, a shift and a mask, two float-to-double
+ * conversions and two FMAs. r1 may equal r0 (an odd row count's last row). */
+static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                   const uint16_t *r1, const double *xd, int n16)
+{
+    const __m256i hi = _mm256_set1_epi32((int)0xFFFF0000u);
+    __m512d e0 = _mm512_setzero_pd(), o0 = _mm512_setzero_pd();
+    __m512d e1 = _mm512_setzero_pd(), o1 = _mm512_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        const __m512d xe = _mm512_loadu_pd(xd + i);       /* x[i + 2k]     */
+        const __m512d xo = _mm512_loadu_pd(xd + i + 8);   /* x[i + 2k + 1] */
+        const __m256i w0 = _mm256_loadu_si256((const __m256i *)(r0 + i));
+        const __m256i w1 = _mm256_loadu_si256((const __m256i *)(r1 + i));
+        if ((i & 31) == 0) {                      /* once per 64-byte line of each row */
+            _mm_prefetch((const char *)(r0 + i) + K3_PF_BF16, _MM_HINT_T0);
+            _mm_prefetch((const char *)(r1 + i) + K3_PF_BF16, _MM_HINT_T0);
+        }
+        e0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_slli_epi32(w0, 16))), xe, e0);
+        o0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_and_si256(w0, hi))), xo, o0);
+        e1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_slli_epi32(w1, 16))), xe, e1);
+        o1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm256_castsi256_ps(
+                 _mm256_and_si256(w1, hi))), xo, o1);
+    }
+    double ev[8], od[8];
+    _mm512_storeu_pd(ev, e0); _mm512_storeu_pd(od, o0); *acc0 = k3_tree16_eo(ev, od);
+    _mm512_storeu_pd(ev, e1); _mm512_storeu_pd(od, o1); *acc1 = k3_tree16_eo(ev, od);
+}
+#elif defined(__AVX2__)
+/* The same with 256-bit registers: eight accumulators for the pair, each 16-element
+ * chunk loaded as two 16-byte halves so the conversions need no lane extract. Two rows
+ * share every xd load, as on AVX-512; the body is ordered so that the eight
+ * accumulators, one x vector and two temporaries fit the sixteen ymm registers without
+ * a spill. The gain was seen only in unrecorded exploratory runs on a shared VM, so no
+ * figure is claimed for it (see the CHANGELOG). */
+static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                   const uint16_t *r1, const double *xd, int n16)
+{
+    const __m128i hi = _mm_set1_epi32((int)0xFFFF0000u);
+    __m256d el0 = _mm256_setzero_pd(), eh0 = _mm256_setzero_pd();
+    __m256d ol0 = _mm256_setzero_pd(), oh0 = _mm256_setzero_pd();
+    __m256d el1 = _mm256_setzero_pd(), eh1 = _mm256_setzero_pd();
+    __m256d ol1 = _mm256_setzero_pd(), oh1 = _mm256_setzero_pd();
+    for (int i = 0; i < n16; i += 16) {
+        const __m128i a0 = _mm_loadu_si128((const __m128i *)(r0 + i));
+        const __m128i b0 = _mm_loadu_si128((const __m128i *)(r0 + i + 8));
+        const __m128i a1 = _mm_loadu_si128((const __m128i *)(r1 + i));
+        const __m128i b1 = _mm_loadu_si128((const __m128i *)(r1 + i + 8));
+        if ((i & 31) == 0) {                      /* once per 64-byte line of each row */
+            _mm_prefetch((const char *)(r0 + i) + K3_PF_BF16, _MM_HINT_T0);
+            _mm_prefetch((const char *)(r1 + i) + K3_PF_BF16, _MM_HINT_T0);
+        }
+        /* Each x vector feeds both rows at once, which keeps the live registers to
+         * the eight accumulators, one x and two temporaries. */
+        __m256d xv = _mm256_loadu_pd(xd + i);                  /* x[i + 0, 2, 4, 6]    */
+        el0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(a0, 16))),
+                              xv, el0);
+        el1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(a1, 16))),
+                              xv, el1);
+        xv = _mm256_loadu_pd(xd + i + 8);                      /* x[i + 1, 3, 5, 7]    */
+        ol0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(a0, hi))),
+                              xv, ol0);
+        ol1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(a1, hi))),
+                              xv, ol1);
+        xv = _mm256_loadu_pd(xd + i + 4);                      /* x[i + 8, 10, 12, 14] */
+        eh0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(b0, 16))),
+                              xv, eh0);
+        eh1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(b1, 16))),
+                              xv, eh1);
+        xv = _mm256_loadu_pd(xd + i + 12);                     /* x[i + 9, 11, 13, 15] */
+        oh0 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(b0, hi))),
+                              xv, oh0);
+        oh1 = _mm256_fmadd_pd(_mm256_cvtps_pd(_mm_castsi128_ps(_mm_and_si128(b1, hi))),
+                              xv, oh1);
+    }
+    double ev[8], od[8];
+    _mm256_storeu_pd(ev, el0); _mm256_storeu_pd(ev + 4, eh0);
+    _mm256_storeu_pd(od, ol0); _mm256_storeu_pd(od + 4, oh0);
+    *acc0 = k3_tree16_eo(ev, od);
+    _mm256_storeu_pd(ev, el1); _mm256_storeu_pd(ev + 4, eh1);
+    _mm256_storeu_pd(od, ol1); _mm256_storeu_pd(od + 4, oh1);
+    *acc1 = k3_tree16_eo(ev, od);
+}
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+/* One row, natural order: wk holds {a[2k], a[2k + 1]}, exactly as k3_f32_row_v. bf16 to
+ * f32 is the usual 16-bit left shift; vshll_n_u16 widens and shifts in one instruction.
+ * The x widening this loop used to repeat per row (eight vcvt per 16 elements) is gone:
+ * xd holds x already widened, in natural order. */
+static inline double k3_bf16_row_neon(const uint16_t *row, const double *xd, int n16)
+{
+    float64x2_t w0 = vdupq_n_f64(0.0), w1 = vdupq_n_f64(0.0);
+    float64x2_t w2 = vdupq_n_f64(0.0), w3 = vdupq_n_f64(0.0);
+    float64x2_t w4 = vdupq_n_f64(0.0), w5 = vdupq_n_f64(0.0);
+    float64x2_t w6 = vdupq_n_f64(0.0), w7 = vdupq_n_f64(0.0);
+    for (int i = 0; i < n16; i += 16) {
+        const uint16x8_t h0 = vld1q_u16(row + i);
+        const uint16x8_t h1 = vld1q_u16(row + i + 8);
+        const float32x4_t f0 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16));
+        const float32x4_t f1 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16));
+        const float32x4_t f2 = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
+        const float32x4_t f3 = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
+        w0 = vfmaq_f64(w0, vcvt_f64_f32(vget_low_f32(f0)), vld1q_f64(xd + i));
+        w1 = vfmaq_f64(w1, vcvt_high_f64_f32(f0),          vld1q_f64(xd + i + 2));
+        w2 = vfmaq_f64(w2, vcvt_f64_f32(vget_low_f32(f1)), vld1q_f64(xd + i + 4));
+        w3 = vfmaq_f64(w3, vcvt_high_f64_f32(f1),          vld1q_f64(xd + i + 6));
+        w4 = vfmaq_f64(w4, vcvt_f64_f32(vget_low_f32(f2)), vld1q_f64(xd + i + 8));
+        w5 = vfmaq_f64(w5, vcvt_high_f64_f32(f2),          vld1q_f64(xd + i + 10));
+        w6 = vfmaq_f64(w6, vcvt_f64_f32(vget_low_f32(f3)), vld1q_f64(xd + i + 12));
+        w7 = vfmaq_f64(w7, vcvt_high_f64_f32(f3),          vld1q_f64(xd + i + 14));
+    }
+    /* (a[l]+a[4+l])+(a[8+l]+a[12+l]) lanewise -- t0 = {b0,b1}, t1 = {b2,b3} -- then
+     * (b0+b1)+(b2+b3): k3_tree16 exactly. */
+    const float64x2_t t0 = vaddq_f64(vaddq_f64(w0, w2), vaddq_f64(w4, w6));
+    const float64x2_t t1 = vaddq_f64(vaddq_f64(w1, w3), vaddq_f64(w5, w7));
+    return vaddvq_f64(t0) + vaddvq_f64(t1);
+}
+
+/* NEON keeps one row per pass: nothing here can measure a two-row form on Apple
+ * Silicon, and its three load ports make the shared-xd saving small there. */
+static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                   const uint16_t *r1, const double *xd, int n16)
+{
+    *acc0 = k3_bf16_row_neon(r0, xd, n16);
+    *acc1 = (r1 != r0) ? k3_bf16_row_neon(r1, xd, n16) : *acc0;
+}
+#endif
+
 void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
 {
+    const int n16 = in & ~15;
+
+    /* WIDEN x ONCE, in the order the vector loop reads it (see the notes above and
+     * "WIDEN x ONCE" in k3_matmul_mxfp4). Read-only and shared by every thread. NULL is
+     * a valid state: the rows then take k3_bf16_row_c, the same sum without the copy,
+     * so an allocation failure costs speed and nothing else. */
+#if K3_MM_HOIST
+    double *const xd = (double *)malloc((size_t)in * sizeof(double));
+    if (xd) {
+#if defined(__AVX2__)
+        k3_widen_eo16(xd, x, in);
+#else
+        for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+#endif
+    }
+#endif
+
+    /* Row PAIRS are the unit of parallel work. Output rows stay independent -- each is
+     * summed by exactly one thread in exactly the order above -- so pairing them changes
+     * no arithmetic and results remain identical at any thread count. An odd last row
+     * is paired with itself and stored once. */
+    const int npair = (out + 1) / 2;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
-    for (int o = 0; o < out; o++) {
-        const uint16_t *row = W + (size_t)o * in;
-        int i = 0;
-        double acc;
-#if defined(__AVX2__)
-        {
-            /* Four vector accumulators, fused. _mm256_fmadd_pd per lane is the same
-             * IEEE operation as scalar fma() in double, and the reduction below is
-             * lane-for-lane the tree k3_matmul's sixteen scalar accumulators use, so
-             * the two kernels remain BITWISE identical (test_ops asserts it). The old
-             * one-accumulator mul+add form serialized on add latency at 4 elements
-             * per ~4 cycles; this runs the memory-bound side of the roof instead. */
-            __m256d v0 = _mm256_setzero_pd(), v1 = _mm256_setzero_pd();
-            __m256d v2 = _mm256_setzero_pd(), v3 = _mm256_setzero_pd();
-            for (; i + 15 < in; i += 16) {
-                const __m128i h0 = _mm_loadl_epi64((const __m128i *)(row + i));
-                const __m128i h1 = _mm_loadl_epi64((const __m128i *)(row + i + 4));
-                const __m128i h2 = _mm_loadl_epi64((const __m128i *)(row + i + 8));
-                const __m128i h3 = _mm_loadl_epi64((const __m128i *)(row + i + 12));
-                v0 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h0), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i)), v0);
-                v1 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h1), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 4)), v1);
-                v2 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h2), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 8)), v2);
-                v3 = _mm256_fmadd_pd(
-                    _mm256_cvtps_pd(_mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(h3), 16))),
-                    _mm256_cvtps_pd(_mm_loadu_ps(x + i + 12)), v3);
-            }
-            /* (v0+v1)+(v2+v3) lanewise, then the same cross-lane pairing as scalar */
-            const __m256d vt = _mm256_add_pd(_mm256_add_pd(v0, v1),
-                                             _mm256_add_pd(v2, v3));
-            double a[4];
-            _mm256_storeu_pd(a, vt);
-            acc = (a[0] + a[1]) + (a[2] + a[3]);
-        }
-#elif defined(__ARM_NEON) && defined(__aarch64__)
-        {
-            /* Eight 2-lane double accumulators: wk holds the scalar path's
-             * {a[2k], a[2k+1]}, so element i lands in accumulator i%16 exactly as in
-             * the scalar and AVX2 forms, and vfmaq_f64 per lane is the same IEEE fma()
-             * in double. bf16 -> f32 is the usual 16-bit left shift; vshll_n_u16
-             * widens and shifts in one instruction. */
-            float64x2_t w0 = vdupq_n_f64(0.0), w1 = vdupq_n_f64(0.0);
-            float64x2_t w2 = vdupq_n_f64(0.0), w3 = vdupq_n_f64(0.0);
-            float64x2_t w4 = vdupq_n_f64(0.0), w5 = vdupq_n_f64(0.0);
-            float64x2_t w6 = vdupq_n_f64(0.0), w7 = vdupq_n_f64(0.0);
-            for (; i + 15 < in; i += 16) {
-                const uint16x8_t h0 = vld1q_u16(row + i);
-                const uint16x8_t h1 = vld1q_u16(row + i + 8);
-                const float32x4_t f0 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h0), 16));
-                const float32x4_t f1 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h0), 16));
-                const float32x4_t f2 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
-                const float32x4_t f3 =
-                    vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
-                const float32x4_t x0 = vld1q_f32(x + i);
-                const float32x4_t x1 = vld1q_f32(x + i + 4);
-                const float32x4_t x2 = vld1q_f32(x + i + 8);
-                const float32x4_t x3 = vld1q_f32(x + i + 12);
-                w0 = vfmaq_f64(w0, vcvt_f64_f32(vget_low_f32(f0)),
-                                   vcvt_f64_f32(vget_low_f32(x0)));
-                w1 = vfmaq_f64(w1, vcvt_high_f64_f32(f0), vcvt_high_f64_f32(x0));
-                w2 = vfmaq_f64(w2, vcvt_f64_f32(vget_low_f32(f1)),
-                                   vcvt_f64_f32(vget_low_f32(x1)));
-                w3 = vfmaq_f64(w3, vcvt_high_f64_f32(f1), vcvt_high_f64_f32(x1));
-                w4 = vfmaq_f64(w4, vcvt_f64_f32(vget_low_f32(f2)),
-                                   vcvt_f64_f32(vget_low_f32(x2)));
-                w5 = vfmaq_f64(w5, vcvt_high_f64_f32(f2), vcvt_high_f64_f32(x2));
-                w6 = vfmaq_f64(w6, vcvt_f64_f32(vget_low_f32(f3)),
-                                   vcvt_f64_f32(vget_low_f32(x3)));
-                w7 = vfmaq_f64(w7, vcvt_high_f64_f32(f3), vcvt_high_f64_f32(x3));
-            }
-            /* (a[l]+a[4+l])+(a[8+l]+a[12+l]) lanewise -- t0 = {b0,b1}, t1 = {b2,b3} --
-             * then (b0+b1)+(b2+b3): the scalar reduction tree exactly. */
-            const float64x2_t t0 = vaddq_f64(vaddq_f64(w0, w2), vaddq_f64(w4, w6));
-            const float64x2_t t1 = vaddq_f64(vaddq_f64(w1, w3), vaddq_f64(w5, w7));
-            acc = vaddvq_f64(t0) + vaddvq_f64(t1);
-        }
-#else
-        {
-            double a[16] = {0};
-            for (; i + 15 < in; i += 16)
-                for (int l = 0; l < 16; l++)
-                    a[l] = fma((double)k3_bf16f(row[i + l]), (double)x[i + l], a[l]);
-            double b0 = (a[0] + a[4]) + (a[8]  + a[12]);
-            double b1 = (a[1] + a[5]) + (a[9]  + a[13]);
-            double b2 = (a[2] + a[6]) + (a[10] + a[14]);
-            double b3 = (a[3] + a[7]) + (a[11] + a[15]);
-            acc = (b0 + b1) + (b2 + b3);
-        }
+    for (int p = 0; p < npair; p++) {
+        const int o0 = 2 * p;
+        const int o1 = (o0 + 1 < out) ? o0 + 1 : o0;
+        const uint16_t *r0 = W + (size_t)o0 * in;
+        const uint16_t *r1 = W + (size_t)o1 * in;
+        double acc0, acc1;
+#if K3_MM_HOIST
+        if (xd) k3_bf16_rows2_v(&acc0, &acc1, r0, r1, xd, n16);
+        else
 #endif
-        for (; i < in; i++) acc = fma((double)k3_bf16f(row[i]), (double)x[i], acc);
-        y[o] = (float)acc;
+        {
+            acc0 = k3_bf16_row_c(r0, x, n16);
+            acc1 = (o1 != o0) ? k3_bf16_row_c(r1, x, n16) : acc0;
+        }
+        for (int i = n16; i < in; i++) {
+            acc0 = fma((double)k3_bf16f(r0[i]), (double)x[i], acc0);
+            acc1 = fma((double)k3_bf16f(r1[i]), (double)x[i], acc1);
+        }
+        y[o0] = k3_out_f32(acc0);
+        if (o1 != o0) y[o1] = k3_out_f32(acc1);
     }
+
+#if K3_MM_HOIST
+    free(xd);                                     /* free(NULL) is a no-op */
+#endif
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
@@ -1476,6 +2489,156 @@ static void k3_e8m0_init(void)
     k3_e8m0_ready = 1;
 }
 
+#if defined(__AVX512F__)
+/* AVX-512 FORM OF THE AVX2 FLAT ROW PATH, BIT-IDENTICAL TO IT. See the FLAT ROW PATH
+ * comment inside k3_matmul_mxfp4 for the arithmetic; this changes only how each
+ * operand reaches its lane.
+ *
+ * DECODE BY TABLE, IN DOUBLE. The AVX2 loop decodes a nibble to a float through a
+ * permute and a sign XOR, then widens it with _mm256_cvtps_pd; with the zero-extends,
+ * lane extracts and scale broadcast, that is thirteen shuffle-port operations per 16
+ * weights, and the shuffle port is what bounds it. Here the sixteen possible weights of
+ * a group -- every E2M1 code times that group's scale -- are built once per group as
+ * DOUBLES in two registers, and _mm512_permutex2var_pd, which indexes sixteen doubles by
+ * the low four bits of each 64-bit lane, turns a code straight into its widened weight.
+ * Per 16 weights: one 8-byte zero-extend, one shift, two lookups, two FMAs.
+ *
+ * WHY THE TABLE HOLDS EXACTLY THE AVX2 VALUES. AVX2 uses w = (double)(float)(E2M1[c] *
+ * K3_E8M0[sb]), the product rounded to float and then widened. For 2 <= sb <= 252 that
+ * float product is exact -- a 3-bit significand times a power of two, neither
+ * overflowing (6 * 2^125 < FLT_MAX) nor falling below the normal range (0.5 * 2^-125 is
+ * normal) -- so computing it in double from the exact double scale gives the same value.
+ * sb 0, 1, 253 and 254 are where the float product is subnormal or overflows to inf;
+ * for those the table is built the AVX2 way, a float multiply then a widen, so it
+ * reproduces the subnormal (and any flush-to-zero mode) and the inf exactly. Negative
+ * codes are the negated magnitudes times the scale: IEEE multiplication is symmetric in
+ * sign, so -(a*s) == (-a)*s bit for bit, the same value AVX2 gets by XORing the sign bit
+ * into a*s (including -0.0 for code 8). */
+static inline void k3_e2m1_table512(__m512d *lo, __m512d *hi, unsigned sb)
+{
+    if (sb >= 2 && sb <= 252) {
+        const __m512d s = _mm512_set1_pd((double)K3_E8M0[sb]);   /* exact: a power of two */
+        *lo = _mm512_mul_pd(_mm512_setr_pd(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), s);
+        *hi = _mm512_mul_pd(_mm512_setr_pd(-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0), s);
+    } else {
+        const __m256 s = _mm256_set1_ps(K3_E8M0[sb]);
+        *lo = _mm512_cvtps_pd(_mm256_mul_ps(
+            _mm256_setr_ps(0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f), s));
+        *hi = _mm512_cvtps_pd(_mm256_mul_ps(
+            _mm256_setr_ps(-0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f), s));
+    }
+}
+
+/* The AVX2 flat path's reduction, in accumulator terms. Its lanewise (v0+v2)+(v1+v3)
+ * is q[l] = (a[l] + a[l+8]) + (a[l+4] + a[l+12]); it then adds the two 128-bit halves,
+ * (q0+q2, q1+q3), and finally those two lanes. That pairing differs from k3_tree16's,
+ * and each must stay as it is: changing either tree changes bits. ev[k] is a[2k] and
+ * od[k] is a[2k+1], as in k3_tree16_eo. */
+static inline double k3_tree16_flat_eo(const double *ev, const double *od)
+{
+    double a[16], q[4];
+    for (int k = 0; k < 8; k++) { a[2 * k] = ev[k]; a[2 * k + 1] = od[k]; }
+    for (int l = 0; l < 4; l++) q[l] = (a[l] + a[l + 8]) + (a[l + 4] + a[l + 12]);
+    return (q[0] + q[2]) + (q[1] + q[3]);
+}
+
+/* Two rows of the flat path, xd in the even/odd chunk layout (k3_widen_eo16): per
+ * 16-element chunk, byte k of the 8 packed bytes holds element 2k in its low nibble and
+ * element 2k+1 in its high nibble, so the zero-extended bytes index the even weights
+ * directly (the lookup reads only bits 3..0) and the same bytes shifted right by 4
+ * index the odd ones. Lane k of e is accumulator a[2k] and lane k of o is a[2k+1]:
+ * every element still lands in a[i % 16], in ascending i, one FMA each.
+ *
+ * A NaN scale byte (255) SKIPS its chunks, exactly as the AVX2 loop's goto does: the
+ * FMAs run under a zero write-mask, which leaves the accumulators untouched, rather
+ * than adding a product of zero (0 * inf would be NaN, and a skipped chunk must not be
+ * able to produce one). The in % 16 tail is the AVX2 path's scalar loop verbatim,
+ * which does NOT skip a 255 group -- also reproduced. r1 may equal r0 (an odd row
+ * count's last row).
+ *
+ * e8d[b] is (double)K3_E8M0[b], widened once per call so a group's scale reaches a
+ * register as one broadcast load. The common case -- a whole 32-element group (K3's
+ * group size) whose two scale bytes both lie in 2..252 -- runs straight-line with no
+ * mask and a two-multiply table per row; everything else (other group sizes, the last
+ * partial group, 255 and the four float-table scale bytes) takes the general loop,
+ * which computes the same values the slower way. */
+static inline void k3_mxfp4_rows2_avx512(double *acc, const unsigned char *p0,
+                                         const unsigned char *s0, const unsigned char *p1,
+                                         const unsigned char *s1, const double *xd,
+                                         const double *e8d, int in, int group)
+{
+    const int n16 = in & ~15;
+    const __m512d LO = _mm512_setr_pd(0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0);
+    const __m512d HI = _mm512_setr_pd(-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0);
+    __m512d e0 = _mm512_setzero_pd(), o0 = _mm512_setzero_pd();
+    __m512d e1 = _mm512_setzero_pd(), o1 = _mm512_setzero_pd();
+    int i = 0;
+    for (int g = 0; i < n16; g++) {               /* i == g * group at the top */
+        const int gend = (n16 - i > group) ? i + group : n16;
+        const unsigned b0 = s0[g], b1 = s1[g];
+        if (gend - i == 32 && b0 - 2u <= 250u && b1 - 2u <= 250u) {
+            const __m512d c0 = _mm512_set1_pd(e8d[b0]), c1 = _mm512_set1_pd(e8d[b1]);
+            const __m512d t0lo = _mm512_mul_pd(LO, c0), t0hi = _mm512_mul_pd(HI, c0);
+            const __m512d t1lo = _mm512_mul_pd(LO, c1), t1hi = _mm512_mul_pd(HI, c1);
+            const unsigned char *q0 = p0 + ((unsigned)i >> 1);
+            const unsigned char *q1 = p1 + ((unsigned)i >> 1);
+            const double *xg = xd + i;
+            if ((g & 3) == 0) {                   /* four 16-byte groups per line */
+                _mm_prefetch((const char *)q0 + K3_PF_MXFP4, _MM_HINT_T0);
+                _mm_prefetch((const char *)q1 + K3_PF_MXFP4, _MM_HINT_T0);
+            }
+            for (int h = 0; h < 2; h++) {         /* the group's two chunks, in order */
+                const __m512d xe = _mm512_loadu_pd(xg + 16 * h);
+                const __m512d xo = _mm512_loadu_pd(xg + 16 * h + 8);
+                const __m512i n0 = _mm512_cvtepu8_epi64(
+                    _mm_loadl_epi64((const __m128i *)(q0 + 8 * h)));
+                const __m512i n1 = _mm512_cvtepu8_epi64(
+                    _mm_loadl_epi64((const __m128i *)(q1 + 8 * h)));
+                e0 = _mm512_fmadd_pd(_mm512_permutex2var_pd(t0lo, n0, t0hi), xe, e0);
+                o0 = _mm512_fmadd_pd(
+                    _mm512_permutex2var_pd(t0lo, _mm512_srli_epi64(n0, 4), t0hi), xo, o0);
+                e1 = _mm512_fmadd_pd(_mm512_permutex2var_pd(t1lo, n1, t1hi), xe, e1);
+                o1 = _mm512_fmadd_pd(
+                    _mm512_permutex2var_pd(t1lo, _mm512_srli_epi64(n1, 4), t1hi), xo, o1);
+            }
+            i += 32;
+            continue;
+        }
+        const __mmask8 k0 = (b0 == 255) ? 0 : 0xFF;
+        const __mmask8 k1 = (b1 == 255) ? 0 : 0xFF;
+        __m512d t0lo, t0hi, t1lo, t1hi;
+        k3_e2m1_table512(&t0lo, &t0hi, b0);
+        k3_e2m1_table512(&t1lo, &t1hi, b1);
+        for (; i < gend; i += 16) {
+            const __m512d xe = _mm512_loadu_pd(xd + i);       /* x[i + 2k]     */
+            const __m512d xo = _mm512_loadu_pd(xd + i + 8);   /* x[i + 2k + 1] */
+            const __m512i n0 = _mm512_cvtepu8_epi64(
+                _mm_loadl_epi64((const __m128i *)(p0 + ((unsigned)i >> 1))));
+            const __m512i n1 = _mm512_cvtepu8_epi64(
+                _mm_loadl_epi64((const __m128i *)(p1 + ((unsigned)i >> 1))));
+            e0 = _mm512_mask3_fmadd_pd(_mm512_permutex2var_pd(t0lo, n0, t0hi),
+                                       xe, e0, k0);
+            o0 = _mm512_mask3_fmadd_pd(
+                _mm512_permutex2var_pd(t0lo, _mm512_srli_epi64(n0, 4), t0hi), xo, o0, k0);
+            e1 = _mm512_mask3_fmadd_pd(_mm512_permutex2var_pd(t1lo, n1, t1hi),
+                                       xe, e1, k1);
+            o1 = _mm512_mask3_fmadd_pd(
+                _mm512_permutex2var_pd(t1lo, _mm512_srli_epi64(n1, 4), t1hi), xo, o1, k1);
+        }
+    }
+    double ev[8], od[8];
+    _mm512_storeu_pd(ev, e0); _mm512_storeu_pd(od, o0); acc[0] = k3_tree16_flat_eo(ev, od);
+    _mm512_storeu_pd(ev, e1); _mm512_storeu_pd(od, o1); acc[1] = k3_tree16_flat_eo(ev, od);
+    /* Tail, at most 15 elements in one group; xd is in natural order here. */
+    for (; i < in; i++) {
+        const unsigned char n0 = (i & 1) ? (p0[i >> 1] >> 4) : (p0[i >> 1] & 0x0F);
+        const unsigned char n1 = (i & 1) ? (p1[i >> 1] >> 4) : (p1[i >> 1] & 0x0F);
+        acc[0] = fma((double)(K3_E2M1[n0] * K3_E8M0[s0[i / group]]), xd[i], acc[0]);
+        acc[1] = fma((double)(K3_E2M1[n1] * K3_E8M0[s1[i / group]]), xd[i], acc[1]);
+    }
+}
+#endif
+
 /* y[rows] = W[rows][in] . x[in], with W read straight out of packed MXFP4 and never
  * materialised as floats. This is not an optimisation; it is what makes streaming
  * experts possible at all.
@@ -1557,10 +2720,59 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
      *
      * Read-only and shared by every thread, so one copy serves the whole parallel
      * region. At the K3 shapes it is 28 KB, which stays in L2 while the packed weights
-     * stream past it. NULL is a valid state: the group loop then widens into a small
-     * stack buffer instead, so an allocation failure costs speed and nothing else. */
+     * stream past it.
+     *
+     * A FAILED ALLOCATION ABORTS ON x86 when group % 16 == 0. The flat row path below
+     * exists only with the copy; without it the rows would take the grouped path, whose
+     * summation order is different, so the output bits would follow the allocator -- not
+     * a speed cost but a change of result, which the engine does not allow (see the
+     * fatal-error note at the top of this file). Elsewhere NULL is a valid state: the
+     * group loop widens each group into a small stack buffer, the same values the copy
+     * holds, so there an allocation failure costs speed and nothing else.
+     *
+     * On AVX-512 the flat path reads x in the even/odd chunk layout its nibble split
+     * produces (k3_widen_eo16); every other path reads natural order. */
     double *const xd = (double *)malloc((size_t)in * sizeof(double));
+#if defined(__AVX2__)
+    if (!xd && (group & 15) == 0)
+        k3_fatal_oom("the widened x of an MXFP4 matmul", (size_t)in * sizeof(double));
+#endif
+#if defined(__AVX512F__)
+    const int flat512 = xd && (group & 15) == 0;
+    if (flat512) k3_widen_eo16(xd, x, in);
+    else
+#endif
     if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+
+#if defined(__AVX512F__)
+    /* The AVX-512 flat path, two rows per iteration sharing each xd load. It runs under
+     * exactly the condition the AVX2 flat path does, so an AVX-512 build and an AVX2
+     * build of this file agree bit for bit on every input, including the
+     * group % 16 != 0 case, which falls through to the unchanged loop below (and a
+     * failed xd, which aborted above in both builds).
+     * Rows stay independent: pairing them changes no arithmetic. */
+    if (flat512) {
+        double e8d[256];                          /* exact: float to double */
+        for (int b = 0; b < 256; b++) e8d[b] = (double)K3_E8M0[b];
+        const int npair = (rows + 1) / 2;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (rows > 64)
+#endif
+        for (int p = 0; p < npair; p++) {
+            const int r0 = 2 * p;
+            const int r1 = (r0 + 1 < rows) ? r0 + 1 : r0;
+            double acc[2];
+            k3_mxfp4_rows2_avx512(acc, packed + (size_t)r0 * pcols,
+                                  scales + (size_t)r0 * ngrp,
+                                  packed + (size_t)r1 * pcols,
+                                  scales + (size_t)r1 * ngrp, xd, e8d, in, group);
+            y[r0] = (float)acc[0];
+            if (r1 != r0) y[r1] = (float)acc[1];
+        }
+        free(xd);
+        return;
+    }
+#endif
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (rows > 64)
@@ -1592,11 +2804,12 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
              * port (permutevar8x32, cvtepu8_epi32 and cvtps_pd all issue there), not
              * FMA-latency-bound, so the shorter chain depth is not what limits it.
              *
-             * Lane k of v0..v3 holds elements == k (mod 16), and the final tree is
-             * ((v0+v2)+(v1+v3)) lane-wise and then (a0+a1)+(a2+a3), the same shape as
-             * the scalar reduction, so every lane holds a sum of the same element
-             * classes in the same order as the dequantised reference and the error
-             * stays a few ulps of double, far inside the 1e-6 gate.
+             * Lane k of vj holds the elements == 4j + k (mod 16), and the final tree
+             * is ((v0+v2)+(v1+v3)) lane-wise, then the two 128-bit halves added, then
+             * the last two lanes, so every lane holds a sum of the same element classes
+             * in the same order as the dequantised reference and the error stays a few
+             * ulps of double, far inside the 1e-6 gate. These are the bits the engine
+             * emits on x86; the AVX-512 path (k3_mxfp4_rows2_avx512) reproduces them.
              *
              * Requires `group` to be a multiple of 16 so no 16-element chunk straddles
              * a scale boundary (K3 uses group 32). Anything else takes the grouped path
@@ -1649,8 +2862,10 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                 if (++c == cpg) { c = 0; g++; }
             }
             {
-                /* Horizontal reduction without touching memory, same tree as the
-                 * grouped path: (a0+a1)+(a2+a3). */
+                /* Horizontal reduction without touching memory. Lanewise
+                 * q = (v0+v2)+(v1+v3), then (q0+q2)+(q1+q3): the 128-bit halves are
+                 * added first. That is NOT the grouped path's (q0+q1)+(q2+q3), and the
+                 * AVX-512 path (k3_tree16_flat_eo) reproduces this one exactly. */
                 const __m256d q = _mm256_add_pd(
                     _mm256_add_pd(v0, v2), _mm256_add_pd(v1, v3));
                 const __m128d t = _mm_add_pd(
@@ -1723,22 +2938,19 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                         vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(h1), 16));
                     const float32x4_t w3v =
                         vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(h1), 16));
-                    const float32x4_t x0v = vld1q_f32(xg + 16 * k);
-                    const float32x4_t x1v = vld1q_f32(xg + 16 * k + 4);
-                    const float32x4_t x2v = vld1q_f32(xg + 16 * k + 8);
-                    const float32x4_t x3v = vld1q_f32(xg + 16 * k + 12);
-                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w0v)),
-                                       vcvt_f64_f32(vget_low_f32(x0v)));
-                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w0v), vcvt_high_f64_f32(x0v));
-                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w1v)),
-                                       vcvt_f64_f32(vget_low_f32(x1v)));
-                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w1v), vcvt_high_f64_f32(x1v));
-                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w2v)),
-                                       vcvt_f64_f32(vget_low_f32(x2v)));
-                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w2v), vcvt_high_f64_f32(x2v));
-                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w3v)),
-                                       vcvt_f64_f32(vget_low_f32(x3v)));
-                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w3v), vcvt_high_f64_f32(x3v));
+                    /* x comes from xdg, already widened: the eight vcvt per 16
+                     * elements that re-widened x for every row are gone. xdg[j] is
+                     * (double)xg[j] exactly, so every fma sees the operands it did
+                     * before, in the same order per accumulator. */
+                    const double *xk = xdg + 16 * k;
+                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w0v)), vld1q_f64(xk));
+                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w0v),          vld1q_f64(xk + 2));
+                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w1v)), vld1q_f64(xk + 4));
+                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w1v),          vld1q_f64(xk + 6));
+                    u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(w2v)), vld1q_f64(xk + 8));
+                    u1 = vfmaq_f64(u1, vcvt_high_f64_f32(w2v),          vld1q_f64(xk + 10));
+                    u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(w3v)), vld1q_f64(xk + 12));
+                    u3 = vfmaq_f64(u3, vcvt_high_f64_f32(w3v),          vld1q_f64(xk + 14));
                 }
                 const float64x2_t t0 = vaddq_f64(u0, u2);
                 const float64x2_t t1 = vaddq_f64(u1, u3);
@@ -1784,11 +2996,12 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                  *
                  * ACCURACY CONTRACT (test_expert.c:219) is maxrel < 1e-6 against
                  * dequant-then-matmul, NOT bit-identity. This grouped path is the
-                 * FALLBACK for group not a multiple of 16, or a failed xd hoist; on
-                 * the normal K3 shape the flat row path above is taken instead. It
-                 * keeps four independent accumulators (v0..v3) to break the FMA
-                 * latency chain, so its intra-lane accumulation order differs from
-                 * the scalar path below; the difference is a few ulps of double,
+                 * FALLBACK for group not a multiple of 16 (a failed xd hoist aborts
+                 * above rather than landing here); on the normal K3 shape the flat row
+                 * path above is taken instead. It keeps four independent
+                 * accumulators (v0..v3) to break the FMA latency chain, so its
+                 * intra-lane accumulation order differs from the scalar path
+                 * below; the difference is a few ulps of double,
                  * orders of magnitude inside the 1e-6 gate. The bench FNV1a of the
                  * mxfp4 output differs from the pre-optimisation value -- that hash
                  * is a determinism check, not a correctness oracle. */
@@ -1887,14 +3100,12 @@ void k3_matmul_mxfp4(float *y, const float *x, const unsigned char *packed,
                     for (; i + 7 < n; i += 8) {
                         const float32x4_t wv0 = vld1q_f32(wf + i);
                         const float32x4_t wv1 = vld1q_f32(wf + i + 4);
-                        const float32x4_t xv0 = vld1q_f32(xg + i);
-                        const float32x4_t xv1 = vld1q_f32(xg + i + 4);
                         u0 = vfmaq_f64(u0, vcvt_f64_f32(vget_low_f32(wv0)),
-                                           vcvt_f64_f32(vget_low_f32(xv0)));
-                        u1 = vfmaq_f64(u1, vcvt_high_f64_f32(wv0), vcvt_high_f64_f32(xv0));
+                                           vld1q_f64(xdg + i));
+                        u1 = vfmaq_f64(u1, vcvt_high_f64_f32(wv0), vld1q_f64(xdg + i + 2));
                         u2 = vfmaq_f64(u2, vcvt_f64_f32(vget_low_f32(wv1)),
-                                           vcvt_f64_f32(vget_low_f32(xv1)));
-                        u3 = vfmaq_f64(u3, vcvt_high_f64_f32(wv1), vcvt_high_f64_f32(xv1));
+                                           vld1q_f64(xdg + i + 4));
+                        u3 = vfmaq_f64(u3, vcvt_high_f64_f32(wv1), vld1q_f64(xdg + i + 6));
                     }
                     const float64x2_t t0 = vaddq_f64(u0, u2);
                     const float64x2_t t1 = vaddq_f64(u1, u3);

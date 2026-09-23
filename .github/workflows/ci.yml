@@ -53,10 +53,76 @@ jobs:
       - name: Assert the suite was not silently empty
         run: |
           make CC=${{ matrix.cc }} ARCH="-mavx2 -mfma" test 2>&1 | tee /tmp/t.log
-          grep -q "22 passed, 0 failed, 0 skipped" /tmp/t.log
+          grep -q "24 passed, 0 failed, 0 skipped" /tmp/t.log
           grep -q "SCALE TEST PASSED"              /tmp/t.log
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" /tmp/t.log
           grep -q "ALL WEIGHTLESS TESTS PASSED"    /tmp/t.log
+
+  # The AVX-512 decode kernels in k3_ops.c (bf16 and fp32 rows, the MXFP4 flat path) are
+  # compiled only under __AVX512F__, which the pinned -mavx2 -mfma baseline above never
+  # defines. Jobs that build with the Makefile's default -march=native (the Windows job,
+  # and the offline-storage workflow's native job on ubuntu-latest) do build and test
+  # them, but only when their runner happens to have AVX-512, and neither checks or
+  # reports whether it did (the exactness gate's banner, buried in the make test log, is
+  # the only trace). They must match the AVX2 bits exactly, and test_matmul_exact holds
+  # them to the AVX2 orders on data where any reordering shows; this job is the one that
+  # requires the AVX-512 build where the CPU has it and says whether it ran.
+  # GitHub's ubuntu-latest pool mixes CPUs with and without AVX-512, so the job asks the
+  # runner first: with avx512f it builds with -march=native, runs the whole suite and the
+  # exactness gate, and fails unless that gate reports the AVX-512 build; without it, it
+  # says so in the log and the run summary and passes, because there is nothing to run.
+  # A green tick here is evidence only when the summary reads "AVX-512 path: RAN".
+  avx512-kernels:
+    name: AVX-512 kernels (when the runner has them)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Detect AVX-512
+        id: cpu
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          if grep -qw avx512f /proc/cpuinfo; then
+            echo "avx512=1" >> "$GITHUB_OUTPUT"
+            echo "this runner reports avx512f: building and testing the AVX-512 kernels"
+          else
+            echo "avx512=0" >> "$GITHUB_OUTPUT"
+            echo "AVX-512 path: NOT RUN (this runner's CPU has no avx512f)" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=AVX-512 path NOT RUN::this runner's CPU has no avx512f," \
+                 "so the AVX-512 kernels were neither built nor tested on this run. The" \
+                 "AVX2 and scalar paths are covered by the build + test jobs."
+          fi
+
+      - name: Install toolchain
+        if: steps.cpu.outputs.avx512 == '1'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libomp-dev
+
+      # pipefail: the default shell does not set it, and without it tee's status would
+      # hide a failing `make test`.
+      - name: make test (-march=native)
+        if: steps.cpu.outputs.avx512 == '1'
+        run: |
+          set -o pipefail
+          make ARCH="-march=native" test -j"$(nproc)" 2>&1 | tee "$RUNNER_TEMP/t.log"
+          grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" "$RUNNER_TEMP/t.log"
+          grep -q "ALL WEIGHTLESS TESTS PASSED"    "$RUNNER_TEMP/t.log"
+
+      # `make test` above already ran it; this run is for the banner. The CPU reported
+      # avx512f, so a build that did not define __AVX512F__ would mean this job had
+      # quietly tested the AVX2 path a second time, and that is a failure, not a pass.
+      - name: test_matmul_exact (-march=native)
+        if: steps.cpu.outputs.avx512 == '1'
+        run: |
+          set -o pipefail
+          ./bin/test_matmul_exact | tee "$RUNNER_TEMP/mm.log"
+          grep -q "MATMUL EXACTNESS: every path reproduces its order bit for bit" "$RUNNER_TEMP/mm.log"
+          if grep -q "^built WITH AVX-512" "$RUNNER_TEMP/mm.log"; then
+            echo "AVX-512 path: RAN (test_matmul_exact built WITH AVX-512, all orders exact)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error title=AVX-512 path did not run::the CPU reports avx512f, but the" \
+                 "-march=native build did not define __AVX512F__"
+            exit 1
+          fi
 
   # A separate job rather than a matrix leg: the toolchain step is brew rather than apt,
   # nproc does not exist on macOS, and Apple Clang ships no OpenMP runtime, so the flags
@@ -95,7 +161,7 @@ jobs:
       - name: Assert the suite was not silently empty
         run: |
           make test 2>&1 | tee "$RUNNER_TEMP/t.log"
-          grep -q "22 passed, 0 failed, 0 skipped" "$RUNNER_TEMP/t.log"
+          grep -q "24 passed, 0 failed, 0 skipped" "$RUNNER_TEMP/t.log"
           grep -q "SCALE TEST PASSED"              "$RUNNER_TEMP/t.log"
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" "$RUNNER_TEMP/t.log"
           grep -q "ALL WEIGHTLESS TESTS PASSED"    "$RUNNER_TEMP/t.log"
@@ -125,7 +191,10 @@ jobs:
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc make
+          # libgomp is listed separately: MSYS2's GCC 16 packages split OpenMP out of
+          # mingw-w64-x86_64-gcc into an optional dependency, and without it the
+          # Makefile's -fopenmp -static link fails with "cannot find -lgomp".
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp make
 
       - name: Build (default flags, platform detection)
         run: make
@@ -136,7 +205,7 @@ jobs:
       - name: Assert the suite was not silently empty
         run: |
           make test 2>&1 | tee /tmp/t.log
-          grep -q "22 passed, 0 failed, 0 skipped" /tmp/t.log
+          grep -q "24 passed, 0 failed, 0 skipped" /tmp/t.log
           grep -q "SCALE TEST PASSED"              /tmp/t.log
           grep -q "VERDICT: ENGINE MATCHES THE REFERENCE EXACTLY" /tmp/t.log
           grep -q "ALL WEIGHTLESS TESTS PASSED"    /tmp/t.log
@@ -240,7 +309,7 @@ jobs:
                LDFLAGS="-lm -fsanitize=address,undefined" ARCH= \
                bin/test_ops bin/test_cfg bin/test_cache bin/test_st \
                bin/test_model_stream bin/k3_model \
-               bin/bench_kernels \
+               bin/bench_kernels bin/test_matmul_exact \
                -j"$(nproc)"
       - name: Run under sanitizers
         env:
@@ -260,6 +329,10 @@ jobs:
           # The ms and GFLOP/s it prints are meaningless under -O1 with ASan interceptors
           # on every load. It is run for what ASan sees, not for what it reports.
           ./bin/bench_kernels
+          # bench_kernels runs the matmuls at two fixed shapes, both multiples of 16.
+          # test_matmul_exact runs them at in = 1, 5, 15, 17, ... and odd row counts, the
+          # tails and unpaired last rows where an off-by-one read would actually live.
+          ./bin/test_matmul_exact
 
       # test_cache carries its own pipeline-mode cases (see tests/unit/test_cache.c), but
       # they only run when K3_EXPERT_PIPELINE is set, so the line above never puts the
@@ -278,18 +351,29 @@ jobs:
       # undefined -- the `ARCH=` above is already a no-op for that reason. That leaves
       # every _mm256_* path in k3_ops.c uninstrumented, and those are the ones that ship
       # and the ones doing the unaligned loads and hand-computed offsets worth checking.
-      # Rebuilding just bench_kernels with the documented baseline covers both vector
-      # kernels for the cost of one more compile.
+      # Rebuilding bench_kernels with the documented baseline covers both vector kernels
+      # at full width; test_matmul_exact adds the single-position kernels at odd widths
+      # and row counts, and test_ops the batched matmul tiles at every block size and
+      # remainder, strided and streamed, which bench_kernels' three positions do not reach.
+      # The second build forces the 8-position block that AVX-512VL builds pick onto
+      # plain AVX2, so its loop shapes are instrumented on any runner.
       - name: Re-run the vector paths under sanitizers
         env:
           ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           make clean
-          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer" \
+          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -ffp-contract=off -mavx2 -mfma -fsanitize=address,undefined -fno-omit-frame-pointer" \
                LDFLAGS="-lm -fsanitize=address,undefined" \
-               bin/bench_kernels -j"$(nproc)"
+               bin/bench_kernels bin/test_matmul_exact bin/test_ops -j"$(nproc)"
           ./bin/bench_kernels
+          ./bin/test_matmul_exact
+          ./bin/test_ops tests/fixtures/ops
+          make clean
+          make CFLAGS="-O1 -g -std=gnu99 -Wall -Wextra -ffp-contract=off -mavx2 -mfma -DK3_MM_TB=8 -fsanitize=address,undefined -fno-omit-frame-pointer" \
+               LDFLAGS="-lm -fsanitize=address,undefined" \
+               bin/test_ops -j"$(nproc)"
+          ./bin/test_ops tests/fixtures/ops
 
   # The tokenizer is portable C99 and must agree with the reference implementation
   # token-for-token. A tokenizer that is merely "close" corrupts every prompt silently.

@@ -13,11 +13,13 @@ import json
 import math
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import struct
 import sys
 import tempfile
+from typing import ClassVar
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,7 +63,7 @@ class OfflineCliTests(unittest.TestCase):
         self.path = Path(self.tmp.name)
         self.counter = 0
 
-    def run_cli(self, model, args, ok=True):
+    def run_cli(self, model, args, ok=True, env=None):
         self.counter += 1
         out = self.path / (str(self.counter) + ".json")
         logits = self.path / (str(self.counter) + ".f32")
@@ -69,7 +71,7 @@ class OfflineCliTests(unittest.TestCase):
                                  "--cache-gb", "0.0001", "--out", str(out),
                                  "--dump-logits", str(logits), *map(str, args)],
                                 text=True, errors="replace", capture_output=True,
-                                env=self.env, timeout=60)
+                                env={**self.env, **(env or {})}, timeout=60)
         if not ok:
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("AddressSanitizer", result.stderr)
@@ -146,9 +148,140 @@ class OfflineCliTests(unittest.TestCase):
                     self.assertLess(rows[0]["trunk_row_buffer_bytes"] +
                                     rows[0]["trunk_small_buffer_bytes"], 50000)
 
+    def test_trunk_rows_batched_positions_read_each_matrix_once(self):
+        # A forward over T positions applies every trunk matrix to all of them in one
+        # pass (k3_mmw_batch -> K3WeightStream.apply_batch), so under --trunk-rows it
+        # must read exactly what a one-position forward reads: the same matrix passes and
+        # the same bytes. Before batching, each position reread every matrix from disk,
+        # so an 8-token prompt cost about eight passes. --gen 1 makes each run a single
+        # forward; the prompt is the only thing that varies. The MoE deduplicates routed
+        # experts over sub-chunks of 64 positions; 65, 129 and 130 positions cross that
+        # width, with a one-position remainder at 65 and 129, and must still read each
+        # trunk matrix once.
+        for trunk in (self.trunk, self.ztrunk):
+            for mode in ([], ["--incremental"]):
+                with self.subTest(trunk=trunk.name, mode=mode):
+                    common = ["--gen", "1", "--trunk", trunk, "--trunk-gb", "0.00005",
+                              "--trunk-rows", *mode]
+                    one = self.run_cli(self.selective, ["--ids", "3", *common])[0]
+                    self.assertGreater(one["trunk_matrix_calls"], 0)
+                    self.assertGreater(one["trunk_bytes_read"], 0)
+                    for ids in ("3,7,11", "3,7,11,5,2,8,1,4", self.long_ids(65),
+                                self.long_ids(129), self.long_ids(130)):
+                        many = self.run_cli(self.selective, ["--ids", ids, *common])[0]
+                        self.assertEqual(many["trunk_matrix_calls"], one["trunk_matrix_calls"])
+                        self.assertEqual(many["trunk_bytes_read"], one["trunk_bytes_read"])
+                    # and a second forward is exactly a second pass
+                    two = self.run_cli(self.selective, ["--ids", "3,7,11",
+                                                        *common, "--gen", "2"])[0]
+                    self.assertEqual(two["trunk_matrix_calls"], 2 * one["trunk_matrix_calls"])
+                    self.assertEqual(two["trunk_bytes_read"], 2 * one["trunk_bytes_read"])
+
+    @staticmethod
+    def long_ids(n):
+        return ",".join(str((7 * i + 3) % 256) for i in range(n))
+
+    def test_moe_prefill_sub_chunks_match_per_token_path(self):
+        # With streamed experts a multi-token forward takes k3_moe_prefill, which runs
+        # the trunk matrices over every position at once and fetches routed experts per
+        # 64-position sub-chunk; K3_NO_BATCH_PREFILL sends the same binary down the
+        # per-token k3_moe instead. Every logit must match across the sub-chunk
+        # boundaries, including a one-position remainder (65, 129) and two (130).
+        # This cannot see the order of a position's routed sum: the tiny checkpoint
+        # routes to the top 2, and 0 + a + b equals 0 + b + a in float. test_ops's
+        # moe_prefill gate holds that order at top-16, where it changes the result.
+        for n in (65, 129, 130):
+            for mode in ([], ["--incremental"]):
+                with self.subTest(n=n, mode=mode):
+                    args = ["--ids", self.long_ids(n), *mode]
+                    batched = self.run_cli(self.selective, args)
+                    serial = self.run_cli(self.selective, args,
+                                          env={"K3_NO_BATCH_PREFILL": "1"})
+                    self.assert_same(batched, serial)
+
     def test_trunk_rows_invalid_mode_is_refused_before_loading(self):
         result = self.run_cli("absent", ["--ids", "1", "--trunk-rows"], ok=False)
         self.assertIn("--trunk-rows needs --trunk", result.stderr)
+
+    def test_malformed_trunk_json_is_refused_with_its_reason(self):
+        # Each trunk.json check names the field it rejected, in both reader modes; a
+        # refusal with an empty stderr would leave a user nothing to fix.
+        manifest = json.loads((self.trunk / "trunk.json").read_text())
+
+        def edited(change):
+            doc = json.loads(json.dumps(manifest))
+            change(doc)
+            return doc
+
+        def f32(doc):
+            return next(t for t in doc["layers"][0]["tensors"].values() if t["dtype"] == "F32")
+
+        def first(doc, layer):
+            return next(iter(doc["layers"][layer]["tensors"].values()))
+
+        cases = (
+            (edited(lambda d: d.update(layers=[])), "lists no layers"),
+            (edited(lambda d: d["layers"][2].update(file_off=-4096)),
+             "layer 2: file_off and nbytes must be non-negative integers"),
+            (edited(lambda d: d["layers"][3].update(nbytes=0)), "is empty or overflows"),
+            (edited(lambda d: first(d, 1).update(off=1.5)),
+             "off and nbytes must be non-negative integers"),
+            (edited(lambda d: first(d, 1).update(nbytes=d["layers"][1]["nbytes"] + 2)),
+             "do not fit the layer's"),
+            (edited(lambda d: f32(d).update(off=f32(d)["off"] + 2)),
+             "is not a multiple of its 4-byte element"))
+        trunk = self.path / "trunk"
+        trunk.mkdir()
+        (trunk / "trunk.bin").symlink_to(self.trunk / "trunk.bin")
+        for rows in ([], ["--trunk-rows"]):
+            for doc, message in cases:
+                with self.subTest(rows=rows, message=message):
+                    (trunk / "trunk.json").write_text(json.dumps(doc))
+                    result = self.run_cli(self.packed, ["--ids", "1,2,3", "--trunk", trunk,
+                                                        "--trunk-gb", "0.001", *rows],
+                                          ok=False)
+                    self.assertIn("k3_trunk: ", result.stderr)
+                    self.assertIn(message, result.stderr)
+
+    def test_trunk_with_more_layers_than_the_config_runs(self):
+        # A config that uses 12 of the packed trunk's 13 layers. Only bound layers are
+        # read, so this ran before the row pipeline existed and must still run in both
+        # modes; the CLI refuses only a trunk with FEWER layers than it needs.
+        config = json.loads((self.packed / "config.json").read_text())
+        config["num_hidden_layers"] = 12
+        config["full_attn_layers"] = [i for i in config["full_attn_layers"] if i <= 12]
+        path = self.path / "config12.json"
+        path.write_text(json.dumps(config))
+        for rows in ([], ["--trunk-rows"]):
+            with self.subTest(rows=rows):
+                out = self.path / ("more%d.json" % len(rows))
+                result = subprocess.run(
+                    [str(self.binary), str(self.packed), "--config", str(path), "--ids",
+                     "1,2,3", "--gen", "1", "--cache-gb", "0.0001", "--trunk",
+                     str(self.trunk), "--trunk-gb", "0.001", *rows, "--out", str(out)],
+                    text=True, errors="replace", capture_output=True, env=self.env,
+                    timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                report = json.loads(out.read_text(errors="replace"))
+                self.assertEqual(report["layers_completed"], 12)
+                self.assertEqual(len(report["generated_ids"]), 1)
+
+    def test_trunk_rows_report_says_what_it_measured(self):
+        # The row pipeline has no timed binds, so the ring's bind-wall breakdown would
+        # call all of its device time overlapped. Its final report instead names the
+        # mode, the main thread's waits for tiles and its own vector reads, and makes no
+        # overlap claim it did not measure.
+        out = self.path / "rows-report.json"
+        result = subprocess.run(
+            [str(self.binary), str(self.packed), "--ids", "1,2,3", "--gen", "2",
+             "--cache-gb", "0.0001", "--trunk", str(self.trunk), "--trunk-gb", "0.001",
+             "--trunk-rows", "--out", str(out)],
+            text=True, errors="replace", capture_output=True, env=self.env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = result.stdout[result.stdout.rindex("trunk [final]"):]
+        self.assertIn("row pipeline:", report)
+        self.assertIn("main thread waited", report)
+        self.assertNotIn("overlapped", report)
 
     def test_trunk_rows_under_cgroup_cap(self):
         if os.environ.get("K3_CGROUP_TEST") != "1":
@@ -220,6 +353,176 @@ class OfflineCliTests(unittest.TestCase):
         refused = self.run_cli(self.plain, ["--ids", "3,7", "--stream-lm-head",
                                            "--draft-trunk", "absent"], ok=False)
         self.assertIn("--stream-lm-head does not yet support --draft-trunk", refused.stderr)
+
+    def run_teacher_forced(self, model, args):
+        """A --score-prompt or --tf-check run: (its JSON, its stdout)."""
+        self.counter += 1
+        out = self.path / ("tf%d.json" % self.counter)
+        process = subprocess.run([str(self.binary), str(model), "--cache-gb", "0.0001",
+                                  "--out", str(out), *map(str, args)],
+                                 capture_output=True, text=True, errors="replace",
+                                 env=self.env, timeout=60)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        return json.loads(out.read_text()), process.stdout
+
+    def test_all_position_logits_in_blocks_match_one_position(self):
+        # --score-prompt and --tf-check need every position's logits, and project them
+        # through lm_head a block of up to 16 positions per pass (k3_mmw_batch, or one
+        # streamed pass over the head per block under --stream-lm-head). A run that scores
+        # ONE position takes the one-position projection, so each NLL of a 40-id run
+        # (positions 0..38, blocks 0-15, 16-31, 32-38) must equal that run's to the last
+        # bit of the printed double, and each --tf-check prediction must be the greedy
+        # next id of that prefix. Positions sit on both sides of each block boundary.
+        rnd = random.Random(11)
+        ids = [rnd.randrange(256) for _ in range(40)]
+        probe = (0, 1, 14, 15, 16, 17, 31, 32, 33, 38)
+        heads = ((self.plain, []),
+                 (self.packed, ["--trunk", self.ztrunk, "--trunk-gb", "0.001",
+                                "--stream-lm-head"]))
+        predictions = []
+        for model, head in heads:
+            with self.subTest(head=head):
+                full, _ = self.run_teacher_forced(model, ["--score-prompt", "--ids",
+                                                          ",".join(map(str, ids)), *head])
+                self.assertEqual(full["scored_tokens"], len(ids) - 1)
+                for i in probe:
+                    one, _ = self.run_teacher_forced(model, [
+                        "--score-prompt", "--ids", ",".join(map(str, ids[:i + 2])),
+                        "--score-start", str(i + 1), *head])
+                    self.assertEqual(one["token_nll"], [full["token_nll"][i]], "position %d" % i)
+                tf, text = self.run_teacher_forced(model, ["--tf-check", "--ids",
+                                                           ",".join(map(str, ids)), *head])
+                # Only mismatches are printed, as [i p=predicted a=actual].
+                predicted = ids[1:]
+                line = next(x for x in text.splitlines() if "per-position" in x)
+                for item in line.split("[")[1:]:
+                    i, p, _ = item.split()
+                    predicted[int(i)] = int(p[2:])
+                self.assertEqual(tf["tf_matches"],
+                                 sum(p == a for p, a in zip(predicted, ids[1:])))
+                predictions.append(predicted)
+        self.assertEqual(len(predictions), 2, "a head mode failed above")
+        self.assertEqual(predictions[0], predictions[1])
+        for i in probe:
+            report, _ = self.run_cli(self.plain, ["--ids", ",".join(map(str, ids[:i + 1])),
+                                                  "--gen", "1"])
+            self.assertEqual(report["generated_ids"], [predictions[0][i]], "position %d" % i)
+
+    def wide_head_model(self, vocab):
+        """The plain fixture with both vocabulary tables widened to `vocab` rows. The new
+        rows are random rather than repeated, so logits written at another chunk's offset
+        would differ from the ones that belong there."""
+        import numpy as np
+        config = json.loads((self.plain / "config.json").read_text())
+        hidden, old_vocab = config["hidden_size"], config["vocab_size"]
+        config["vocab_size"] = vocab
+        model = self.path / ("wide-%d" % vocab)
+        model.mkdir()
+        source = (self.plain / "model.safetensors").read_bytes()
+        header_size = struct.unpack("<Q", source[:8])[0]
+        header = json.loads(source[8:8 + header_size])
+        payload = memoryview(source)[8 + header_size:]
+        rng = np.random.default_rng(vocab)
+        new_header, blobs, offset = {}, [], 0
+        for name, entry in header.items():
+            if name == "__metadata__":
+                continue
+            first, last = entry["data_offsets"]
+            raw = bytes(payload[first:last])
+            entry = dict(entry)
+            if name in ("language_model.model.embed_tokens.weight",
+                        "language_model.lm_head.weight"):
+                self.assertEqual(entry["dtype"], "BF16")
+                rows = (rng.standard_normal((vocab - old_vocab, hidden)) * 0.05)
+                raw += (rows.astype(np.float32).view(np.uint32) >> 16).astype("<u2").tobytes()
+                entry["shape"] = [vocab, hidden]
+            entry["data_offsets"] = [offset, offset + len(raw)]
+            new_header[name] = entry
+            blobs.append(raw)
+            offset += len(raw)
+        encoded = json.dumps(new_header, separators=(",", ":")).encode()
+        encoded += b" " * (-len(encoded) % 8)
+        with open(model / "model.safetensors", "wb") as f:
+            f.write(struct.pack("<Q", len(encoded)))
+            f.write(encoded)
+            for blob in blobs:
+                f.write(blob)
+        (model / "config.json").write_text(json.dumps(config))
+        return model, hidden
+
+    def test_streamed_head_blocks_across_chunks(self):
+        # The other head tests use a 256-row head, which the stream reads in one chunk.
+        # Here the head spans three 4 MiB chunks, so every block of positions is written
+        # through k3_model_stream_project_batch's per-chunk offsets and row stride. Verify
+        # sweeps and a blocked --score-prompt must give the resident head's logits bit
+        # for bit, and a sweep must still read the head exactly once.
+        rows_per_chunk = (4 << 20) // (128 * 2)
+        vocab = 2 * rows_per_chunk + 77
+        model, hidden = self.wide_head_model(vocab)
+        self.assertEqual(hidden, 128)
+        rnd = random.Random(3)
+
+        def run(args):
+            self.counter += 1
+            out = self.path / ("wide%d.json" % self.counter)
+            dump = self.path / ("wide%d.f32" % self.counter)
+            process = subprocess.run([str(self.binary), str(model), "--cache-gb", "0.0001",
+                                      "--out", str(out), "--dump-all-logits", str(dump),
+                                      *map(str, args)], capture_output=True, text=True,
+                                     errors="replace", env=self.env, timeout=120)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            report = json.loads(out.read_text(errors="replace"))
+            self.assertEqual(report["expert_drops"], 0)
+            raw = dump.read_bytes()
+            self.assertEqual(len(raw), vocab * 4 * len(report["generated_ids"]))
+            return report, raw
+
+        # A prompt the n-gram drafter can work with, built as crafted() does: it opens
+        # with its own last two ids and the model's continuation of it, so after the
+        # first emitted id the drafter proposes the rest. Iterated to a fixed point.
+        common = ["--incremental", "--gen", "10", "--trunk", self.trunk, "--trunk-gb", "0.01"]
+        p = [rnd.randrange(256) for _ in range(10)]
+        r = [rnd.randrange(256) for _ in range(5)]
+        y = run(["--ids", ",".join(map(str, p)), *common])[0]["generated_ids"]
+        for _ in range(6):
+            prompt = p[-2:] + y[:6] + r + p
+            serial = run(["--ids", ",".join(map(str, prompt)), *common])
+            if serial[0]["generated_ids"][:2] == y[:2]:
+                break
+            y = serial[0]["generated_ids"]
+        common = ["--ids", ",".join(map(str, prompt)), *common]
+        streamed = [*common, "--stream-lm-head"]
+        for args in ([*common, "--spec", "4"], [*streamed, "--spec", "4"], streamed):
+            with self.subTest(args=args[-3:]):
+                got = run(args)
+                self.assertEqual(got[0]["generated_ids"], serial[0]["generated_ids"])
+                self.assertEqual(got[1], serial[1], "every logit must be bit-identical")
+                if "--stream-lm-head" in args:
+                    self.assertEqual(got[0]["lm_head_bytes_read"],
+                                     got[0]["forward_sweeps"] * vocab * hidden * 2)
+                if "--spec" in args:
+                    self.assertGreater(got[0]["spec_sweeps"], 0)
+
+        ids20 = [rnd.randrange(256) for _ in range(20)]
+
+        def score(first, n, head):
+            self.counter += 1
+            out = self.path / ("wscore%d.json" % self.counter)
+            process = subprocess.run([str(self.binary), str(model), "--score-prompt",
+                                      "--ids", ",".join(map(str, ids20[:n])),
+                                      "--score-start", str(first), "--cache-gb", "0.0001",
+                                      "--trunk", str(self.trunk), "--trunk-gb", "0.01",
+                                      "--out", str(out), *head],
+                                     capture_output=True, text=True, env=self.env, timeout=120)
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            return json.loads(out.read_text())["token_nll"]
+
+        for head in ([], ["--stream-lm-head"]):
+            with self.subTest(head=head):
+                full = score(1, len(ids20), head)
+                self.assertEqual(len(full), len(ids20) - 1)
+                for i in (0, 15, 16, 18):
+                    self.assertEqual(score(i + 1, i + 2, head), [full[i]], "position %d" % i)
 
     def test_lm_head_ring_under_cgroup_cap(self):
         if os.environ.get("K3_CGROUP_TEST") != "1":
@@ -522,6 +825,237 @@ class OfflineCliTests(unittest.TestCase):
                 self.assertIn("profile", result.stderr)
                 self.assertNotIn("config:", result.stdout)
                 self.assertNotIn("indexed", result.stdout)
+
+    # ---- speculative decode: tentative sweeps, never a replay sweep -------------------
+    # --spec verifies drafted ids in ONE batched sweep. A rejected draft used to cost a
+    # second forward that replayed the accepted prefix, re-reading the whole trunk. Now
+    # the sweep is tentative: each KDA layer records its recurrence inputs, and only the
+    # positions whose ids are emitted are committed to the carried state. Every test here
+    # demands that each generated id AND the logits behind each one are bit-identical to
+    # plain serial --incremental decode, and reads the counters that show which paths ran:
+    # partial and full acceptance, a stop id cutting a sweep, and one exact forward sweep
+    # per decode step, which is what "no replay" means.
+
+    SPEC = 4
+    _crafted: ClassVar[dict] = {}
+
+    def run_logits(self, model, args):
+        """run_cli plus --dump-all-logits: (report, first-step logits, every token's)."""
+        path = self.path / ("all%d.f32" % (self.counter + 1))
+        report, first = self.run_cli(model, [*args, "--dump-all-logits", path])
+        raw = path.read_bytes()
+        self.assertEqual(len(raw), 256 * 4 * len(report["generated_ids"]))
+        return report, first, raw
+
+    def assert_same_run(self, a, b):
+        self.assertEqual(a[0]["generated_ids"], b[0]["generated_ids"])
+        self.assertEqual(a[0]["full_ids"], b[0]["full_ids"])
+        self.assertEqual(a[1], b[1], "first-step logits must be bit-identical")
+        self.assertEqual(a[2], b[2], "the logits behind every token must be bit-identical")
+
+    def assert_no_replay(self, report):
+        # Every decode step, a verify sweep included, runs exactly one exact forward.
+        self.assertEqual(report["forward_sweeps"], report["decode_steps"])
+        self.assertEqual(len(report["spec_trace"]), report["spec_sweeps"])
+        self.assertEqual(report["spec_sweeps"],
+                         report["spec_full_accepts"] + report["spec_partial_accepts"])
+        self.assertEqual(report["spec_accepted"], sum(s[1] for s in report["spec_trace"]))
+        self.assertEqual(report["spec_dropped_positions"],
+                         sum(s[0] + 1 - s[2] for s in report["spec_trace"]))
+        # A decode step emits one id, a sweep emits its kept ids: nothing else runs.
+        emitted = report["decode_steps"] + sum(s[2] - 1 for s in report["spec_trace"])
+        self.assertEqual(emitted, len(report["generated_ids"]))
+
+    def crafted(self, accept, second=False):
+        """A prompt whose FIRST verify sweep drafts SPEC ids and the model accepts exactly
+        `accept` of them. The prompt opens with a 4-gram `a` and ends with it, and after the
+        opening copy come the model's own continuation up to the rejection point and then a
+        wrong id, so the n-gram drafter proposes exactly that. second=True also embeds the
+        continuation that follows the sweep's bonus id, behind the sweep's last four ids,
+        so a SECOND sweep drafts SPEC ids that are all accepted. Since the continuation
+        depends on the prompt, the prompt is iterated to a fixed point; this random tiny
+        model's greedy continuation barely moves with distant context, so a few serial runs
+        suffice. Cached per class: every memory mode must agree on the continuation anyway."""
+        key = (accept, second)
+        if key in self._crafted:
+            return self._crafted[key]
+        spec, rnd = self.SPEC, random.Random(7919 * accept + 104729 * second + 1)
+        need = accept + (spec + 2 if second else 1)
+        for _ in range(12):
+            a = [rnd.randrange(256) for _ in range(4)]
+            r = [rnd.randrange(256) for _ in range(6)]
+            y = [rnd.randrange(256) for _ in range(accept + spec + 3)]
+            for _ in range(6):
+                junk = (y[accept + 1] + 1) % 256
+                b = y[:spec + 1] if accept == spec else \
+                    (y[:accept + 1] + [junk] + y[accept + 2:])[:spec + 1]
+                prompt = a + b + r
+                if second:
+                    prompt += y[accept - 2:accept + spec + 2] + r[::-1]
+                prompt += a
+                report, _ = self.run_cli(self.plain, ["--ids", ",".join(map(str, prompt)),
+                                                      "--incremental",
+                                                      "--gen", str(accept + spec + 3)])
+                got = report["generated_ids"]
+                if got[:need] == y[:need] and (accept == spec or got[accept + 1] != junk):
+                    self._crafted[key] = (prompt, got)
+                    return prompt, got
+                y = got
+        self.fail("no stable crafted prompt for accept=%d second=%s" % (accept, second))
+
+    def test_spec_partial_and_full_acceptance_match_serial_decode(self):
+        seen = set()
+        for accept, second in ((0, False), (1, False), (3, False), (2, True)):
+            with self.subTest(accept=accept, second=second):
+                prompt, _ = self.crafted(accept, second)
+                args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", "12"]
+                serial = self.run_logits(self.plain, args)
+                spec = self.run_logits(self.plain, [*args, "--spec", str(self.SPEC)])
+                self.assert_same_run(serial, spec)
+                report = spec[0]
+                self.assert_no_replay(report)
+                self.assertEqual(report["spec_trace"][0], [self.SPEC, accept, accept + 1])
+                if second:
+                    self.assertEqual(report["spec_trace"][1], [self.SPEC, self.SPEC,
+                                                               self.SPEC + 1])
+                self.assertEqual(serial[0]["decode_steps"], 12)
+                self.assertEqual(serial[0]["spec_log_bytes"], 0)
+                # The plan counts exactly what --spec allocates, and nothing more: the
+                # rollback log, the block a verify sweep's SPEC + 1 logit vectors are
+                # projected into with one pass over lm_head, and, because run_logits passes
+                # --dump-all-logits, the K3_SPEC_MAX + 1 = 9 vectors a sweep's logits are
+                # kept in until the kept ones are written.
+                self.assertGreater(report["spec_log_bytes"], 0)
+                self.assertEqual(serial[0]["logit_block_bytes"], 0)
+                self.assertEqual(report["logit_block_bytes"], (self.SPEC + 1) * 256 * 4)
+                self.assertEqual(serial[0]["all_logits_bytes"], 0)
+                self.assertEqual(report["all_logits_bytes"], 9 * 256 * 4)
+                self.assertEqual(report["memory_plan_bytes"] - serial[0]["memory_plan_bytes"],
+                                 report["spec_log_bytes"] + report["logit_block_bytes"]
+                                 + report["all_logits_bytes"])
+                seen.update("full" if s[1] == s[0] else "partial%d" % s[1]
+                            for s in report["spec_trace"])
+        self.assertTrue({"partial0", "partial1", "partial2", "partial3", "full"} <= seen, seen)
+
+    def test_spec_rollback_matches_serial_in_every_memory_mode(self):
+        # The contract is the same logits at every budget and in every mode, so each mode's
+        # speculative run is held to the PLAIN serial run, not to its own mode's.
+        modes = ((self.plain, ["--kv-latent"]),
+                 (self.packed, ["--trunk", self.ztrunk, "--trunk-gb", "0.001"]),
+                 (self.selective, ["--trunk", self.ztrunk, "--trunk-gb", "0.00005",
+                                   "--trunk-rows", "--expert-pipeline"]),
+                 (self.selective, ["--trunk", self.trunk, "--trunk-gb", "0.00005",
+                                   "--trunk-rows", "--kv-latent"]),
+                 (self.packed, ["--trunk", self.ztrunk, "--trunk-gb", "0.001",
+                                "--stream-lm-head"]))
+        for accept, second in ((0, False), (2, True)):
+            prompt, _ = self.crafted(accept, second)
+            args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", "12"]
+            serial = self.run_logits(self.plain, args)
+            for model, mode in modes:
+                with self.subTest(accept=accept, mode=mode):
+                    spec = self.run_logits(model, [*args, *mode, "--spec", str(self.SPEC)])
+                    self.assert_same_run(serial, spec)
+                    self.assert_no_replay(spec[0])
+                    self.assertEqual(spec[0]["spec_trace"][0],
+                                     [self.SPEC, accept, accept + 1])
+
+    def test_streamed_head_is_read_once_per_verify_sweep(self):
+        # A sweep needs the logits of every position it verifies. Under --stream-lm-head
+        # they are projected together (k3_model_stream_project_batch), so a sweep streams
+        # the head from disk exactly once, like a one-position step, where it used to
+        # stream it once per verified position.
+        prompt, _ = self.crafted(2, True)
+        args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", "12",
+                "--trunk", self.ztrunk, "--trunk-gb", "0.001", "--stream-lm-head"]
+        serial = self.run_logits(self.packed, args)
+        spec = self.run_logits(self.packed, [*args, "--spec", str(self.SPEC)])
+        self.assert_same_run(serial, spec)
+        self.assert_no_replay(spec[0])
+        self.assertEqual(spec[0]["spec_trace"][:2], [[self.SPEC, 2, 3],
+                                                     [self.SPEC, self.SPEC, self.SPEC + 1]])
+        per_forward = serial[0]["lm_head_bytes_read"] // serial[0]["forward_sweeps"]
+        self.assertGreater(per_forward, 0)
+        self.assertEqual(serial[0]["lm_head_bytes_read"],
+                         per_forward * serial[0]["forward_sweeps"])
+        self.assertEqual(spec[0]["lm_head_bytes_read"], per_forward * spec[0]["forward_sweeps"])
+
+    def test_spec_saved_state_is_the_serial_state(self):
+        # --save-state after a sweep must write what serial decode writes at the same
+        # point, byte for byte, including when a --stop-id cuts a sweep short, fully or
+        # partially accepted: the state then has to end at the stop, not at the sweep's
+        # last accepted position. The saved sessions must also resume identically.
+        spec = self.SPEC
+        two, got2 = self.crafted(2, True)
+        three, got3 = self.crafted(3)
+
+        def first_new(got, i):
+            # a stop fires at the FIRST occurrence of its id, so it must be new at i
+            return next(j for j in range(len(got)) if got[j] == got[i]) == i
+
+        # Generated ids: [0] from the prefill, then each sweep's kept ids. For `two` the
+        # first sweep keeps 1..3 and the fully accepted second one 4..8; for `three` the
+        # one sweep keeps 1..4.
+        cases = [("end of a full sweep", two, 2 + spec + 3, None, None)]
+        for i in (2 + 3, 2 + 4, 2 + 5):
+            if first_new(got2, i):
+                cases.append(("stop inside a full sweep", two, 16, got2[i], [spec, spec, i - 3]))
+                break
+        for i in (2, 1, 3):
+            if first_new(got3, i):
+                cases.append(("stop inside a partial sweep", three, 16, got3[i], [spec, 3, i]))
+                break
+        self.assertEqual(len(cases), 3, "the crafted continuations repeat too much")
+        for name, prompt, gen, stop, cut in cases:
+            with self.subTest(case=name):
+                args = ["--ids", ",".join(map(str, prompt)), "--incremental", "--gen", str(gen)]
+                if stop is not None:
+                    args += ["--stop-id", str(stop)]
+                states = [self.path / (name.replace(" ", "_") + s) for s in (".serial", ".spec")]
+                serial = self.run_logits(self.plain, [*args, "--save-state", states[0]])
+                specr = self.run_logits(self.plain, [*args, "--spec", str(spec),
+                                                     "--save-state", states[1]])
+                self.assert_same_run(serial, specr)
+                self.assert_no_replay(specr[0])
+                self.assertEqual(states[0].read_bytes(), states[1].read_bytes(),
+                                 "the saved state must be the serial state, byte for byte")
+                if cut is None:
+                    self.assertEqual(len(specr[0]["generated_ids"]), gen)
+                    self.assertEqual(specr[0]["spec_trace"][-1], [spec, spec, spec + 1])
+                else:
+                    self.assertEqual(specr[0]["stopped_at"], stop)
+                    self.assertEqual(specr[0]["spec_trace"][-1], cut)
+                    self.assertEqual(specr[0]["spec_cut_by_stop"], 1)
+                resume = ["--incremental", "--ids", ",".join(map(str, prompt[:4])),
+                          "--gen", "10"]
+                a = self.run_logits(self.plain, [*resume, "--load-state", states[0]])
+                b = self.run_logits(self.plain, [*resume, "--load-state", states[1],
+                                                 "--spec", str(spec)])
+                self.assert_same_run(a, b)
+                self.assert_no_replay(b[0])
+
+    def test_draft_trunk_rollback_matches_serial_decode(self):
+        # The hybrid draft proposes through tentative calls of its own and commits what the
+        # exact model keeps, so it needs no replay either, and after a fully accepted round
+        # its next round's first call absorbs the last draft instead of a catch-up sweep.
+        # A draft on the same trunk differs from the exact model through its cache-only
+        # expert routing, which on this tiny cache gives both kinds of round.
+        args = ["--ids", "3,7,11,5,9", "--incremental", "--gen", "24"]
+        serial = self.run_logits(self.plain, args)
+        for mode in ([], ["--kv-latent"]):
+            with self.subTest(mode=mode):
+                hybrid = self.run_logits(self.plain, [*args, *mode, "--trunk", self.trunk,
+                                                      "--trunk-gb", "0.01",
+                                                      "--draft-trunk", self.trunk])
+                self.assert_same_run(serial, hybrid)
+                report = hybrid[0]
+                self.assert_no_replay(report)
+                self.assertGreater(report["spec_partial_accepts"], 0)
+                self.assertGreater(report["spec_full_accepts"], 0)
+                # the draft's prefill plus SPEC calls per round: no catch-up, no replay
+                self.assertEqual(report["draft_forward_sweeps"],
+                                 1 + self.SPEC * report["spec_sweeps"])
+                self.assertEqual(report["draft_accepted"], report["spec_accepted"])
 
 
 if __name__ == "__main__":

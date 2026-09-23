@@ -94,7 +94,7 @@ int main(void)
     for (unsigned i = 0; i < sizeof Ts / sizeof *Ts; i++) {
         const int T = Ts[i];
         size_t mla = k3_mla_scratch(&c, T), kda = k3_kda_scratch(&c, T);
-        size_t moe = k3_moe_scratch(&c),    lay = k3_layer_scratch(&c, T);
+        size_t moe = k3_moe_scratch(&c, T), lay = k3_layer_scratch(&c, T);
         human((double)lay * 4, b1, sizeof b1);
         printf("  T=%-5d mla %-12zu kda %-12zu moe %-10zu layer %-12zu (%s)\n",
                T, mla, kda, moe, lay, b1);

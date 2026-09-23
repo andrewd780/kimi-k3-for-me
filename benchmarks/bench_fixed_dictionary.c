@@ -1,5 +1,6 @@
 /* Independent Python encoding, byte-exact C reconstruction, then optional timing.
- * Units and 0.2-second repeat windows match bench_huf4; setup/I/O are untimed. */
+ * Units and 0.2-second repeat windows match bench_huf4; setup/I/O are untimed.
+ * The packed file may be FD4B or FD3B; the magic selects the decoder pair. */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,24 +35,26 @@ int main(int argc, char **argv)
     uint8_t *raw = read_file(argv[2], &raw_bytes);
     uint8_t *out = (uint8_t *)malloc(raw_bytes + 1);
     FwdView view;
-    if (!out || fwd_parse(&view, packed, packed_bytes) || view.raw_bytes != raw_bytes) goto fail;
-    if (fwd_decode_scalar(&view, out, raw_bytes) || memcmp(out, raw, raw_bytes)) goto fail;
-    if (fwd_decode_native(&view, out, raw_bytes) || memcmp(out, raw, raw_bytes)) goto fail;
-    printf("{\"native\":\"%s\",\"raw_bytes\":%zu,\"packed_bytes\":%zu,"
+    if (!out || fwd_parse_any(&view, packed, packed_bytes) || view.raw_bytes != raw_bytes) goto fail;
+    if (fwd_decode_any_scalar(&view, out, raw_bytes) || memcmp(out, raw, raw_bytes)) goto fail;
+    if (fwd_decode_any_native(&view, out, raw_bytes) || memcmp(out, raw, raw_bytes)) goto fail;
+    printf("{\"native\":\"%s\",\"index_bits\":%u,\"raw_bytes\":%zu,\"packed_bytes\":%zu,"
            "\"escape_values\":%zu,\"byte_exact\":true,\"arms\":[",
-           fwd_native_name(), raw_bytes, packed_bytes, view.escapes);
+           view.bits == 3 ? fwd3_native_name() : fwd_native_name(), view.bits, raw_bytes,
+           packed_bytes, view.escapes);
     if (!strcmp(argv[3], "time")) {
         if (!raw_bytes) goto fail;
         for (int arm = 0; arm < 2; arm++) {
             printf("%s{\"name\":\"%s\",\"decoded_BF16_GBps_runs\":[", arm ? "," : "",
-                   arm ? fwd_native_name() : "scalar_reference");
+                   arm ? (view.bits == 3 ? fwd3_native_name() : fwd_native_name())
+                       : "scalar_reference");
             for (int run = 0; run < 3; run++) {
                 const double start = now();
                 unsigned rounds = 0;
                 double elapsed;
                 do {
-                    const int rc = arm ? fwd_decode_native(&view, out, raw_bytes)
-                                       : fwd_decode_scalar(&view, out, raw_bytes);
+                    const int rc = arm ? fwd_decode_any_native(&view, out, raw_bytes)
+                                       : fwd_decode_any_scalar(&view, out, raw_bytes);
                     if (rc) goto fail;
                     rounds++;
                     elapsed = now() - start;

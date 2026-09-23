@@ -61,7 +61,7 @@ float *scratch = malloc(n * sizeof(float));
 | `k3_kda_scratch(cfg, T)` | a KDA layer |
 | `k3_mla_scratch(cfg, T)` | an MLA layer, no KV cache |
 | `k3_mla_scratch_cached(cfg, T, cap, mode)` | an MLA layer with a KV cache |
-| `k3_moe_scratch(cfg)` | the MoE block |
+| `k3_moe_scratch(cfg, T)` | the MoE block |
 
 ## Weight structures
 
@@ -138,7 +138,9 @@ if (k3_expert_drops) {
 ## Thread safety
 
 The kernels are reentrant and parallelise internally with OpenMP. They hold no global
-state except `k3_expert_drops`.
+state except `k3_expert_drops`. `k3_mla_cached` also reads one test hook,
+`k3_mla_trace`, which copies out intermediates its output rounds away; it is NULL unless
+a test sets it around a single-threaded call (see `k3.h`), and callers leave it NULL.
 
 The cache, the trunk reader, and the safetensors index are **not** thread-safe. One
 inference at a time per instance.

@@ -3,6 +3,7 @@
 #   make                build the engine (bin/k3)
 #   make test           run every test that needs no model weights
 #   make bench          kernel microbenchmarks
+#   make bench-mla      MLA KV-cache variants: timing at K3 geometry (quick form)
 #   make portable       build without -march/-mcpu=native (for distribution)
 #   make debug          -O0 -g with assertions
 #   make asan / ubsan   sanitizer builds
@@ -14,7 +15,7 @@
 # PLATFORMS. Linux/x86-64 is the reference. macOS/arm64 builds with plain `make` too,
 # but needs Homebrew's libomp for OpenMP (`brew install libomp`) because Apple Clang
 # ships no OpenMP runtime; the platform block below detects and wires it up. Windows
-# builds under MSYS2's MinGW64 environment (`pacman -S mingw-w64-x86_64-gcc`) -- open
+# builds under MSYS2's MinGW64 environment (`pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-libgomp`) -- open
 # the "MSYS2 MinGW x64" shell specifically, not the plain MSYS2 shell, so `cc`/`make`
 # resolve to the native-Windows-target toolchain rather than the POSIX-emulation one;
 # then plain `make` works, no flags to remember. See src/io/k3_portable_io.h for what
@@ -175,7 +176,8 @@ CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
 
 # Tests that need no checkpoint. These run in CI on every push.
-UNIT_TESTS := test_ops test_kda_exact test_quality test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk
+UNIT_TESTS := test_ops test_kda_exact test_quality test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk \
+              test_trunk_rows test_matmul_exact test_mla_variants
 # Tests that need real shards. Built and run by `make test-all` with SHARD_DIR set;
 # see the weights-test target below.
 WEIGHT_TESTS := test_expert test_real_layer
@@ -190,7 +192,7 @@ TOK_FILES  ?= $(HOME)/k3model
 # two concurrent `make test` runs cannot race on one filename and `make clean` removes it.
 
 # ---------------------------------------------------------------------------- targets --
-.PHONY: all test test-all bench portable debug asan ubsan format clean install help \
+.PHONY: all test test-all bench bench-mla portable debug asan ubsan format clean install help \
         tok cfg ops cache st oracle weights-test
 
 all: $(CLI_BIN)
@@ -210,6 +212,10 @@ $(BIN)/test_ops: tests/unit/test_ops.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_kda_exact: tests/unit/test_kda_exact.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+# Same CFLAGS as k3_ops.o on purpose: the test picks the MXFP4 order this ISA promises.
+$(BIN)/test_matmul_exact: tests/unit/test_matmul_exact.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/test_quality: tests/unit/test_quality.c $(ENGINE_HEADERS) | $(BIN)
@@ -249,11 +255,37 @@ $(BIN)/test_trunk: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
                    $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
+# The same test on a 93-layer fixture whose dense matrices span several row tiles: the
+# only build in which --trunk-rows double-buffers, so the only one that can catch a tile
+# read from the wrong offset or applied to the wrong rows.
+$(BIN)/test_trunk_rows: tests/unit/test_trunk.c $(BUILD)/src/io/k3_trunk.o \
+                        $(BUILD)/src/io/k3_st.o \
+                        $(BUILD)/src/model/k3_bind.o \
+                        $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) -DK3_TEST_ROWS_ONLY $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 $(BIN)/bench_kda: benchmarks/bench_kda.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 $(BIN)/bench_kernels: benchmarks/bench_kernels.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/bench_batch: benchmarks/bench_batch.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+$(BIN)/bench_router: benchmarks/bench_router.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+# The MLA cache variants live in a header under benchmarks/, not in the engine: the test
+# holds E+, L0 and L1 to k3_mla_cached bit for bit, and bench_mla times all of them and
+# measures the absorbed one. $< plus the object, because $^ would pass the header too.
+$(BIN)/test_mla_variants: tests/unit/test_mla_variants.c benchmarks/mla_variants.h \
+                          $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
+
+$(BIN)/bench_mla: benchmarks/bench_mla.c benchmarks/mla_variants.h \
+                  $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
 test: $(CLI_BIN) $(TEST_BINS)
@@ -276,8 +308,10 @@ test: $(CLI_BIN) $(TEST_BINS)
 	      esac; \
 	  done; echo "  3 malformed stop lists refused, each for the right reason"
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
+	@echo "== matmul exactness ==";  ./$(BIN)/test_matmul_exact
 	@echo "== quality arithmetic =="; ./$(BIN)/test_quality
 	@echo "== KDA bitwise recurrence =="; ./$(BIN)/test_kda_exact
+	@echo "== MLA cache variants ==";  ./$(BIN)/test_mla_variants
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32
@@ -297,6 +331,7 @@ test: $(CLI_BIN) $(TEST_BINS)
 	  fi
 	@echo "== real dimensions ==";   ./$(BIN)/scale_test
 	@echo "== trunk streaming ==";   ./$(BIN)/test_trunk
+	@echo "== trunk rows, 93 layers =="; ./$(BIN)/test_trunk_rows
 	@echo "== full-model oracle =="; ./$(BIN)/k3_model $(FIXTURES)
 	@echo
 	@if [ ! -f "$(TOK_FILES)/tiktoken.model" ]; then \
@@ -335,8 +370,20 @@ cfg: $(BIN)/test_cfg
 	    || echo "  (skipped real config: none at $(TOK_FILES))"
 
 ## bench: kernel microbenchmarks, no weights required
-bench: $(BIN)/bench_kernels
+# bench_batch times the batched trunk matmul against the per-position loop at T = 1..8;
+# it is a separate binary because the sanitizer CI job runs bench_kernels for coverage
+# and a sweep at real width is minutes under ASan. bench_router times one MoE router
+# call at the released shape and hashes its output.
+bench: $(BIN)/bench_kernels $(BIN)/bench_batch $(BIN)/bench_router
 	./$(BIN)/bench_kernels
+	./$(BIN)/bench_batch
+	./$(BIN)/bench_router
+
+## bench-mla: MLA cache variants, one layer at K3 geometry (quick; see docs/notes/mla-variants.md)
+# The quick form stops at 4,096 cached positions and projects any run longer than 20 s
+# from the measured kv_b cost. benchmarks/mla-study.sh runs the full study.
+bench-mla: $(BIN)/bench_mla
+	./$(BIN)/bench_mla --C 256,1024,4096 --T 1,5 --max-run-s 20
 
 ## portable: drop the -march/-mcpu=native tuning, for a distributable binary
 # On x86-64 that means a generic AVX2 + FMA baseline. On arm64 there is no equivalent
