@@ -225,7 +225,7 @@ int main(int argc, char **argv)
 
     /* ---- stage C: MoE with STREAMED experts ---- */
     float *moe_out = (float *)malloc((size_t)T * c.hidden * sizeof(float));
-    float *mscr = (float *)malloc(k3_moe_scratch(&c) * sizeof(float));
+    float *mscr = (float *)malloc(k3_moe_scratch(&c, T) * sizeof(float));
     if (!moe_out || !mscr) { fprintf(stderr, "moe scratch allocation failed\n"); return 1; }
 
     k3_cache_reset_stats(&cache);

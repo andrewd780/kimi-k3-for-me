@@ -172,6 +172,9 @@ target_link_libraries(bench_kda PRIVATE k3)
 add_executable(bench_kernels benchmarks/bench_kernels.c)
 target_link_libraries(bench_kernels PRIVATE k3)
 
+add_executable(bench_batch benchmarks/bench_batch.c)
+target_link_libraries(bench_batch PRIVATE k3)
+
 install(TARGETS k3_cli RUNTIME DESTINATION bin)
 install(DIRECTORY include/k3 DESTINATION include)
 # k3_cfg.h includes json.h and exposes jval in its signatures, so an installed header

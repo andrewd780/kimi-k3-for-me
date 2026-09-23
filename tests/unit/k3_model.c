@@ -628,8 +628,33 @@ int main(int argc, char **argv)
          * must be the same float. */
         printf("GATE 3b kv latent      : %s  <- %d steps of logits bit-identical to the"
                " expanded cache\n", latent_ok ? "PASS" : "FAIL", se > 0 ? se : 0);
+
+        /* GATE 3c: the SAME floats however the work was batched. Full recompute runs every
+         * layer over up to T positions at once, so every trunk matrix goes through the
+         * batched kernels (k3_mmw_batch, T > 1); incremental decode after its prefill
+         * feeds one position per step through the single-position kernels. GATE 3 has
+         * checked that the tokens, and therefore the contexts, agree, so at each position
+         * the two logit vectors must be identical to the bit. What this catches is the
+         * RESTRUCTURING: a batched layer that feeds a stage the wrong position's row, the
+         * wrong stride or a stale buffer changes logits outright. It is not the gate for
+         * the kernels' summation order -- a reassociated double sum survives the final
+         * float rounding too rarely to show on ordinary data -- which is why test_ops
+         * checks the batched kernels on rows built to make the order visible. */
+        int batch_ok = 0;
+        if (se > 0 && reuse_ok && iok == T - np) {
+            batch_ok = 1;
+            for (int s = 0; s < se; s++) {
+                const int pos = np - 1 + s;               /* step s scores position pos */
+                if (pos >= T || memcmp(lg_exp + (size_t)s * (size_t)c.vocab,
+                                       lg_reuse + (size_t)pos * (size_t)c.vocab,
+                                       (size_t)c.vocab * sizeof(float)) != 0)
+                    batch_ok = 0;
+            }
+        }
+        printf("GATE 3c batched = single: %s  <- %d positions, full-recompute logits bit-identical"
+               " to one-position steps\n", batch_ok ? "PASS" : "FAIL", se > 0 ? se : 0);
         gok = (iok == T - np) ? gok : -1;   /* fail the verdict if incremental diverged */
-        if (!latent_ok) gok = -1;
+        if (!latent_ok || !batch_ok) gok = -1;
 
         /* ---- GATE 4: SPECULATIVE decode, without replay ------------------------------
          * Verify sweeps run tentatively and commit only the positions behind the ids

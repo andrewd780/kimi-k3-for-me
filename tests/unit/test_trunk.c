@@ -577,6 +577,35 @@ static int test_rows(const char *dir, const K3Cfg *c)
         }
     }
     ck(same, "rows: two full walks, exact matrices", "including final -> first layer and ragged row tiles");
+
+    /* BATCHED positions read each row tile ONCE. Three positions through apply_batch must
+     * equal the resident matrix bit for bit and cost exactly what one position costs: one
+     * matrix call and one pass of bytes. Before apply_batch existed the batch fell back to
+     * one pass per position, which is the reread this checks is gone. */
+    {
+        K3LayerBind a, b;
+        int ok = !k3_trunk_bind(&tr, c, 0, &a) && !k3_trunk_bind(&resident, c, 0, &b);
+        enum { TB = 3, W = DENSE_INTER > HIDDEN ? DENSE_INTER : HIDDEN };
+        float xb[TB * W], got[TB * W], want[TB * W];
+        for (int i = 0; i < TB * W; i++) xb[i] = (float)((i * 7) % 11 - 5) / 4;
+        if (ok) {
+            const uint64_t calls0 = tr.matrix_calls, bytes0 = tr.bytes_read;
+            k3_mmw(got, xb, a.lay.dense_gate, a.lay.wdt, HIDDEN, DENSE_INTER);
+            const uint64_t one_calls = tr.matrix_calls - calls0, one_bytes = tr.bytes_read - bytes0;
+            const uint64_t calls1 = tr.matrix_calls, bytes1 = tr.bytes_read;
+            k3_mmw_batch(got, xb, a.lay.dense_gate, a.lay.wdt, HIDDEN, DENSE_INTER, TB);
+            k3_mmw_batch(want, xb, b.lay.dense_gate, b.lay.wdt, HIDDEN, DENSE_INTER, TB);
+            ok = !memcmp(got, want, sizeof(float) * TB * DENSE_INTER) &&
+                 tr.matrix_calls - calls1 == one_calls && one_calls == 1 &&
+                 tr.bytes_read - bytes1 == one_bytes && one_bytes > 0 && !tr.read_error;
+            /* and the other orientation, many rows short, into a strided output */
+            k3_mmw_batch_ld(got, W, xb, W, a.lay.dense_down, a.lay.wdt, DENSE_INTER, HIDDEN, TB);
+            k3_mmw_batch_ld(want, W, xb, W, b.lay.dense_down, b.lay.wdt, DENSE_INTER, HIDDEN, TB);
+            for (int t = 0; t < TB; t++)
+                if (memcmp(got + t * W, want + t * W, sizeof(float) * HIDDEN)) ok = 0;
+        }
+        ck(ok, "rows: batched positions, one pass", "3 positions == resident bitwise, bytes == 1 position");
+    }
     k3_trunk_close(&resident);
     K3LayerBind b;
     if (k3_trunk_bind(&tr, c, 0, &b)) { k3_trunk_close(&tr); return 1; }

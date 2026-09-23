@@ -195,6 +195,15 @@ static void k3_state_fp(const K3Cfg *c, int32_t *fp)
 }
 
 #define K3_SPEC_MAX 8
+
+/* Positions whose logits one lm_head pass serves when a run needs EVERY position's logits
+ * (--tf-check, --score-prompt, and a --spec verify sweep of spec_n + 1 <= K3_SPEC_MAX + 1
+ * positions). One pass of the batched kernel covers 16 positions at hidden 7168 (see
+ * k3_mm_pass in k3_ops.c), so for a resident head a larger block would buy no fewer
+ * passes. A streamed head (--stream-lm-head, --ultra-low-memory) is read from disk once
+ * per block, 16x less than once per position; a larger block would cut that further but
+ * costs a vocab row (0.66 MB) per position, and 16 keeps the buffer at 10.5 MB. */
+#define K3_LOGIT_ROWS 16
 /* Longest-suffix n-gram drafting for --spec: if the last n ids (n=3, then 2) already
  * appeared earlier in the sequence, propose the ids that followed them there. Costs
  * nothing when it misses: no draft means the step runs exactly as without --spec. The
@@ -382,7 +391,8 @@ static void usage(FILE *f)
 "  --trunk DIR           packed trunk directory; enables streaming (see scripts/)\n"
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
 "  --trunk-rows          exact double-buffered matrix rows; needs --trunk\n"
-"                        bounded buffers, no pins; batched prompts reread matrices\n"
+"                        bounded buffers, no pins; a batch of positions reads each\n"
+"                        matrix once (--kv-latent still rereads kv_b per position)\n"
 "  --cache-gb X          routed-expert cache budget\n"
 "  --ultra-low-memory    stream embedding rows and lm_head chunks, and reuse one\n"
 "                        recurrent-state slot during full recompute; needs --trunk\n"
@@ -421,9 +431,10 @@ static void usage(FILE *f)
 "  --draft-trunk-gb X    trunk budget for the draft model (default 6)\n"
 "  --spec N              speculative decode: draft up to N tokens by n-gram lookup and\n"
 "                        verify them in ONE batched sweep. Output is identical to\n"
-"                        serial decode by construction; needs --incremental. An extra\n"
-"                        verified position costs ~22%% of a serial token when the trunk\n"
-"                        streams, so repetitive text decodes up to several times faster.\n"
+"                        serial decode by construction; needs --incremental. A sweep\n"
+"                        reads the trunk and lm_head once for all its positions, so an\n"
+"                        extra verified position costs a fraction of a serial token and\n"
+"                        repetitive text can decode several times faster.\n"
 "                        A rejected draft costs no second sweep: the sweep is tentative\n"
 "                        and only the accepted positions are committed\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
@@ -589,6 +600,10 @@ typedef struct {
     const int   *score_targets; /* optional next-token targets for each input position */
     double      *score_nll;
     int          score_start;   /* first scored input position, zero-based */
+    /* [logit_rows][vocab]: when every position needs logits, lm_head is applied to this
+     * many positions per pass. NULL (or 1 row) projects one position at a time. */
+    float       *logit_block;
+    int          logit_rows;
     /* Tentative sweeps for speculative decode: log rows for each KDA layer (see K3KdaLog
      * in k3.h), allocated only with --spec or --draft-trunk. Only KDA layers carry state
      * that absorbs a rejected token, so the MLA layers get no log. log_row0 >= 0 makes
@@ -613,9 +628,11 @@ typedef struct {
  * yields a token drawn from uninitialised memory, printed as though it were output. */
 /* arg_all: when non-NULL, receives argmax(logits) for EVERY position 0..T-1, which is
  * what batched greedy verification consumes. logits_last still gets the final position's
- * full vector either way. The extra cost is one lm_head matmul per additional position,
- * pure RAM-resident compute; measured, an extra verified position costs ~22% of a serial
- * token at streamed-trunk budgets, which is the entire economics of --spec. */
+ * full vector either way. The extra cost is lm_head applied to the additional positions,
+ * which with a logit block is one pass over the head per block of positions rather than
+ * one per position. (The ~22% of a serial token per extra verified position once measured
+ * at streamed-trunk budgets predates batching the trunk matrices and the head over
+ * positions; it needs remeasuring.) */
 static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int T,
                    float *logits_last, float *scratch, float *h, float *br, float *kstate,
                    int *arg_all)
@@ -730,25 +747,44 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
 
     float *nrm = scratch;
     if (arg_all || w->score_targets) {
-        for (int t = 0; t < T; t++) {
-            if (w->score_targets && t < w->score_start) continue;
-            k3_rmsnorm(nrm, h + (size_t)t * E, w->mb.norm, E, c->rms_eps);
+        /* Every position's logits, lm_head applied to a block of positions per pass
+         * (k3_mmw_batch, or one streamed pass over the head per block) instead of once
+         * per position: verifying 9 speculative positions otherwise reads the 2.35 GB
+         * head 9 times. Each position's vector is bit-identical to the one-position
+         * projection, and positions before score_start are still never projected.
+         * nrm holds at most T rows, well inside the layer scratch. */
+        const int first = w->score_targets ? w->score_start : 0;
+        const int rows = (w->logit_block && w->logit_rows > 1) ? w->logit_rows : 1;
+        float *blk = rows > 1 ? w->logit_block : logits_last;
+        int last = -1;                        /* row of blk holding the final position */
+        for (int t0 = first; t0 < T; t0 += rows) {
+            const int n = T - t0 < rows ? T - t0 : rows;
+            for (int j = 0; j < n; j++)
+                k3_rmsnorm(nrm + (size_t)j * E, h + (size_t)(t0 + j) * E, w->mb.norm, E,
+                           c->rms_eps);
             if (w->stream_lm_head) {
-                if (k3_model_stream_project(&w->ms, logits_last, nrm) != 0) return -1;
+                if (k3_model_stream_project_batch(&w->ms, blk, nrm, n) != 0) return -1;
             } else {
-                k3_mmw(logits_last, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab);
+                k3_mmw_batch(blk, nrm, w->mb.lm_head, w->mb.wdt, E, c->vocab, n);
             }
-            if (arg_all) arg_all[t] = argmax_(logits_last, c->vocab);
-            if (arg_all && w->all_logits && t <= K3_SPEC_MAX)
-                memcpy(w->all_logits + (size_t)t * c->vocab, logits_last,
-                       (size_t)c->vocab * sizeof(float));
-            if (w->score_targets && k3_token_nll(logits_last, c->vocab,
-                                                 w->score_targets[t], w->score_nll + t)) {
-                fprintf(stderr, "invalid logits/target at score position %d\n", t + 1);
-                return -1;
+            for (int j = 0; j < n; j++) {
+                const int t = t0 + j;
+                const float *lt = blk + (size_t)j * c->vocab;
+                if (arg_all) arg_all[t] = argmax_(lt, c->vocab);
+                if (arg_all && w->all_logits && t <= K3_SPEC_MAX)
+                    memcpy(w->all_logits + (size_t)t * c->vocab, lt,
+                           (size_t)c->vocab * sizeof(float));
+                if (w->score_targets && k3_token_nll(lt, c->vocab,
+                                                     w->score_targets[t], w->score_nll + t)) {
+                    fprintf(stderr, "invalid logits/target at score position %d\n", t + 1);
+                    return -1;
+                }
             }
+            last = n - 1;
         }
         /* logits_last now holds the FINAL position's vector, same as the plain path. */
+        if (blk != logits_last && last >= 0)
+            memcpy(logits_last, blk + (size_t)last * c->vocab, (size_t)c->vocab * sizeof(float));
         return 0;
     }
     k3_rmsnorm(nrm, h + (size_t)(T - 1) * E, w->mb.norm, E, c->rms_eps);
@@ -1339,6 +1375,16 @@ int main(int argc, char **argv)
         printf("resident trunk: %s in RAM (large matrices kept in the checkpoint's bf16,\n"
                "  fp32 only for the norms and biases that kernels read elementwise)\n", b1);
 
+    /* Runs that need every position's logits project them a block at a time: see
+     * K3_LOGIT_ROWS and forward(). Sized here so the memory plan below counts it. */
+    int logit_rows = 1;
+    if (score_prompt)    logit_rows = np - score_start;   /* the positions scored       */
+    else if (tf_check)   logit_rows = np;                 /* every position             */
+    else if (spec_n > 0) logit_rows = spec_n + 1;         /* one verify sweep; a draft
+                                                           * trunk has set spec_n above */
+    if (logit_rows > K3_LOGIT_ROWS) logit_rows = K3_LOGIT_ROWS;
+    if (logit_rows < 1) logit_rows = 1;
+
     /* Add up EVERYTHING before allocating anything. Being OOM-killed halfway through
      * binding wastes the whole load and reports nothing useful; a refusal with the two
      * numbers side by side says exactly what box this needs. */
@@ -1362,7 +1408,8 @@ int main(int argc, char **argv)
             if (cached > scratch) scratch = cached;
         }
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
-                              + (double)scratch + (double)c.vocab) * 4;
+                              + (double)scratch + (double)c.vocab
+                              + (logit_rows > 1 ? (double)logit_rows * c.vocab : 0.0)) * 4;
         /* The KV cache MUST be in this total: it is the only term that grows with
          * context, so a guard that omits it is blind to the one thing it exists to
          * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
@@ -1553,6 +1600,11 @@ int main(int argc, char **argv)
     float *sc = (float *)malloc(sc_need * sizeof(float));
     float *lg = (float *)malloc((size_t)c.vocab * sizeof(float));
     if (!h || !br || !ks || !sc || !lg) { fprintf(stderr, "buffer allocation failed\n"); return 1; }
+    if (logit_rows > 1) {
+        w.logit_block = (float *)malloc((size_t)logit_rows * c.vocab * sizeof(float));
+        if (!w.logit_block) { fprintf(stderr, "logit block allocation failed\n"); return 1; }
+        w.logit_rows = logit_rows;
+    }
     human((double)(kper * state_layers) * 4, b1, sizeof b1);
     if (state_layers == 1 && NL > 1)
         printf("recurrent state: one %s slot, cleared and reused across %d layers\n\n",
@@ -2136,7 +2188,8 @@ int main(int argc, char **argv)
                 "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
                 "\"spec_full_accepts\":%ld,\"spec_partial_accepts\":%ld,"
                 "\"spec_cut_by_stop\":%ld,\"spec_dropped_positions\":%ld,"
-                "\"spec_log_bytes\":%.0f,\"draft_forward_sweeps\":%ld,"
+                "\"spec_log_bytes\":%.0f,\"logit_block_bytes\":%.0f,"
+                "\"draft_forward_sweeps\":%ld,"
                 "\"draft_accepted\":%ld,\"draft_dropped_positions\":%ld,"
                 "\"spec_trace\":[",
                 NL, NL, w.layers_completed, k3_expert_drops, peak_b, t_total,
@@ -2157,7 +2210,9 @@ int main(int argc, char **argv)
                 (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0), stopped_at,
                 steps, w.forwards, spec_n, spec_sweeps, spec_drafted, spec_accepted,
                 spec_full, spec_partial, spec_cut, spec_dropped,
-                spec_log_bytes, dw.forwards, hyb_accepted, draft_dropped);
+                spec_log_bytes,
+                (double)sizeof(float) * (w.logit_block ? (double)w.logit_rows * c.vocab : 0.0),
+                dw.forwards, hyb_accepted, draft_dropped);
         for (long i = 0; i < spec_sweeps && i < gen + 1; i++)
             fprintf(f, "%s[%d,%d,%d]", i ? "," : "", spec_trace[3 * i],
                     spec_trace[3 * i + 1], spec_trace[3 * i + 2]);
@@ -2224,7 +2279,7 @@ cleanup:
     k3_model_stream_free(&w.ms);
     k3_bind_model_free(&w.mb);
     k3_st_close(&st);
-    free(h); free(br); free(ks); free(sc); free(lg); free(generated_text);
+    free(h); free(br); free(ks); free(sc); free(lg); free(w.logit_block); free(generated_text);
     free(prompt); free(seq); free(outtok);
 
     /* A dropped expert means some token was computed with part of its routed sum

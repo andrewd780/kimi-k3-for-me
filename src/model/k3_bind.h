@@ -115,6 +115,11 @@ int  k3_model_stream_init(K3ModelStream *m, const K3St *s, const K3Cfg *c);
 void k3_model_stream_free(K3ModelStream *m);
 int  k3_model_stream_embed_row(K3ModelStream *m, float *dst, int64_t row);
 int  k3_model_stream_project(K3ModelStream *m, float *logits, const float *x);
+/* The same projection for n positions: x is [n][hidden], logits [n][vocab]. Each chunk
+ * of lm_head rows is read ONCE and applied to every position through k3_mmw_batch, so n
+ * positions cost one pass over the 2.35 GB head instead of n, and every logit is
+ * bit-identical to k3_model_stream_project on that position alone. */
+int  k3_model_stream_project_batch(K3ModelStream *m, float *logits, const float *x, int n);
 
 /* BYTES one layer needs, without loading it. For sizing and for reporting. */
 int64_t k3_bind_layer_bytes(const K3St *s, const K3Cfg *c, int layer);

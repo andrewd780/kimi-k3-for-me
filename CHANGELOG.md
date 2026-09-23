@@ -7,6 +7,40 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Exact batched trunk matmul** for T > 1 positions (prefill, speculative
+  verification, draft prefill): `k3_matmul_bf16_batch`, `k3_matmul_batch` and the
+  `k3_mmw_batch` dispatcher apply a matrix to every position in one pass, widening each
+  weight once per block of positions, with every output bit-identical to the
+  single-position kernel (same partition, fma order, reduction tree and tail; scalar,
+  AVX2 and NEON). KDA, MLA, the MoE trunk and the dense layer use it; under
+  `--trunk-rows` a batch reads each matrix once instead of once per position, at any
+  prompt length: the streamed MoE prefill deduplicates routed experts over 64-position
+  sub-chunks but applies its five trunk matrices to the whole batch.
+  T == 1 takes the existing kernel. `k3_moe_scratch` now takes T. Gated bitwise by
+  `test_ops` on cancelling inputs that expose a wrong summation order, by the oracle's
+  GATE 3c, by a rows-mode byte-count check in `test_offline_cli.py` at 1 to 130
+  positions, and by 65-, 129- and 130-token prompts matched against the per-token MoE
+  (`K3_NO_BATCH_PREFILL`). Positions share a widened weight in register blocks of 4 on
+  AVX2, 8 when AVX-512VL gives the compiler 32 vector registers, and 2 on NEON. On the
+  reference VM a block of 8 is about 10% faster than 4 with AVX-512VL and about 8%
+  slower on plain AVX2 (`bench_batch`, 8 to 16 positions); the block is a loop shape
+  only and cannot move an output.
+  **Public API:** `K3WeightStream` (include/k3/k3.h), the streamed-matrix descriptor
+  that `--trunk-rows` introduces, carries an optional `apply_batch` callback besides
+  `apply`. `k3_mmw_batch` calls it for a `K3_WSTREAM` matrix, so every layer op reaches
+  it on a multi-position forward; each output must be bit-identical to `apply` on that
+  position alone. NULL falls back to one `apply` per position, so a stream built on the
+  stack must zero the field.
+- **lm_head batched over positions** where a forward needs every position's logits:
+  a `--spec` verify sweep projects its positions in one pass over the head, and
+  `--tf-check` / `--score-prompt` in blocks of up to 16, through `k3_mmw_batch`, or
+  under `--stream-lm-head` through `k3_model_stream_project_batch`, which reads each
+  chunk of the head once per block instead of streaming the 2.35 GB head once per
+  position. Every logit is bit-identical to the one-position projection; the block
+  (10.5 MB at most on K3) is counted in the memory plan and reported as
+  `logit_block_bytes`. `test_offline_cli.py` checks NLLs and `--tf-check`
+  predictions on both sides of each block boundary against one-position runs, and
+  that a streamed-head verify sweep reads the head exactly once.
 - **Fixed-width trunk dictionary gates** (benchmark-only, not in inference): a
   4-bit high-byte index into one pooled 15-entry table with an escape code, the
   low byte raw, decoded by SSSE3 `pshufb` / NEON `tbl`. The eight-range histogram
@@ -19,8 +53,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Bounded trunk row streaming**, opt-in `--trunk-rows`: two small read/compute
   buffers, unchanged per-row arithmetic, and an explicitly sized current-layer
   vector arena. Synthetic gates cover compressed/plain logits, a 64 MiB cgroup,
-  93-layer wraparound, ThreadSanitizer and ASan/UBSan. Batched prompts can reread
-  weights; no full-model speedup is claimed. Fixes the trunk JSON ownership leak
+  93-layer wraparound, ThreadSanitizer and ASan/UBSan. A batch of positions reads
+  each matrix once (see the batched matmul entry below); `--kv-latent` still rereads
+  `kv_b` per rebuilt position. No full-model speedup is claimed. Fixes the trunk JSON ownership leak
   and parallel read error-flag race uncovered by those gates.
 - **Executable research gates** for the other four proposals: a compact
   four-stream/two-symbol Huffman decoder benchmark with pinned K3 range samples,

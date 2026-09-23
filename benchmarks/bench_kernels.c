@@ -215,6 +215,30 @@ int main(void)
         fnv("bf16 ", y, out);
         printf("             trunk is 56.74 G params/token -> %.2f s/token at this rate\n",
                2.0 * 56.74e9 / 1e9 / (gflop / dt));
+
+        /* The batched form over three positions, checked against three single-position
+         * calls bit for bit. Timing it properly is bench_batch's job; it is here so that
+         * the sanitizer CI job, which runs this binary with the vector paths compiled in,
+         * also exercises the batched tile's loads and strides. */
+        {
+            const int T = 3;
+            float *xb = (float *)malloc((size_t)T * in * sizeof(float));
+            float *y1 = (float *)malloc((size_t)T * out * sizeof(float));
+            float *yb = (float *)malloc((size_t)T * out * sizeof(float));
+            if (!xb || !y1 || !yb) { printf("alloc failed\n"); return 1; }
+            fillf(xb, (size_t)T * in, 31337u);
+            for (int t = 0; t < T; t++)
+                k3_matmul_bf16(y1 + (size_t)t * out, xb + (size_t)t * in, W, in, out);
+            const double tb0 = now_s();
+            k3_matmul_bf16_batch(yb, xb, W, in, out, T);
+            const double tb = now_s() - tb0;
+            const int same = !memcmp(y1, yb, (size_t)T * out * sizeof(float));
+            printf("bf16 batch   T=%d        %7.2f ms  %8.1f GFLOP/s  %s\n", T, tb * 1e3,
+                   2.0 * in * out * T / tb / 1e9,
+                   same ? "bit-identical to 3 single calls" : "DIFFERS from single calls");
+            free(xb); free(y1); free(yb);
+            if (!same) return 1;
+        }
         free(W); free(x); free(y);
     }
 

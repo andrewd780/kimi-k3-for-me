@@ -114,7 +114,9 @@ typedef struct {
  * the budget allows minus a small streaming ring. Returns 0 on success. */
 int  k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes);
 /* Exact row tiling: two buffers of at most 8 MiB each, plus current-layer vectors.
- * No pinning and no cross-layer prefetch. Batched tokens can reread matrices. */
+ * No pinning and no cross-layer prefetch. A batch of positions applied through
+ * k3_mmw_batch reads each matrix once (K3WeightStream.apply_batch); only callers that
+ * still loop k3_mmw per position reread it. */
 int  k3_trunk_open_rows(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes);
 void k3_trunk_close(K3Trunk *tr);
 

@@ -61,7 +61,7 @@ float *scratch = malloc(n * sizeof(float));
 | `k3_kda_scratch(cfg, T)` | a KDA layer |
 | `k3_mla_scratch(cfg, T)` | an MLA layer, no KV cache |
 | `k3_mla_scratch_cached(cfg, T, cap, mode)` | an MLA layer with a KV cache |
-| `k3_moe_scratch(cfg)` | the MoE block |
+| `k3_moe_scratch(cfg, T)` | the MoE block |
 
 ## Weight structures
 
