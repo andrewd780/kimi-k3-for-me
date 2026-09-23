@@ -572,9 +572,9 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  * POSITIONS PER REGISTER BLOCK (K3_MM_TB)
  *   Each position in a block holds four __m256d accumulators on AVX2, so the block size
  *   is set by the vector register file. With 16 ymm registers (plain AVX2) a block of 4
- *   fills them, and 8 spills: bench_batch at 12288 x 7168, one thread, -march=haswell on
- *   the reference VM, measured blocks of 8 about 8% SLOWER than 4 at T = 8 and 16 (and
- *   2% to 9% slower with -mavx2 -mfma at T = 8, 9 and 16, one thread and four). With
+ *   fills them, and 8 spills: bench_batch at 12288 x 7168 on the reference VM, built
+ *   with -mavx2 -mfma, measured blocks of 8 2% to 9% SLOWER than 4 at T = 8, 9 and 16,
+ *   on one thread and on four. With
  *   AVX-512VL the compiler may use ymm16-31 for the same 256-bit code, and there a block
  *   of 8 measured 7% to 13% faster than 4 at T = 8, 9 and 16 on one thread and at T = 8
  *   and 9 on four, tying at 16 on four (runs in docs/notes/research-results.md).
