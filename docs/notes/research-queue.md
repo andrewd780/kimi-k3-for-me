@@ -3,7 +3,8 @@
 Written in [#12](https://github.com/andrewd780/kimi-k3-for-me/pull/12) from the five
 proposals first queued in #11, and updated through #14 (2026-09-23); the work it lists
 is merged. It replaces #11's ranked queue: the per-machine ordering that queue drew
-from the memory ladder does not hold (see [the arithmetic](#what-the-arithmetic-establishes)).
+from the memory ladder was withdrawn because its premises no longer hold (see
+[the arithmetic](#what-the-arithmetic-establishes)); no measurement contradicted it.
 [Research results](research-results.md) records scope, measurements, usage and
 remaining work.
 
@@ -26,9 +27,15 @@ For independent disk and compute resources, every schedule satisfies
 $$t \ge \max(C, B_{\rm required}/D_{\rm disk}).$$
 
 The only split on record is the memory ladder's 8 GB row: 32.69 s per token with
-57.3% of it I/O ([memory-ladder.tsv](../data/memory-ladder.tsv)), so 18.73 s of disk
-and 13.96 s of everything else. Fully overlapped, that would bound the step at
-18.73 s, a 1.75x ceiling. Four things keep that from describing the engine today:
+57.3% of it I/O ([memory-ladder.tsv](../data/memory-ladder.tsv)), so 18.73 s attributed
+to I/O and 13.96 s to everything else. Fully overlapped, that would bound the step at
+18.73 s, a 1.75x ceiling. The 18.73 s cannot be a pure disk service time (2026-09-24
+review): moving the 134.64 GB of a steady step, or the 143.9 GB averaged over the
+run's 8 steps with its prefill, in 18.73 s would need 7.2 to 7.7 GB/s, above every
+rate recorded for that host (3.2 GB/s O_DIRECT `dd`, 5.4 to 6.1 GB/s sustained by the
+engine, [environment.txt](../data/environment.txt)), so the share mixes waiting with
+reading and the ceilings below are illustrative. Four more things keep that from
+describing the engine today:
 
 - Both figures are averages over a whole 8-step run whose first step is the prompt
   prefill (99.70 GB of expert reads against 25.83 GB per later step), and the ladder
@@ -36,9 +43,11 @@ and 13.96 s of everything else. Fully overlapped, that would bound the step at
   ([PERFORMANCE.md](../PERFORMANCE.md#longer-runs-are-faster)).
 - The campaign (captured 2026-07-31) predates the asynchronous trunk reader
   (2026-08-05), so no budget in it had read-ahead.
-- It also predates v1.0.0's fused kernels, which cut per-token compute about eightfold;
-  with the compute term divided by 8, the same model gives a ceiling of about 1.09x on
-  that 124-core host.
+- It also predates v1.0.0's fused kernels, which cut the trunk matmul's time about
+  eightfold (the v1.0.0 changelog states the cut for that kernel, not for the expert
+  matmuls, the KDA recurrence, attention or the router); dividing all 13.96 s by 8, as
+  if everything had shrunk that much, gives a ceiling of about 1.09x on that 124-core
+  host, a projection rather than a bound.
 - None of it measures the row pipeline, and none of it a small machine.
 
 Smaller buffers, startup, queue depth, shared cores, decompression, expert

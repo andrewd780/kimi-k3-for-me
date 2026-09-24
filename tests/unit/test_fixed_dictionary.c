@@ -476,7 +476,8 @@ int main(int argc, char **argv)
     row_ranges(3, 6, 7168, 33);
     row_ranges(4, 6, 7168, 1);
     printf("PASS %s, FD3B %s: tails, all byte values, no/all escapes, bounds, corruption, "
-           "escape counts; FD3B bit layout and branch-free escapes; FDRX mid-matrix row ranges\n",
+           "escape counts; FD3B bit layout and escape expansion (byte-exact; branchlessness "
+           "is not checked here); FDRX mid-matrix row ranges\n",
            fwd_native_name(), fwd3_native_name());
     return 0;
 }

@@ -21,6 +21,8 @@ def analyze(p, window, verify, draft, replay):
     cost = verify + draft + (1 - p**window) * replay
     if not cost:
         raise ValueError("total cost must be positive")
+    # maximum_extra_draft_cost is the break-even proposal cost: profitable only for a
+    # draft cost strictly below it, so a value of 0 means no positive draft cost pays.
     return {"expected_tokens": str(tokens), "expected_step_cost": str(cost),
             "speed_ratio": str(tokens / cost), "profitable_under_assumptions": tokens > cost,
             "maximum_extra_draft_cost": str(tokens - verify - (1 - p**window) * replay)}

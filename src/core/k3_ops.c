@@ -561,6 +561,8 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   the per-position f32 -> f64 conversion of x, and the wider form does not remove it.
  *   Widening X to double once per call instead turns the loop into an L2 stream of
  *   doubles, and that measured slower still, including with the tile packed for L1.
+ *   (Those two were orientation runs during development; no report of them is
+ *   committed, so they are recollection, not a recorded measurement.)
  *   So an AVX-512 build runs the 256-bit tiles below beside the single-position
  *   kernels' 512-bit rows. That is not a second arithmetic: the tiles and every
  *   k3_matmul / k3_matmul_bf16 path hold the same sixteen accumulators, each fed its
@@ -581,8 +583,10 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   So 8 when __AVX512VL__ is defined, else 4; NEON keeps 2, since each position needs
  *   eight of its 32 registers for accumulators. The block size is a loop shape only:
  *   each position keeps its own accumulators whatever the block, so no output can
- *   depend on it, and test_ops checks every block size and remainder bitwise. It may be
- *   forced with -DK3_MM_TB=1, 2, 4 or 8 to compare them. */
+ *   depend on it; test_ops checks the block size it was built with and its remainders
+ *   bitwise, and CI builds it with -DK3_MM_TB=8 on AVX2 as well as with each ISA's
+ *   default, so both x86 blocks are covered. It may be forced with -DK3_MM_TB=1, 2, 4
+ *   or 8 to compare them. */
 
 /* Force inlining so that each call below, made with a literal block size, gets its own
  * copy with the position loops unrolled and the accumulators held in registers. */

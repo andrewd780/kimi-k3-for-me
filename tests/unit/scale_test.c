@@ -101,7 +101,7 @@ int main(void)
         /* A scratch size of zero, or a layer buffer smaller than a sub-buffer it must
          * contain, is a heap overflow waiting for a caller that trusts it. Detecting one
          * is a FAILURE, not a remark, so it feeds the verdict at the end of main. */
-        if (mla == 0 || kda == 0 || lay < mla || lay < kda) {
+        if (mla == 0 || kda == 0 || lay < mla || lay < kda || lay < moe) {
             printf("    OVERFLOW OR UNDERSIZE at T=%d\n", T);
             scratch_bad = 1;
         }

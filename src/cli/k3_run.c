@@ -198,9 +198,10 @@ static void k3_state_fp(const K3Cfg *c, int32_t *fp)
 
 /* Positions whose logits one lm_head pass serves when a run needs EVERY position's logits
  * (--tf-check, --score-prompt, and a --spec verify sweep of spec_n + 1 <= K3_SPEC_MAX + 1
- * positions). One pass of the batched kernel covers 16 positions at hidden 7168 (see
- * k3_mm_pass in k3_ops.c), so for a resident head a larger block would buy no fewer
- * passes. A streamed head (--stream-lm-head, --ultra-low-memory) is read from disk once
+ * positions). One pass of the batched kernel covers 16 positions at hidden 7168 on x86
+ * (see k3_mm_pass in k3_ops.c; on NEON, K3_MM_TB = 2, a pass covers 18), so for a
+ * resident head a larger block would buy no fewer passes on x86. A streamed head
+ * (--stream-lm-head, --ultra-low-memory) is read from disk once
  * per block, 16x less than once per position; a larger block would cut that further but
  * costs a vocab row (0.66 MB) per position, and 16 keeps the buffer at 10.5 MB. */
 #define K3_LOGIT_ROWS 16

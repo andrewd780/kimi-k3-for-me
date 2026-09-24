@@ -570,6 +570,8 @@ static int test_rows(const char *dir, const K3Cfg *c)
     if (k3_trunk_open(&resident, dir, c, 2 * FIXTURE_RUN_BYTES + 32768)) {
         k3_trunk_close(&tr); return 1;
     }
+    /* The cap is derived from the same budget, so this holds by construction: it
+     * documents the accounting rather than testing the memory bound independently. */
     ck(tr.row_buffer_bytes + tr.small_buffer_bytes < 32768,
        "rows: bounded two-buffer arena", "metadata also charged at allocation");
     /* The comparisons below can only see a misplaced tile if rows differ: see fixture_byte. */
@@ -608,6 +610,9 @@ static int test_rows(const char *dir, const K3Cfg *c)
             k3_trunk_prefetch(&tr, (L + 1) % N_LAYERS); /* must not race row reads */
         }
     }
+    /* Layer 0's 257-row matrices span several tiles; layers 1..92 compare one-tile
+     * matrices and the norms. The 92 -> 0 boundary shares the row pipeline's path with
+     * every other layer boundary, since rows_run drains its reads before returning. */
     ck(same, "rows: two full walks, exact matrices", "including final -> first layer and ragged row tiles");
 
     /* BATCHED positions read each row tile ONCE. Three positions through apply_batch must

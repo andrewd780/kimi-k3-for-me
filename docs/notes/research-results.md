@@ -7,6 +7,71 @@ section 1 and the decode-under-contention measurements in section 2b were taken 
 4-vCPU cloud development VM, with conditions beside each. Andrew's machines were not
 used. There is no full-checkpoint host and no new full-model seconds/token result.
 
+## Corrections after the 2026-09-24 review
+
+An outside review of #12 to #14 (recorded in the `j-research` repository as
+findings/98) recomputed every load-bearing number from the committed JSONs and notes
+and found the arithmetic right but fifteen places where the prose claimed more than
+the evidence. Each is corrected in place; this list is the index.
+
+- **Fixed-width dictionary, "5.58 points above Huffman"**: the plan's r = 0.7329
+  stores `shared_down` raw while the bound Huffman-codes it; about 2.32 of the 5.58
+  points are that fallback, and coding every family gives 0.7128 (3.57 points). The
+  STOP rule is scored in 4-bit coverage while the chosen widths are 3-bit
+  ([note](fixed-width-trunk.md#per-family-result), CHANGELOG, STATUS).
+- **"14.7x / 11.0x the Huffman kernel"** compares different CI runs, runners and
+  buffer sizes; the same FD4B case read 16.2 GB/s in one run and 25.4 in another
+  ([note](fixed-width-trunk.md#gates-2-and-3-passed-in-ci-run-35498176696)).
+- **Compact Huffman "2.63x / 3.35x"**: two arms, so the three changes are confounded;
+  the ARM median spreads 0.94 to 1.35 GB/s; Huff0 at 1724 MB/s on the same kind of
+  bytes was omitted (section 2 below).
+- **Predictive prefetch "closed on its traffic arithmetic"**: the 5.76% holds under
+  toy assumptions (16 guesses so precision equals recall, no cancellation) and only in
+  the streamed-trunk regime; "uncancelled misses" should read "wrong guesses"
+  (section 3 below, [audit](predictive-prefetch-gates.md), CHANGELOG, STATUS).
+- **Decode under contention**: the worst-case envelope guards against run-to-run
+  variance, not model error, and depends on the repeat count; the amendment dated
+  "before any measurement" followed a 2026-09-22 orientation reading; the "every run"
+  at B = 4 includes a run whose report was not kept
+  ([note](fixed-width-trunk.md#decode-under-matmul-contention)).
+- **Lookahead worked example** charges a verify sweep as one plain step (V = 1),
+  against the repository's own verify-step model (S(3) = 1.43 at 8 GB, 2.10 at
+  128 GB) (section 4 below).
+- **`--spec` replay study**: the expert term u(n) assumes uniform independent routing,
+  which the expert trace contradicts; the "0.91x on code" corroboration exists only
+  in a source comment; the cost-share coefficients are asserted; δ is the first
+  draft's marginal cost, not every position's ([note](spec-replay.md)).
+- **io_uring**: no report or run id is committed; verification runs inside the timed
+  region; the process-CPU statement depends on `OMP_WAIT_POLICY=PASSIVE`; the
+  research-queue gate (benefit under concurrent compute) was never exercised (section
+  5 below).
+- **STATUS "read-ahead ring 1.70x measured"** is the memory ladder's 224 GB against
+  8 GB ratio, captured before the ring existed (STATUS).
+- **Research queue "18.73 s of disk" and the 1.09x ceiling**: the I/O share cannot be
+  a pure disk service time at the host's recorded rates, and the eightfold cut is
+  stated for the trunk matmul only ([queue](research-queue.md)).
+- **MLA variants**: L0's "twice per query token" applies all of kv_b on both passes
+  and uses half each time; a row split halves it at identical bits, and the 2x credited
+  to L1 at T = 1 is that waste ([note](mla-variants.md#the-decode-shapes-c-cached-positions-t--1-or-5-new-tokens)).
+- **Trunk rows tests**: the wraparound walk shares its code path with any layer
+  boundary; layers 1 to 92 of the fixture hold one-tile matrices; the sanitizer jobs
+  build without OpenMP, so the error-flag race was not seen by ThreadSanitizer; the
+  CLI check dumps the final position's logits only (section 1 below).
+- **`test_matmul_exact` "any other order changes the float"**: four named wrong
+  orders, each rejected in 39% to 92% of rows, not every order in every row
+  (CHANGELOG, TESTING.md).
+- **Kernel timing bit-identity**: the benchmark hashes are on benign inputs and
+  cannot see a reordering; the earlier "3x" figures have no raw data in the
+  repository; the register-block decision on AVX2 sits inside the stated noise band
+  (section 1 below, [decode-kernels](decode-kernels.md)).
+- **Committed measurement files kept as they are**, with their known defects noted
+  here rather than rewritten: `research-word-refill.json` holds the io_uring job as
+  `experiments[0]` under the decoder stage label; `fixed-dictionary-rate-fd3b-avx2-x86_64.json`
+  records SSSE3 compiler flags for an AVX2 binary; `mla-variants-x86_64.jsonl` keeps
+  the projected one-thread L0 prefill (470.7 s) that the note supersedes;
+  `kda-simd-ci.json` predates the 24-gate `test_ops` count that `bench_kda.py` now
+  expects.
+
 ## 1. Bounded trunk rows: implemented, opt-in
 
 `--trunk-rows` replaces whole-layer residency with two buffers of at most 8 MiB
@@ -54,17 +119,22 @@ counter is logical/requested traffic, not a physical-device measurement.
 Tests cover two full 93-layer walks, unaligned row starts, ragged row/tile tails,
 wraparound, insufficient budget and truncation. The fixture's bytes differ at every
 position, so a tile read from the wrong offset, applied to the wrong rows or shifted by
-a wrong O_DIRECT prefix changes the products the test compares; the 93-layer build,
-whose 257-row matrices span several tiles, runs in `make test` as `test_trunk_rows`.
-ThreadSanitizer and ASan/UBSan run it without OpenMP in the research workflow. CLI
-checks compare all dumped vocabulary logits and generated IDs across plain/compressed
-trunk, full-recompute/incremental/latent-cache modes, and expert pipelining. A Linux
-check uses a 64 MiB cgroup with swap disabled. These prove synthetic
-mechanism/exactness, not full-model speed.
+a wrong O_DIRECT prefix changes the products the test compares; the 93-layer build
+runs in `make test` as `test_trunk_rows`. Its layer-0 257-row matrices span several
+tiles; layers 1 to 92 hold one-tile matrices (`moe.up`, 128 bytes) and the norms, so
+multi-tile streaming is exercised in layer 0 and in the dedicated tile tests, and the
+layer 92 to 0 wraparound shares its code path with every other layer boundary, since
+the row pipeline drains each matrix's reads before returning and keeps no cross-layer
+read in flight. ThreadSanitizer and ASan/UBSan run it without OpenMP in the research
+workflow. CLI checks compare the dumped final-position vocabulary logits and every
+generated id across plain/compressed trunk, full-recompute/incremental/latent-cache
+modes, and expert pipelining. A Linux check uses a 64 MiB cgroup with swap disabled.
+These prove synthetic mechanism/exactness, not full-model speed.
 
-Sanitizers also exposed the old reader's leaked parsed JSON tree. Tensor names
-now keep an explicit owner freed on close/error. The old parallel read loop's
-shared error flag now uses an OpenMP reduction.
+ASan exposed the old reader's leaked parsed JSON tree. Tensor names now keep an
+explicit owner freed on close/error. The old parallel read loop's shared error flag
+now uses an OpenMP reduction; the sanitizer jobs build without OpenMP, so that race
+was not observed by ThreadSanitizer.
 
 ### Batched kernel timing
 
@@ -86,7 +156,10 @@ shape) after one untimed call. Cells give the median of the three run medians an
 parentheses, the fastest call of all runs; speedup is loop median over batched median.
 Before every run the runner waited for the 1-minute load to fall below 1.0; it read
 0.24 to 0.87, with no other job running. **In all fifteen runs every batched output
-was bit-identical to the per-position loop, at every T and both thread counts.**
+was bit-identical to the per-position loop, at every T and both thread counts** (on
+the benchmark's benign ±0.05 inputs, a same-data check that cannot expose a
+reordering; exactness rests on `test_ops` and `test_matmul_exact`, not on these
+hashes).
 Across the 72 cells of the three tables below, the largest of a cell's three run
 medians exceeded the smallest by 5.7% at the median and by 42% at worst, in one of the
 shortest cells (four threads, T = 1, batched: 5.2 to 7.4 ms); read differences under
@@ -99,7 +172,9 @@ per call at one thread against 20.9 ms here, so its speedups (1.76x, 2.66x and 3
 at T = 2, 4 and 8 on one thread; 3.14x at T = 8 on four; 2.78x and 3.09x for lm_head
 blocks of 9 and 16) measured batching against a kernel the engine no longer ships.
 The batched calls themselves take the same time as then (81.7 ms at T = 8 on one
-thread then, 82.6 now); what shrank is the alternative.
+thread then, 82.6 now); what shrank is the alternative. Those earlier figures have no
+raw data in the repository (the measurement JSON was first committed with the new
+runs), so the comparison is quoted, not reproducible.
 
 Trunk shape, 12288 x 7168 (a KDA q/k/v/g projection), `-march=native`: AVX-512VL,
 so positions share a widened weight in register blocks of 8 (`bench_batch 15 12288 16`).
@@ -187,8 +262,9 @@ Reading them:
 the other one forced (`-DK3_MM_TB`), trunk shape, batched median in ms; the loop does
 not depend on the block. With AVX-512VL a block of 8 takes 7% to 13% less time than 4
 at T = 8, 9 and 16 on one thread and at T = 8 and 9 on four, and ties at T = 16 on
-four; on the AVX2 baseline a block of 8 takes 2% to 9% more time than 4. That is what
-the default of 8 with AVX-512VL and 4 without rests on.
+four; on the AVX2 baseline a block of 8 takes 2% to 9% more time than 4, inside the
+noise band stated above. That is what the default of 8 with AVX-512VL rests on; the
+AVX2 default of 4 rests on the register count as much as on these timings.
 
 | Build | Threads | T | Block 8 | Block 4 | 8 against 4 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -229,8 +305,10 @@ until valid, never truncated.
 The benchmark checks every decoded byte after each timed run and reports three
 runs per arm as **reconstructed BF16 GB/s**, including low-plane assembly. Native
 sanitizers cover all byte values, odd tails, truncation, invalid padding, invalid
-code space and single/pair lookup paths. The transport is benchmark-only, not a
-supported archive format.
+code space and single/pair lookup paths; the all-byte-values and truncation cases use
+8-bit codes, where the pair path never packs two symbols, so the pair path is covered
+by a small 2-bit alphabet case and by the benchmark's byte comparison on real ranges.
+The transport is benchmark-only, not a supported archive format.
 
 Inputs are explicitly synthetic bytes and four 1 MiB BF16 ranges identified by
 immutable revision, offset and SHA in the committed sample manifest. All four are
@@ -265,6 +343,18 @@ exclude disk/encoding and do not compete with model compute. The improvement
 over the old kernel is real in these arms; a full-model inference improvement
 has not been measured. All repeats, sample hashes and the slower first attempt
 are preserved, rather than selecting the fastest run.
+
+Three limits of that comparison (2026-09-24 review). It has two arms, the old
+single-stream byte-refill kernel and the whole new kernel, so it does not separate
+the four streams, the word refill and the two-symbol table; on arm64 the
+word-refill-only run already stood at 3.44x its own baseline (medians 0.977 against
+0.284 GB/s), as high as the two-symbol run's 3.35x, and the baseline itself moved
+27% between the two runs. The arm64 two-symbol median rests on three runs spread
+from 0.94 to 1.35 GB/s (per-run ratios 2.60x to 3.53x). And the shelved
+single-stream note recorded FSE/Huff0 at 1724 MB/s on the same exponent-plane bytes
+([compressed-trunk.md](compressed-trunk.md)), about three times this prototype's
+high-byte symbol rate (1.1 GB/s of reconstructed BF16 is 0.55 GB/s of high bytes), so
+"faster than the old kernel" is not "fast".
 
 A kernel pass alone does not make deployment profitable. For raw bytes `W`,
 retained fraction `r`, disk rate `B` and reconstructed decode rate `D`, serial
@@ -379,7 +469,12 @@ cancellation of wrong reads and every correct guess kept until use, reads
 `16 + 16 * 0.3 = 20.8` experts' bytes for every 16 used, and experts are 25.83 GB of
 the 134.64 GB one-position baseline (19.2%), so whole-token traffic grows by
 `0.192 * 0.3 = 5.76%`. Cache hits or cancellation would lower that; eviction of
-still-needed experts could raise it. The audit remains the stopping record. No further
+still-needed experts could raise it. Two more assumptions carry the figure: exactly
+16 guesses per layer, so precision equals recall (a thresholded predictor fetching
+fewer, surer guesses would not follow the `2 - r` form), and the streamed-trunk
+regime, where experts are 19.2% of the bytes; with the trunk resident, experts are
+nearly all of the disk traffic and the same guesses add about 30% of it, a regime
+this audit did not analyse. The audit remains the stopping record. No further
 capture or predictor work is planned; the next item is the
 [fixed-width trunk dictionary falsifier](fixed-width-trunk.md).
 
@@ -409,7 +504,9 @@ routing, not evidence for a training-free K3 predictor or a CPU speedup.
 `tools/lookahead_gate.py` implements bounded Jacobi proposals and an
 accept-exact-prefix reference. Tests enumerate every binary second-order model,
 starting prefix, three-token guess and 0–3 Jacobi rounds. All emitted tokens
-equal greedy output. This proves the reference, not K3 state rollback or speed.
+equal greedy output, which holds for any draft under exact-prefix verification, so
+the enumeration checks the reference's plumbing, not a property of Jacobi proposals.
+This proves the reference, not K3 state rollback or speed.
 
 For window `w`, independent draft agreement `p`, verification cost `V`, proposal
 cost `D` and rejection replay cost `R`, normalized to ordinary-step cost (the model
@@ -421,6 +518,10 @@ $$E[N]=\sum_{j=0}^w p^j,\qquad E[T]=V+D+(1-p^w)R.$$
 It pays only if `E[N] > E[T]`. Assuming `p=.9,w=2,V=D=R=1` gives
 `2.71/2.19 = 1.2374`, and with `R = 0` it gives `2.71/2 = 1.355`; at `p=.5` it loses
 either way (`1.75` against `2.75` or `2`). Those are assumptions, not K3 acceptance.
+In particular `V = 1` charges a (w+1)-position verify sweep the same as one plain
+step; the repository's own verify-step model ([spec-replay.md](spec-replay.md)) puts
+S(3) at 1.43 at 8 GB and 2.10 at 128 GB, under which the `p=.9, w=2, D=1, R=0` case
+is `2.71/2.43 = 1.12` and `2.71/3.10 = 0.87`.
 Correlated acceptance needs empirical prefix-length frequencies. Guaranteed
 convergence via `w` full Jacobi passes plus verification costs at least `w+1`
 sweeps to emit at most `w+1` tokens: no pass-count improvement.
@@ -446,7 +547,18 @@ time are reported. Unsupported/denied APIs are reported without changing policy.
 
 The recorded runs have broad timing dispersion. Arms overlap, with no consistent
 33%-plus improvement across queue depths. This does not justify an engine backend
-change. Process CPU service is much shorter than wall time: sleeping read threads
+change. No report from those runs is committed and no run id is cited: the CI job
+uploads an unpinned artifact with the default retention, so the dispersion cannot be
+audited from the repository (2026-09-24 review). Three limits of the benchmark bear
+on the reading: the io_uring arm is wave-synchronous (it submits `qd` reads, waits
+for all of them, then repeats, never keeping the ring full, with submit and wait as
+separate `io_uring_enter` calls); the per-byte verification of each 64 MiB pass runs
+inside the timed region, a substantial share of it, which shrinks any relative
+difference between the arms; and the pread arm creates its OpenMP threads inside the
+timed loop at each larger queue depth. The research-queue gate for this proposal, a
+repeatable benefit under concurrent real compute, was not exercised: the benchmark
+has no compute arm. Process CPU service is much shorter than wall time, under the
+`OMP_WAIT_POLICY=PASSIVE` the CI job sets: sleeping read threads
 do not each occupy a full core. Process CPU excludes some kernel-worker cost,
 so it is not a complete system-energy measurement. Read completion alone does
 not establish overlap with K3 compute. The

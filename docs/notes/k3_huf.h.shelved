@@ -21,8 +21,8 @@
  *
  * The decoder is a single 12-bit table lookup per symbol: canonical codes are limited to
  * K3_HUF_MAXLEN bits at pack time (the encoder flattens deeper trees), so one load gives
- * both the symbol and its length. Longest-first canonical assignment matches the
- * encoder's; change one and you must change the other.
+ * both the symbol and its length. Shortest-first canonical assignment (see k3_huf_build)
+ * matches the encoder's; change one and you must change the other.
  */
 #ifndef K3_HUF_H
 #define K3_HUF_H

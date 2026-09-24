@@ -46,7 +46,8 @@ transcripts were used.
   minimum of 6 and N = 4 at 128 GB.
 - **P3 adaptive**: P2's draft, cut at the first j where the estimated probability that
   drafts 1..j are *all* accepted falls to δ. δ is 0.22 at 8 GB and 0.55 at 128 GB, the
-  marginal cost of one more verified position. The estimate is a 234-cell table over
+  marginal cost of the first extra verified position, S(2) − S(1); the marginal cost
+  falls with depth, to about 0.195 and 0.50 at the eighth. The estimate is a 234-cell table over
   (match length + j − 1, how often the matched context occurred and was followed by the
   proposed id, depth), and it reads only the history.
 - **P3 cost-aware**: the same estimate with the stop rule taken from the cost model
@@ -65,7 +66,14 @@ second forward after every partial acceptance. The engine no longer does that, s
 "replay-free" column is the one that describes it; the "today" column is kept to show
 what the rollback changed. The coefficients are estimates
 of a plain decode token's cost shares (trunk bytes, expert bytes, compute) at each memory
-tier, not measurements.
+tier, not measurements; nothing in the repository derives them, and no sensitivity
+beyond eps is reported, so every speedup here scales with them. u(n) assumes routing
+that is uniform and independent across the positions of one sweep, and the
+repository's own expert trace does not bear that out: over 5, 8 and 12 consecutive
+positions of one context it saw 5,682, 7,922 and 10,010 distinct experts
+([EXPERT_PROFILES.md](../EXPERT_PROFILES.md)), against about 7,100, 11,100 and 16,000
+under u(n) (92 layers x 16 x u(n)), so the model over-charges expert fan-out, most at
+the 128 GB tier where a_E is 0.45 (2026-09-24 review).
 
 ## 8 GB (trunk streamed)
 
@@ -129,8 +137,8 @@ tier, not measurements.
 3. **The cost-aware rule beats P0 in all 16 corpus × tier × mode cells.** Paired
    differences run from +0.05 to +0.28, and every interval excludes zero. Under today's
    costs it gives 1.07 to 1.11x on non-edit text at 8 GB and 1.02 to 1.04x at 128 GB.
-   Replay-free it stays within 0.03 of P3, so it needs no retuning when the rollback
-   lands. At 8 GB, P3 with δ raised to 0.55 behaves almost the same; the cost-aware
+   Replay-free it stays within 0.03 of P3, so it needed no retuning when the rollback
+   landed (commit 1804f7e). At 8 GB, P3 with δ raised to 0.55 behaves almost the same; the cost-aware
    rule derives that threshold from the cost model instead of tuning it.
 4. **At 128 GB, the current rule at `--spec 8` slows non-edit text down.** It runs
    0.87 to 0.92x replay-free and 0.76 to 0.85x today, because it drafts about 6 ids at
@@ -139,10 +147,15 @@ tier, not measurements.
    replay.** At 8 GB it runs 0.93 to 0.95x replay-free and 0.71 to 0.80x today.
    Shorter eager drafts do better replay-free at 8 GB (1.09 to 1.19x at `--spec 1` or
    `2`) but still lose today (0.92 to 0.97x). At `--spec 4`, today, on code writing, it
-   is 0.84x. The engine measured an eager drafter at 0.91x on code; the proxy points
-   the same way at a similar size.
-6. **P3's table is calibrated.** On every corpus, predicted and realized first-draft
-   acceptance agree to within 2.2 points. The *cumulative* reading of "P(accept next)
+   is 0.84x. A comment in `src/cli/k3_run.c` records an eager drafter at 0.91x on
+   code on the released checkpoint; no log or measurement file for that run is in the
+   repository, so it is a recollection rather than a corroboration, and the proxy
+   points the same way at a similar size.
+6. **P3's table is calibrated for the first draft.** On every corpus, predicted and
+   realized first-draft acceptance agree to within 2.2 points; the same check
+   over-predicts accepted ids per firing by up to 9% (code writing at 8 GB: 1.61
+   predicted against 1.48 realized), so the calibration does not extend to the full
+   draft length. The *cumulative* reading of "P(accept next)
    > δ" matters: stopping on the per-draft conditional probability instead costs 0.28 to
    0.31 outside edits at 8 GB, and 0.08 to 0.17 at 128 GB. P2's copy past the end of the
    history makes no measurable difference.

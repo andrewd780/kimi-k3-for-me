@@ -6,8 +6,11 @@ one MLA layer's cached attention, plus one bit-exact restructuring added as a fa
 baseline, are implemented side by side in `benchmarks/mla_variants.h`. They are held to
 the engine bit for bit by `tests/unit/test_mla_variants.c`, which is part of `make test`,
 and measured by `benchmarks/bench_mla.c`. `benchmarks/mla-study.sh` reproduces every
-number below, and the raw JSON lines are in
-[`docs/measurements/mla-variants-x86_64.jsonl`](../measurements/mla-variants-x86_64.jsonl).
+number below except two, and the raw JSON lines are in
+[`docs/measurements/mla-variants-x86_64.jsonl`](../measurements/mla-variants-x86_64.jsonl):
+the shared-work timing (17.8 ms per layer) is printed by `time_common` but not written
+to JSON, and the mutation table's mutants are not committed, so it can be re-derived
+only by hand.
 
 The study has two halves. The **exact half**, the bitwise gates, the kv_b application
 counts and the numerics of the absorbed variant, does not depend on machine load. The
@@ -27,7 +30,7 @@ appends T new tokens after C cached ones and attends over N = C + T positions, c
 |---|---:|---|---|---|
 | **E** | 98,560 B | T | reference | the engine's default loop, copied statement for statement |
 | **E+** | 98,560 B | T | bitwise = E | the same arithmetic threaded over heads, each cached row read once per call instead of once per query token |
-| **L0** | 2,304 B | 2T(C+1) + T(T-1) | bitwise = E | the engine's `--kv-latent` loop: every visible position rebuilt through kv_b twice per query token |
+| **L0** | 2,304 B | 2T(C+1) + T(T-1) | bitwise = E | the engine's `--kv-latent` loop: every visible position rebuilt through kv_b twice per query token, each rebuild computing all of kv_b's rows and using half of them (see the correction under the decode counts) |
 | **L1** | 2,304 B, plus up to 49,152 B per position transiently, for one layer at a time | 2N - vcap | bitwise = E | each position rebuilt once per call; value rows kept for the first vcap positions, the rest rebuilt a second time |
 | **A** | 2,304 B | none (T kv_b's worth of multiply-adds in per-head slices) | **no** | absorbed: W_uk folded into the query, W_uv applied after the latent-weighted sum |
 
@@ -76,8 +79,9 @@ also runs two constructed kinds of layer through the same gates:
   score chain then meets huge terms that cancel exactly, and its ordinary terms lose bits
   that depend on the partial sums they meet.
 - **Sharp layers** scale the query norm by 16 (exact), for score ranges of tens of nats.
-  Until softmax terms fall below about 2^-29 the double normaliser is a sum of floats that
-  is exact in any order; on sharp rows it is not.
+  While every softmax term is at least about 2^-29 of the normaliser itself (a float has
+  24 significant bits and a double 53), the double normaliser is a sum of floats that is
+  exact in any order; on sharp rows the smallest terms fall below that, and it is not.
 
 | order witness (this commit) | score chains | changed if reversed | nope and rope summed apart | two lanes | normalisers of 3+ terms changed if reversed | quotients changed as e*(1/z) |
 |---|---:|---:|---:|---:|---:|---:|
@@ -92,7 +96,10 @@ never does.
 The witness only says whether a reordering *could* be seen. A mutation run shows that
 the test does see one: each mutant below was compiled into a scratch copy of the header,
 or for the engine rows of `src/core/k3_ops.c`, and run through the unchanged test on
-four threads (57 cases: 29 ordinary, 16 cancelling, 12 sharp).
+four threads (57 cases: 29 ordinary, 16 cancelling, 12 sharp). The mutants are not
+committed, so the table is a record, not a reproducible artifact; the first row's
+13 of 16 holds for the mutation applied to the four-chain E+ path alone, and applied
+to both E+ chains it fails all 16 cancelling cases.
 
 | mutant | ordinary cases failed | cancelling | sharp |
 |---|---:|---:|---:|
@@ -139,7 +146,7 @@ work of the whole model is about 103 GMAC per token, for scale.
 
 | T | L0 kv_b applications | L1 applications (all value rows held) | L0 / L1 | L0 GMAC per token x24 | L1 GMAC per token x24 | A GMAC per token x24 | L0 kv_b read | L1 kv_b read |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 2 | 1 | 2.0x | 0.61 | 0.30 | 0.30 | 0.05 GB | 0.03 GB |
+| 1 | 2 | 1 | 2.0x | 0.60 | 0.30 | 0.30 | 0.05 GB | 0.03 GB |
 | 16 | 272 | 16 | 17.0x | 5.14 | 0.31 | 0.32 | 6.8 GB | 0.40 GB |
 | 64 | 4,160 | 64 | 65.0x | 19.7 | 0.33 | 0.38 | 105 GB | 1.6 GB |
 | 256 | 65,792 | 256 | 257.0x | 77.7 | 0.40 | 0.62 | 1,656 GB | 6.4 GB |
@@ -169,9 +176,20 @@ L1's value-row budget here is the benchmark default, 2,560 MB for one layer, whi
 | 65,536 | 1 | 131,074 | 78,991 | 1.7x | 39,631 | 23,903 | 165 | 48.6 |
 | 65,536 | 5 | 655,390 | 78,999 | 8.3x | 39,633 | 4,820 | 165 | 48.6 |
 
+**Correction (2026-09-24 review).** L0's two applications per position are each a
+full 24,576-row kv_b, of which the score pass reads only the 128 key rows per head and
+the value pass only the 128 value rows (`src/core/k3_ops.c`, the latent branch of
+`k3_mla_cached`). Applying only W_uk's rows in the first pass and only W_uv's in the
+second is bitwise identical, since the matvec is row-independent, and halves L0's kv_b
+multiply-adds and, under `--trunk-rows`, its streamed kv_b bytes. Counted in whole
+applications, L0 then makes N per query token at T = 1, the same as L1, so the
+"L0 / L1 = 2.0x" column above is L0's own waste, not an advantage of L1's loop order.
+L1's advantage at T > 1, rebuilding each position once per call rather than once per
+query token, stands. The engine has not been changed.
+
 Three things follow, none of them a timing. At T = 1 a latent cache costs at least one
 kv_b application per cached position per layer, whichever loop runs it; L1 halves L0's
-count and no exact reorganisation can go below N. Verifying T drafted tokens at once
+count as written, and no exact reorganisation can go below N. Verifying T drafted tokens at once
 (T = 5 here) is where L0's cost multiplies and L1's does not. And A's arithmetic is at
 most 3.4 times E's (the per-position ratio it approaches at long contexts), not the
 hundreds of times a rebuilding cache pays, because it never expands the cache: each
@@ -204,7 +222,7 @@ than these weights give (score rms 4.9, largest score 32).
 | scores bitwise equal | 74.2% | 74.1% | 74.1% |
 | \|score_A - score_E\|, 99th percentile | 1.2e-7 | 1.2e-7 | 5.0e-7 |
 | \|score_A - score_E\|, max (score rms) | 4.8e-7 (0.83) | 4.8e-7 (0.82) | 3.8e-6 (4.95) |
-| **argmax changed**, of 10,000 softmax rows | 0 | 0 | 0 |
+| **argmax changed**, of 10,000 softmax rows (the first 10,000 of the 10,080, the `--rows` cap) | 0 | 0 | 0 |
 | smallest top-2 score gap among those rows | 9.1e-6 | 1.9e-5 | 2.6e-4 |
 | rows whose gap is within 2x their largest score difference | 0 | 0 | 0 |
 
@@ -400,7 +418,9 @@ Three cautions about individual cells:
   is attention. L0's own ratio on one thread was 1.06 to 1.13 at the five decode points
   it ran, and on four threads its measured prefill was 1.07 times its count times the
   unit. Scaled by its own ratio, the one-thread L0 prefill is about 163 to 176 s
-  (65,792 applications x 2.35 to 2.36 ms x 1.06 to 1.13), not the 471 s in the JSON. The decode projections are calibrated on runs whose ratios are
+  (65,792 applications x 2.35 to 2.36 ms x 1.06 to 1.13), not the 471 s in the JSON,
+  which keeps that projected value under `status: projected`; read it with this
+  caveat. The decode projections are calibrated on runs whose ratios are
   1.06 to 1.36, and the four-thread prefill needed no projection.
 - **E and E+ at 65,536 positions are not measured.** The JSON's `seconds_per_call` for
   those lines (status `not_run_memory`) is the bench's linear extrapolation from 16,384.

@@ -20,11 +20,14 @@ ISA, runs sanitizer coverage, and records three synthetic timing runs per arm.
 `k3_matmul_mxfp4`) to their summation order, bit for bit. Each order is written out
 again in plain C (bf16 and fp32 share one order on every ISA; MXFP4 has one per ISA, and
 AVX-512 must reproduce AVX2's), and every output is compared on data where equal and
-opposite 2^60 terms land in different accumulators, so any other partition or tree
+opposite 2^60 terms land in different accumulators, so a different partition or tree
 changes the float, not just a double's last bit. It proves that on each run: the same
-data is summed in wrong orders (a sequential sum, the neighbouring tree, rotated or
-swapped lanes, another MXFP4 partition) and every one must be caught, so the test fails
-rather than passing vacuously if the data stops discriminating. Shapes cover the in % 16
+data is summed in four named wrong orders (a sequential sum, the neighbouring tree,
+rotated or swapped lanes, another MXFP4 partition) and each must be rejected in at
+least 10% of the eligible rows (39% to 92% in practice), so the test fails rather than
+passing vacuously if the data stops discriminating against those orders; it does not
+test every conceivable order, and leaf permutations that are symmetries of the tree
+are excluded because no data can distinguish them. Shapes cover the in % 16
 tails, odd row counts, and groups that are and are not multiples of 16. The MXFP4 scale
 bytes with special handling have data of their own: a NaN scale byte beside an infinite
 x on one or both rows of an AVX-512 row pair, overflowing scales in whole chunks and in

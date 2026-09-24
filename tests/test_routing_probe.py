@@ -41,6 +41,8 @@ class ProbeTests(unittest.TestCase):
             rp.evaluate(self.fixture(), {"calibration", "held-a", "held-b"}, lead=1)
 
     def test_shuffled_heldout_routes_have_no_artificial_agreement(self):
+        # A deterministic cyclic shift of the held-out routes, not a random shuffle:
+        # it shows only that no split leakage occurs on this toy case.
         data = self.fixture()
         data["routes"][4:] = (data["routes"][4:] + 1) % 4
         for row in rp.evaluate(data, {"calibration"}, lead=1)["results"]:

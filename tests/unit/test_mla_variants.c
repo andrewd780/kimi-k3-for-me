@@ -626,8 +626,9 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
  *   Every score is a double chain rounded to float once, at the end. With terms of one
  *   size, the same terms summed in another order differ by ~1e-16 relative and round to
  *   the same float almost always, so a variant that reordered its chain would pass every
- *   memcmp in test_case. The order witness measures this: on the ordinary layers only a
- *   few percent of reordered chains change their float.
+ *   memcmp in test_case. The order witness measures this: on the ordinary layers none of
+ *   the reordered chains changed its float (0 of 305,712 in the committed run), so an
+ *   output-only gate on such layers has no power against a reordering at all.
  *
  * WHAT THIS LAYER DOES INSTEAD
  *   Every chain CANCELS. Huge terms, in exactly negated pairs, arrive at shuffled points

@@ -7,6 +7,33 @@ the hosted exactness, rate and contention legs ran in hosted CI; the FD3B orient
 rates and the decode-under-contention tables were measured on a 4-vCPU cloud VM, with
 the conditions beside each. No checkpoint host or rental is used.
 
+## Prior art (added 2026-09-24, after review)
+
+The design here is not new; the review of #12 to #14 found these published or public
+precedents, checked as stated. **ZipServ** (Fan et al., ASPLOS'26; arXiv 2603.17435;
+code `HPMLL/ZipServ_ASPLOS26@6f8a209`, dated 2025-12-19) encodes BF16 weights with
+3 bits per weight from three bitmaps: codes 1 to 7 index a numerically contiguous
+window of seven exponent values seeded by the seven most frequent, and code 0 stores
+the whole 16-bit value in a separate stream, with the decode fused into the GEMM on
+GPU (read from its source, `kernel_benchmark/utils.h` and `csrc/L_Kernel.cuh`; its
+abstract, seen through search only, claims up to 30% size reduction, bit-exact).
+**dgpp** (`leloch/dgpp@73ddb9f7`, 2026-09-19 09:37 UTC) streams BF16 decode weights
+from "the sign+mantissa byte plus a 4-bit exponent code against a per-row window,
+exact side tables for the weights outside it", 0.75 of the bytes; **NWC** layout 2
+(`parda21/NWC@648b35f`, 2026-09-19 21:04 UTC) stores a `[sign | rank]` nibble per
+weight with per-block exception lists. Both were published the day before this note's
+first commit (`c03cf52`, 2026-09-20 07:35 UTC). The entropy facts behind all of them,
+that BF16 exponents carry about 2.6 to 2.8 bits and the mantissa byte is close to
+incompressible, are published in ZipNN (arXiv 2411.05239, exponent bytes separated and
+Huffman-coded, about 33% saved) and DFloat11 (arXiv 2504.11651, Huffman-coded
+exponents, about 70% size). What differs here: the code indexes the high byte (sign
+plus seven exponent bits) with a frequency-ranked, non-contiguous table, an escape
+costs 8 extra bits rather than ZipServ's 16, the decode runs on CPU with SSSE3, AVX2
+and NEON table lookups rather than fused into a GPU GEMM, and the sign-split
+alternative is measured (0.99 points worse at 3 bits). None of that is a new
+technique; the measurements on K3's families are the contribution, within the
+limits stated throughout.
+
 ## Gate 1 contract
 
 `tools/trunk_dictionary_gate.py` reads exactly the eight dense 1 MiB ranges in
@@ -119,7 +146,12 @@ patched and both planes assembled inside the timed region, `bench_huf4` units:
 real-range run on the same ISA (1.100 x86_64, 1.350 arm64, on the four `f_a_proj`
 ranges; [results](research-results.md#2-compact-huffman-decoder-research-prototype)),
 each ISA's slowest FD4B run is 14.7x faster on x86_64 (16.220) and 11.0x on arm64
-(14.844); the pooled medians give 14.8x and 12.9x. The ratio cost of that rate, on the
+(14.844); the pooled medians give 14.8x and 12.9x. Those ratios compare different CI
+runs on different hosted runners and buffer sizes (FD4B from run 35498176696 on the
+pooled 8 MiB buffer, the Huffman kernel from run 35462000448 on repeated 4 MiB
+buffers), so they are indicative, not a matched measurement: the same pooled FD4B
+x86_64 case read 16.2 GB/s in that run and 25.4 GB/s in run 35845709912
+([below](#fd3b-the-3-bit-prototype)). The ratio cost of that rate, on the
 same four ranges, is 7.80 points (0.750257 against 0.672227, [below](#remaining-gates)).
 The arm64 spread on identical input (16.4–26.7 GB/s) is the shared three-core hosted
 runner; the gate is on the minimum, not the median. At `B = 3 GB/s` and
@@ -140,7 +172,7 @@ its provenance.
 |---|---|---|---|
 | 4. Bit-width curve | **Result on all eight gate-1 ranges and on every family** | Eight ranges, from committed counts: 3 bits retain 0.703403, 4 bits 0.750227, 5 bits 0.8125; 3 bits gain 4.68 points. Every family, byte-weighted (CI run 35845709912): 0.713279 against 0.751122, +3.78 points. Both clear the 1.5-point bar, so FD3B is carried. FD3B is byte-exact in hosted CI under ASan/UBSan (SSSE3, AVX2, NEON) and decodes at 9.6 (SSSE3), 15.3 (AVX2) and 11.0 to 13.5 (NEON) reconstructed GB/s pooled | Nothing for the curve |
 | 5. Row-boundary cost | **Exact, from released shapes** | FDRX: zero padding at every K3 width; 0.0340 points per-row index, 0.0148 grouped; three range reads per chunk | Nothing for the cost; a container still needs a per-chunk checksum |
-| Every tensor family | **STOP on two families; plan applied** | All 23 families sampled, inventory equal to the config; the pooled table covers under 99% of `moe.router` (98.49%) and `moe.shared_down` (98.88%). By the plan the router takes its own table, `shared_down` stays raw, and per-family widths give **r = 0.7329** over all 108.76 GB of matrices ([result](#per-family-result)) | A census instead of four 1 MiB samples per family |
+| Every tensor family | **STOP on two families; plan applied** | All 23 families sampled, inventory equal to the config; the pooled table covers under 99% of `moe.router` (98.49%) and `moe.shared_down` (98.88%). By the plan the router takes its own table, `shared_down` stays raw, and per-family widths give **r = 0.7329** over all 108.76 GB of matrices; coding `shared_down` at 3 bits, as the plan's own per-matrix rule would, gives 0.7128 ([result](#per-family-result)) | A census instead of four 1 MiB samples per family; a STOP rule stated in the width the plan chooses |
 | Decode under matmul contention | **Measured on a VM with the shipped kernels, and hosted** | VM, worst case: above 1 up to B = 4 GB/s in every run; B = 5 is marginal (all eight cases pass in the idle runs, worst 1.124, but one 4-thread run taken during background downloads fell to 0.969 FD4B and 0.999 FD3B); the full 1/r up to about 4.0 to 4.3 GB/s for streamed input; at B = 6 it fails for streamed input at 4 and 2 threads, decoder-limited. Hosted x86_64 and arm64: above 1 at every B up to 6. Resident slowdown 2.3 to 6.1 ([results](#results-on-a-4-vcpu-vm)) | Which placement a real row pipeline sees |
 | Supported container/reader | Not started | | Everything |
 
@@ -163,8 +195,13 @@ a missed six-point requirement, rather than rounding it into a pass.
 four-stream Huffman payload's 0.672227: **7.80 points, the six-point requirement
 is missed**. FD3B (below) retains 0.704132 there: 3.19 points. Both figures cover
 KDA `f_a_proj` only. Over every family, byte-weighted, 4-bit retains 0.751122
-against the per-family Huffman bound of 0.677074 (7.40 points), and the plan's
-per-family choice 0.732863 (5.58 points above that bound).
+against the per-family Huffman bound of 0.677074 (7.40 points). The plan's
+per-family choice, 0.732863, is 5.58 points above that bound, but the two are not
+like for like (correction, 2026-09-24 review): the plan stores `moe.shared_down` raw
+(r = 1) while the bound Huffman-codes it (0.687925), and that raw fallback alone is
+about 2.32 of the 5.58 points (0.0745 x (1 - 0.6879)). With every family coded at
+its better width, `shared_down` at its 3-bit 0.730941, the byte-weighted ratio is
+0.712812 and the premium over per-family Huffman is **3.57 points**.
 
 No full-model speedup, full-model storage number or ratio win over Huffman is
 claimed. The streamed-byte reduction is budget-dependent: pinned trunk bytes
@@ -220,8 +257,8 @@ direction that clears the 1.5-point bar is **down**, to 3 bits, where seven entr
 hold 96.67% and the 3.33% of escapes cost less than the saved bit. The sign is
 close to a fair coin, so a (k-1)-bit magnitude table covers `2^k - 2` signed values
 in pairs while the k-bit table covers the same pairs plus one more value: the sign
-split trails at every width, by 0.99 points at 3 bits, where that extra entry
-holds 1.99% of values. Huffman is a further 3.21 points below 3-bit, and the
+split trails at 3 and 4 bits, by 0.99 points at 3 bits, where that extra entry
+holds 1.99% of values, and ties at 5 bits, where neither escapes. Huffman is a further 3.21 points below 3-bit, and the
 high-byte entropy only 0.17 below Huffman. Beyond that only the low byte is left:
 an order-0 coder of whole values can gain at most `8 - H(low | high)` bits per
 value over these bounds, which the CI job now measures.
@@ -338,7 +375,9 @@ so the result cannot pick its own test. In order:
    byte-weighted ratio of that per-family choice is the figure to quote.
 5. **Bounds, per family.** The Huffman and order-0 bounds per family and for one
    shared code state the fixed-width premium family by family; the whole-BF16
-   bound says how much any model of the low byte could still add.
+   order-0 bound says how much any memoryless model of the low byte could still add
+   (a coder that models context across neighbouring values or rows is not bounded
+   by it).
 6. **Provenance.** Record the run ID, head and artifact ID; commit the report as
    `docs/measurements/trunk-family-gate.json` with every derived field recomputed
    from the committed histograms and matched before writing (the gate 2/3
@@ -371,8 +410,8 @@ the plan above:
    the sampled bytes but under 99% of `moe.router` (98.49%) and `moe.shared_down`
    (98.88%). The gate-1 table, fitted on 4.00% of the bytes, covers 99.54% byte-weighted
    and under 99% of all three shared-expert projections (`shared_down` 97.59%,
-   `shared_gate` 98.61%, `shared_up` 98.54%; together 22.35% of trunk bytes): gate 1's
-   pass does not generalize to them.
+   `shared_gate` 98.61%, `shared_up` 98.54%; together 22.35% of matrix bytes, 22.34%
+   of the documented trunk): gate 1's pass does not generalize to them.
 3. **The STOP names families.** The router's own best 15 entries cover 99.96% of it, so
    it takes a table of its own; `shared_down`'s own best 15 cover 98.94%, so it stays
    raw BF16.
@@ -385,10 +424,22 @@ the plan above:
    r = 1, that is **r = 0.732863** (`trunk_family_gate.family_plan` on the committed
    report, unit-tested), the figure to quote: 29.05 GB fewer bytes before framing and
    the row index (0.0148 to 0.034 points).
-5. **Bounds.** Per-family Huffman codes for the high byte give 0.677074 byte-weighted,
-   one shared code 0.677387; the order-0 whole-BF16 entropy is 0.661496 per family and
-   0.663900 for one shared code. The plan's r is 5.58 points above the per-family
-   Huffman bound; 4 bits everywhere would be 7.40 points above it.
+   **Correction (2026-09-24 review).** The STOP rule in step 3 is scored on 15-entry
+   (4-bit) coverage, while step 4 chooses 3-bit widths, so the rule and the decision it
+   controls are in different units: `shared_down`'s 3-bit payload is 0.730941, well
+   under 1, and the deployment rule stated above (a writer stores raw only a matrix
+   whose FD payload would not be smaller) would code it. Coding it gives 0.712812
+   over the same matrices, 2.00 points below the plan's figure; the router's own table
+   moves its ratio by 0.005 points (0.707432 against 0.707483 pooled) and the trunk
+   total by under 0.0001. The pre-registered figure is kept as what the rule yields;
+   quote 0.7128 beside it, and state any future STOP in the width being decided.
+5. **Bounds.** Per-family Huffman codes for the high byte give 0.677074 byte-weighted;
+   the order-0 entropy of the byte-weighted mixture, the bound for one shared code, is
+   0.677387 (an entropy, not a Huffman code); the order-0 whole-BF16 entropy is
+   0.661496 per family and 0.663900 for the mixture. The plan's r is 5.58 points above
+   the per-family Huffman bound, of which about 2.32 points are the raw `shared_down`
+   fallback that the bound does not take; like for like, every family coded, the
+   premium is 3.57 points. 4 bits everywhere would be 7.40 points above the bound.
 
 Bold coverages are under 99%; "own best 15" is each family's own 15 most frequent high
 bytes.
@@ -435,7 +486,8 @@ On the committed counts the curve clears the 1.5-point bar at 3 bits, so
 `benchmarks/fixed_dictionary.h`
 now has FD3B beside FD4B: 3-bit codes as a little-endian bitstream (code i in
 bits 3i..3i+2), code 7 escapes to a raw byte, then the raw low bytes, the escape
-bytes and 32 zero bytes of read slack. Escapes are 3.3% of values here, so the
+bytes and 32 zero bytes of read slack. Escapes are 3.2% of values pooled over the
+eight ranges (133,404 of 4,194,304) and 3.3% on the four `f_a_proj` ranges, so the
 FD4B approach of patching each escape in a branchy loop would mispredict; FD3B
 computes an exclusive prefix count of the escape lanes and shuffles the next
 escape bytes into place with no branch. Decoders: scalar reference, SSSE3,
@@ -483,7 +535,11 @@ and [fixed-dictionary-rate-fd3b-arm64.json](../measurements/fixed-dictionary-rat
 jobs timed FD4B again on these runners: pooled 25.4 GB/s on x86_64 (a faster runner than
 gate 3's 16.2) and 15.4 to 19.4 on arm64. So FD3B decodes at 38% (SSSE3) and 60%
 (AVX2) of FD4B's pooled rate on x86_64 and about 71% on arm64: its escape expansion
-costs rate, as the orientation runs below suggested. The AVX2 report's
+costs rate, as the orientation runs below suggested. That FD4B re-timing exists only
+in the job logs, and the committed FD4B rates are gate 3's from a different run and
+runner, so these fractions are orientation rather than a matched measurement; no arm
+times the SIMD unpack with conventional scalar escape patching, so whether the
+branch-free expansion beats it at this escape rate is not measured. The AVX2 report's
 `compiler_flags` field repeats the job's SSSE3 flags; the binary it timed was built
 with `-mavx2`, as its `native` field says. Figures in this note that are quoted from
 hosted job logs rather than from a committed file (this paragraph's FD4B re-timing and
@@ -580,8 +636,10 @@ matmul on T - 1 threads, and decoder plus matmul at once. In the concurrent arm
 only work finished before the deadline counts, and each side keeps running until
 the other has finished, so every counted unit ran against a live competitor. The
 input is either `stream` (all 22 chunks in turn, so the decoder reads DRAM like a
-cold row pipeline) or `hot` (one cache-resident chunk, as right behind the read
-that landed it). Every chunk is compared byte for byte with the raw matrix through
+cold row pipeline) or `hot` (one chunk re-decoded in place, as right behind the read
+that landed it; at 5.6 to 6.0 MiB compressed (8 MiB x r) the chunk exceeds the 1 MiB
+per-core L2 and shares the 33 MiB L3 with the matmul's 176 MB stream, so `hot` means
+recently touched, not verified cache-resident). Every chunk is compared byte for byte with the raw matrix through
 the scalar and native decoders before timing, and through the native one after.
 
 Exactness is not at stake here: the decoder reproduces the BF16 bytes exactly, so
@@ -613,19 +671,28 @@ from every arm at its run least favourable to compression. The speedup falls as
 M_all rises and rises with D_c and M_c, so the worst case pairs M_all's fastest
 run with the slowest D_c and M_c; it is at or below the speedup of every repeat,
 however the runs pair up, and the worst resident slowdown at or above every
-repeat's (unit-tested on random arms).
+repeat's (unit-tested on random arms). The worst case is an envelope over
+run-to-run variance only: an extreme order statistic whose value depends on the
+repeat count (9 on the VM, 5 hosted, so the two are not comparable), with no
+confidence level, and it does not bound the model's own error (perfect overlap of
+the stages, no disk in the loop, no fill or drain across the 22 chunks and two
+buffers).
 
 **Decision rules, fixed before the data.** A streamed deployment at SSD rate B is
 worth building only if the contended **worst-case** speedup at that B exceeds 1;
-the median is reported beside it. (Amended on 2026-09-23, before any measurement:
-the rule first named the per-arm minimum, which also takes M_all's slowest run, so
-one disturbed run of the uncompressed baseline could pass the gate while the
-median failed, and would report the most favourable resident slowdown.) The
+the median is reported beside it. (Amended on 2026-09-23, before the runs tabulated
+below but after the 2026-09-22 orientation reading noted at the end of this
+section: the rule first named the per-arm minimum, which also takes M_all's slowest
+run, so one disturbed run of the uncompressed baseline could pass the gate while the
+median failed, and would report the most favourable resident slowdown. On the data
+below the amendment changes nothing: every `Matmul all` run exceeds 6 GB/s, so raw
+streaming is SSD-bound at every tabulated B under either rule.) The
 resident slowdown is expected to exceed 1: a pinned trunk layer is read once, so
 it should be decoded once when pinned and kept raw, and this measurement prices
 that choice rather than gating it. The VM has 4 cores, where the decoder's core is
-a quarter of the matmul's; the 2-thread run bounds a smaller machine, and larger
-machines lose a smaller share.
+a quarter of the matmul's; the 2-thread run stands in for a smaller machine, with
+the caveat that two threads on a 4-vCPU VM keep the whole L3 and memory bandwidth,
+so it is not a bound on a real 2-core host; larger machines lose a smaller share.
 
 **Protocol.** Build with the engine's flags, as the `contention` CI job does:
 
@@ -774,7 +841,9 @@ that arithmetic on the printed `min` rows, not new measurements.
 
 - **B up to 4 GB/s: the condition holds in every run**, including the one taken during
   background downloads (by the model above, a run whose worst case is 0.969 at B = 5 has
-  min(D_c, M_c) = 4.85 GB/s and so gives 1.21 at B = 4),
+  min(D_c, M_c) = 4.85 GB/s and so gives 1.21 at B = 4; that run's raw report was not
+  kept, so its B = 4 figure is back-derived from its B = 5 worst case rather than read
+  from a recorded table),
   so a streamed FD4B or FD3B trunk is worth building there by this gate. **At B = 5 it
   is marginal:** all eight format x placement x thread-count cases pass in the idle runs
   (worst 1.124), but the run with background activity fell just below 1, so B = 5 is

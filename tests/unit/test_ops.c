@@ -412,9 +412,11 @@ static float xs_unit(unsigned *s, float a)
  * ordinary term added while the +-2^40 partial sum is live is rounded to its grid of
  * 2^-12, and which terms those are, and what the running sum is at each rounding, is
  * fixed by the order of the chain. So a reordered or split chain moves the logit by
- * 3e-7 to 2.4e-4 (measured for a reversed chain over these shapes), where the float
- * spacing of these logits, all below 5 in magnitude, is 5e-7 or finer, not by a last
- * double bit that the narrowing to float erases; the sigmoid carries it into the score. 2^40 and not larger: at 2^60 the grid is 256, every term that meets
+ * 3e-7 to 2.4e-4 (measured for a reversed chain over these shapes at the fixed seed;
+ * other seeds of the same generator give shifts from below float spacing up to about
+ * 1e-3, and logits a little above 5), where the float spacing of these logits is about
+ * 5e-7 or finer, not by a last double bit that the narrowing to float erases; the
+ * sigmoid carries it into the score. 2^40 and not larger: at 2^60 the grid is 256, every term that meets
  * the big sum is lost outright, and two wrong orders could lose the same terms and
  * agree. A float times a float is exact in double and the pair cancels exactly, so
  * nothing overflows and the exact logit is unchanged. */
