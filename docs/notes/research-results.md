@@ -41,11 +41,12 @@ the evidence. Each is corrected in place; this list is the index.
   which the expert trace contradicts; the "0.91x on code" corroboration exists only
   in a source comment; the cost-share coefficients are asserted; δ is the first
   draft's marginal cost, not every position's ([note](spec-replay.md)).
-- **io_uring**: the runs are committed, but not as a report of their own:
-  `research-word-refill.json` holds them as `experiments[0]` (workflow run
-  35461771297, job 105946793371) and `research-two-symbol.json` as `experiments[4]`
-  (workflow run 35462000448, job 105947405103), each under a decoder-stage label
-  (an earlier version of this line said no run id was committed; that was wrong);
+- **io_uring**: the runs are committed, but not as a report of their own: the
+  per-run records sit inside two decoder-study files, `research-word-refill.json`
+  as `experiments[0]` (workflow run 35461771297, job `submission` 105946793371) and
+  `research-two-symbol.json` as `experiments[4]` (workflow run 35462000448, job
+  `submission` 105947405152); an earlier version of this line said no run id was
+  committed, and its first correction quoted the wrong job id for the second file;
   verification runs inside the timed region; the process-CPU statement depends on
   `OMP_WAIT_POLICY=PASSIVE`; the research-queue gate (benefit under concurrent
   compute) was never exercised (section 5 below).
@@ -554,9 +555,13 @@ time are reported. Unsupported/denied APIs are reported without changing policy.
 
 The recorded runs have broad timing dispersion. Arms overlap, with no consistent
 33%-plus improvement across queue depths. This does not justify an engine backend
-change. No report from those runs is committed and no run id is cited: the CI job
-uploads an unpinned artifact with the default retention, so the dispersion cannot be
-audited from the repository (2026-09-24 review). Three limits of the benchmark bear
+change. The per-run records of those runs are committed inside
+`docs/measurements/research-word-refill.json` (`experiments[0]`, workflow run
+35461771297, job 105946793371) and `docs/measurements/research-two-symbol.json`
+(`experiments[4]`, workflow run 35462000448, job 105947405152), so the dispersion can
+be read from the repository to the extent those files record it; no separate report
+is committed, and the CI job's artifact is unpinned with the default retention
+(2026-09-24 review; this sentence first said no run id was cited, which was wrong). Three limits of the benchmark bear
 on the reading: the io_uring arm is wave-synchronous (it submits `qd` reads, waits
 for all of them, then repeats, never keeping the ring full, with submit and wait as
 separate `io_uring_enter` calls); the per-byte verification of each 64 MiB pass runs
