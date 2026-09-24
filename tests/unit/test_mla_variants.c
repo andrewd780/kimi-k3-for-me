@@ -316,6 +316,10 @@ static void run_engine(Run *r, const Case *K, int latent)
     const int N = K->C + K->T;
     const size_t n = k3_mla_scratch_cached(c, K->T, K->cap, 1, latent);
     float *scr = (float *)xmalloc(n * sizeof(float));
+    /* Poisoned, as the caches are: the latent layout's rebuild buffer holds only key rows
+     * in the score pass and only value rows in the value pass, and an engine that read
+     * the other half, or any scratch it had not written, cannot pass by luck. */
+    memset(scr, 0x7F, n * sizeof(float));
     memset(r, 0, sizeof *r);
     run_alloc_trace(r, K->T, c->n_heads, c->v_head, N);
     r->out = (float *)xmalloc((size_t)K->T * c->hidden * sizeof(float));

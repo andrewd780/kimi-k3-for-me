@@ -323,12 +323,22 @@ enum { K3_WF32 = 0, K3_WBF16 = 1, K3_WI8 = 2, K3_WSTREAM = 3 };
  * position t reads X + t*ldx and writes Y + t*ldy. A source that reads its matrix from
  * disk implements it so the matrix is read ONCE per batch instead of once per position;
  * each output must be bit-identical to apply on that position alone. NULL means
- * k3_mmw_batch falls back to T calls of apply, which is always correct. ZERO THIS FIELD
- * when building one of these on the stack: it is a function pointer. */
+ * k3_mmw_batch falls back to T calls of apply, which is always correct.
+ *
+ * apply_rows is OPTIONAL too and computes only the rows k3_mmw_rows selects (rows
+ * r0 .. r0 + nr - 1 of every block of blk rows), each written where apply writes it and
+ * bit-identical to it. A source that reads its matrix from disk implements it so that
+ * only those rows are read. NULL means k3_mmw_rows calls apply, which computes and reads
+ * every row: correct, at the cost of the rows nobody asked for.
+ *
+ * ZERO THESE FIELDS when building one of these on the stack: they are function
+ * pointers. */
 typedef struct K3WeightStream {
     void (*apply)(const struct K3WeightStream *, float *, const float *, int, int);
     void (*apply_batch)(const struct K3WeightStream *, float *Y, int ldy,
                         const float *X, int ldx, int in, int out, int T);
+    void (*apply_rows)(const struct K3WeightStream *, float *y, const float *x, int in,
+                       int out, int blk, int r0, int nr);
 } K3WeightStream;
 
 /* bf16 -> f32 is a pure left shift: bf16 IS the top 16 bits of an f32. No rounding,
@@ -358,6 +368,42 @@ static inline void k3_mmw(float *y, const float *x, const void *W, int wdt,
         stream->apply(stream, y, x, in, out);
     }
     else                     k3_matmul(y, x, (const float *)W, in, out);
+}
+
+/* ---- some of the rows ------------------------------------------------------------------
+ * y[o] = W[o] . x for rows r0 .. r0 + nr - 1 of every block of blk rows, W's out rows
+ * taken as out / blk such blocks (blk divides out, r0 + nr <= blk). Each row computed
+ * lands at y[o], where k3_mmw puts it, and is BIT-IDENTICAL to what k3_mmw stores there:
+ * every kernel computes a row through the same code whichever rows it is asked for (see
+ * "selected output rows" in k3_ops.c; test_ops checks it bitwise under every tag).
+ *
+ * y must hold out floats. The resident kernels write the selected rows and nothing else;
+ * a streamed matrix without apply_rows computes all out rows, so a caller must treat the
+ * rows it did not select as unspecified. The --kv-latent branch of k3_mla_cached applies
+ * kv_b this way: blk = qk_nope + v_head, the key rows (r0 = 0, nr = qk_nope) to score a
+ * cached position and the value rows (r0 = qk_nope, nr = v_head) to weight its values,
+ * half the matrix each at K3 geometry instead of the whole of it twice. */
+void k3_matmul_rows(float *y, const float *x, const float *W, int in, int out, int blk,
+                    int r0, int nr);
+void k3_matmul_bf16_rows(float *y, const float *x, const uint16_t *W, int in, int out,
+                         int blk, int r0, int nr);
+void k3_matmul_q8_rows(float *y, const float *x, const void *W, int in, int out, int blk,
+                       int r0, int nr);
+
+static inline void k3_mmw_rows(float *y, const float *x, const void *W, int wdt, int in,
+                               int out, int blk, int r0, int nr)
+{
+    if (wdt == K3_WBF16)
+        k3_matmul_bf16_rows(y, x, (const uint16_t *)W, in, out, blk, r0, nr);
+    else if (wdt == K3_WI8)
+        k3_matmul_q8_rows(y, x, W, in, out, blk, r0, nr);
+    else if (wdt == K3_WSTREAM) {
+        const K3WeightStream *stream = (const K3WeightStream *)W;
+        if (stream->apply_rows) stream->apply_rows(stream, y, x, in, out, blk, r0, nr);
+        else                    stream->apply(stream, y, x, in, out);
+    }
+    else
+        k3_matmul_rows(y, x, (const float *)W, in, out, blk, r0, nr);
 }
 
 /* ---- the same product for T positions at once --------------------------------------

@@ -1400,12 +1400,23 @@ static void fill_cancelling(uint16_t *Wb, float *Wf, float *X, int in, int out, 
     }
 }
 
-typedef struct { K3WeightStream s; const uint16_t *W; int calls, batch_calls; } MockStream;
+typedef struct {
+    K3WeightStream s;
+    const uint16_t *W;
+    int calls, batch_calls, rows_calls;
+} MockStream;
 static void mock_apply(const K3WeightStream *s, float *y, const float *x, int in, int out)
 {
     MockStream *m = (MockStream *)(void *)s;
     m->calls++;
     k3_matmul_bf16(y, x, m->W, in, out);
+}
+static void mock_apply_rows(const K3WeightStream *s, float *y, const float *x, int in,
+                            int out, int blk, int r0, int nr)
+{
+    MockStream *m = (MockStream *)(void *)s;
+    m->rows_calls++;
+    k3_matmul_bf16_rows(y, x, m->W, in, out, blk, r0, nr);
 }
 static void mock_apply_batch(const K3WeightStream *s, float *Y, int ldy, const float *X,
                              int ldx, int in, int out, int T)
@@ -1647,6 +1658,144 @@ static void t_matmul_batch(void)
     }
 }
 
+/* A SELECTION of rows must be the full kernels' rows BIT FOR BIT, and nothing else.
+ *
+ * k3_matmul_rows, k3_matmul_bf16_rows and k3_matmul_q8_rows compute rows r0 .. r0 + nr - 1
+ * of every block of blk rows (the --kv-latent path applies kv_b's key rows to score and
+ * its value rows to weight). Their claim is that a row is the same float whichever rows
+ * the call computes, and that a row nobody selected is not written. So each case fills
+ * the output with a sentinel, runs a selection, and compares every selected row with the
+ * full kernel's bits and every other row with the sentinel: through each kernel directly
+ * and through k3_mmw_rows under every weight tag, including a streamed matrix with
+ * apply_rows (one call, the selection only) and without it (apply, every row; the
+ * contract then leaves the rest unspecified, and they are the full kernel's rows).
+ * Selections cover a single block, many blocks, runs that start mid-block and end at
+ * the block's end, one row per block, an odd number of rows in all (the bf16 kernel's
+ * last pair is one row) and in a run (a pair then spans two blocks), counts below and
+ * above the OpenMP threshold, the fixture's and K3's kv_b head layouts, and every
+ * in % 16 tail that matters; half the cases use cancelling operands, where a row summed
+ * in any other order changes its float, and one set carries NaNs. */
+static void t_matmul_rows(void)
+{
+    static const int ins[] = {1, 5, 16, 17, 33, 100, 257};
+    /* {out, blk, r0, nr} */
+    static const int sel[][4] = {
+        {7, 7, 0, 7},       /* one block, every row: the full product */
+        {24, 8, 0, 5},      /* three blocks, a run at the start of each, odd total */
+        {24, 8, 5, 3},      /* the rest of each block, runs ending at the block's end */
+        {30, 10, 3, 3},     /* runs mid-block, a pair spanning two blocks */
+        {160, 40, 0, 24},   /* the fixture's kv_b: 4 heads, keys (qk_nope 24) */
+        {160, 40, 24, 16},  /* ... and values (v_head 16) */
+        {70, 1, 0, 1},      /* one row per block, 70 selected: above the threshold */
+        {287, 41, 7, 1},    /* one row per block, seven blocks */
+        {130, 65, 1, 64},   /* 128 selected: over the threshold, pairs across blocks */
+        {512, 256, 0, 128}, /* K3's kv_b head layout, two heads: keys */
+        {512, 256, 128, 128}/* ... and values */
+    };
+    const int nin = (int)(sizeof ins / sizeof *ins), nsel = (int)(sizeof sel / sizeof *sel);
+    const float SENT = -12345.0f;
+    long cases = 0, bad = 0;
+    char where[200] = "";
+
+    for (int a = 0; a < nin; a++)
+        for (int b = 0; b < nsel; b++) {
+            const int in = ins[a], out = sel[b][0], blk = sel[b][1], r0 = sel[b][2];
+            const int nr = sel[b][3];
+            const size_t nw = (size_t)in * out, rowb = (size_t)4 + (size_t)in;
+            uint16_t *Wb = (uint16_t *)malloc(nw * sizeof(uint16_t));
+            float *Wf = (float *)malloc(nw * sizeof(float));
+            unsigned char *W8 = (unsigned char *)malloc(rowb * out);
+            float *x  = (float *)malloc((size_t)in * sizeof(float));
+            float *Yr = (float *)malloc((size_t)out * sizeof(float));
+            float *Ys = (float *)malloc((size_t)out * sizeof(float));
+            if (!Wb || !Wf || !W8 || !x || !Yr || !Ys) {
+                printf("  FAIL  matmul_rows    allocation\n"); g_fail++;
+                free(Wb); free(Wf); free(W8); free(x); free(Yr); free(Ys); return;
+            }
+            if ((a + b) % 2 == 0) {
+                fill_cancelling(Wb, Wf, x, in, out, 1, in);
+            } else {
+                for (size_t i = 0; i < nw; i++) { Wb[i] = rnd_bf16(); Wf[i] = rnd_x(); }
+                for (int i = 0; i < in; i++) x[i] = rnd_x();
+            }
+            if (a == 3 && b % 3 == 0)                          /* NaNs in some rows */
+                for (int o = 0; o < out; o += 3) {
+                    const uint32_t u = 0x7FC00000u | (rnd() & 0x803FFFFFu);
+                    float f; memcpy(&f, &u, 4);
+                    const int at = (int)(rnd() % (unsigned)in);
+                    Wf[(size_t)o * in + at] = f;
+                    Wb[(size_t)o * in + at] = (uint16_t)(u >> 16);
+                }
+            for (int o = 0; o < out; o++) {
+                const float sc = 0.01f * (float)(o % 13 + 1);
+                memcpy(W8 + (size_t)o * rowb, &sc, 4);
+                for (int i = 0; i < in; i++) W8[(size_t)o * rowb + 4 + i] = (unsigned char)rnd();
+            }
+            /* ks: the tag under test. 0 fp32, 1 bf16, 2 int8, each directly and through
+             * k3_mmw_rows; 3 a stream with apply_rows, 4 a stream without it. */
+            for (int ks = 0; ks < 5; ks++)
+                for (int via = 0; via < (ks < 3 ? 2 : 1); via++) {
+                    if (ks == 0)      k3_matmul(Yr, x, Wf, in, out);
+                    else if (ks == 2) k3_matmul_q8(Yr, x, W8, in, out);
+                    else              k3_matmul_bf16(Yr, x, Wb, in, out);
+                    for (int o = 0; o < out; o++) Ys[o] = SENT;
+                    MockStream ms; memset(&ms, 0, sizeof ms);
+                    ms.s.apply = mock_apply;
+                    ms.s.apply_rows = ks == 3 ? mock_apply_rows : NULL;
+                    ms.W = Wb;
+                    if (ks == 0 && !via)      k3_matmul_rows(Ys, x, Wf, in, out, blk, r0, nr);
+                    else if (ks == 1 && !via) k3_matmul_bf16_rows(Ys, x, Wb, in, out, blk, r0, nr);
+                    else if (ks == 2 && !via) k3_matmul_q8_rows(Ys, x, W8, in, out, blk, r0, nr);
+                    else if (ks < 3)
+                        k3_mmw_rows(Ys, x, ks == 0 ? (const void *)Wf
+                                           : ks == 1 ? (const void *)Wb : (const void *)W8,
+                                    ks == 0 ? K3_WF32 : ks == 1 ? K3_WBF16 : K3_WI8,
+                                    in, out, blk, r0, nr);
+                    else k3_mmw_rows(Ys, x, &ms, K3_WSTREAM, in, out, blk, r0, nr);
+                    cases++;
+                    int ok = 1;
+                    for (int o = 0; o < out; o++) {
+                        const int i = o % blk, picked = i >= r0 && i < r0 + nr;
+                        if (picked || ks == 4) { if (!same_bits(Yr + o, Ys + o, 1)) ok = 0; }
+                        else if (Ys[o] != SENT) ok = 0;
+                    }
+                    if (ks == 3 && (ms.rows_calls != 1 || ms.calls != 0)) ok = 0;
+                    if (ks == 4 && (ms.rows_calls != 0 || ms.calls != 1)) ok = 0;
+                    if (!ok) {
+                        bad++;
+                        snprintf(where, sizeof where, "%s%s in=%d out=%d blk=%d r0=%d nr=%d",
+                                 (const char *[]){"fp32", "bf16", "int8", "stream+rows",
+                                                  "stream"}[ks],
+                                 via ? " via k3_mmw_rows" : "", in, out, blk, r0, nr);
+                    }
+                }
+            free(Wb); free(Wf); free(W8); free(x); free(Yr); free(Ys);
+        }
+
+    /* Selecting no rows writes nothing, through every tag. */
+    {
+        float y[4] = {SENT, SENT, SENT, SENT}, x[3] = {1.0f, 2.0f, 3.0f};
+        const float wf[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+        const uint16_t wb[12] = {0x3F80, 0x4000, 0x4040, 0x4080, 0x40A0, 0x40C0,
+                                 0x40E0, 0x4100, 0x4110, 0x4120, 0x4130, 0x4140};
+        k3_matmul_rows(y, x, wf, 3, 4, 2, 1, 0);
+        k3_matmul_bf16_rows(y, x, wb, 3, 4, 2, 1, 0);
+        cases++;
+        for (int o = 0; o < 4; o++)
+            if (y[o] != SENT) { bad++; snprintf(where, sizeof where, "empty selection"); break; }
+    }
+
+    if (bad) {
+        printf("  FAIL  matmul_rows    %ld/%ld cases differ from the full kernels or wrote an "
+               "unselected row, e.g. %s\n", bad, cases, where);
+        g_fail++;
+    } else {
+        printf("  PASS  matmul_rows    %ld cases, selected rows bit-identical to the full "
+               "kernels under every tag, no other row written\n", cases);
+        g_pass++;
+    }
+}
+
 int main(int argc, char **argv)
 {
     const char *dir = (argc > 1) ? argv[1] : "../fixtures/ops";
@@ -1686,6 +1835,7 @@ int main(int argc, char **argv)
     t_mxfp4(dir);
     t_matmul_bf16();
     t_matmul_batch();
+    t_matmul_rows();
     t_kda_layer(dir, "kda_layer1");
     t_kda_layer(dir, "kda_layer8");
     t_layer(dir, "layer_kda");

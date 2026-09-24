@@ -101,6 +101,11 @@ typedef struct {
      * layer name before its read succeeds; bind waits for completion before consuming it. */
     void         *io_state;
     void         *row_state;   /* opt-in bounded row pipeline, separate from layer ring */
+    /* Row pipeline: 1 reads a selection of rows (K3WeightStream.apply_rows) in whole-
+     * matrix tiles and applies only the selected rows; 0 reads only the selected rows.
+     * Set for a compressed trunk, which decodes a whole block behind every read, so that
+     * each block is decoded once per pass rather than once per run of rows it holds. */
+    int           rows_whole_tiles;
     int           read_error;  /* sticky: never emit output after a failed matrix read */
     uint64_t      row_buffer_bytes, small_buffer_bytes, matrix_calls;
     /* Row pipeline only, both on the main thread: time blocked waiting for a row tile,
@@ -120,7 +125,9 @@ int  k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_
 /* Exact row tiling: two buffers of at most 8 MiB each, plus current-layer vectors.
  * No pinning and no cross-layer prefetch. A batch of positions applied through
  * k3_mmw_batch reads each matrix once (K3WeightStream.apply_batch); only callers that
- * still loop k3_mmw per position reread it. */
+ * still loop k3_mmw per position reread it. A selection of rows applied through
+ * k3_mmw_rows (apply_rows: the --kv-latent passes over kv_b) reads only those rows from a
+ * plain trunk.bin; see rows_whole_tiles. */
 int  k3_trunk_open_rows(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes);
 void k3_trunk_close(K3Trunk *tr);
 
