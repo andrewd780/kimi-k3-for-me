@@ -41,10 +41,14 @@ the evidence. Each is corrected in place; this list is the index.
   which the expert trace contradicts; the "0.91x on code" corroboration exists only
   in a source comment; the cost-share coefficients are asserted; δ is the first
   draft's marginal cost, not every position's ([note](spec-replay.md)).
-- **io_uring**: no report or run id is committed; verification runs inside the timed
-  region; the process-CPU statement depends on `OMP_WAIT_POLICY=PASSIVE`; the
-  research-queue gate (benefit under concurrent compute) was never exercised (section
-  5 below).
+- **io_uring**: the runs are committed, but not as a report of their own:
+  `research-word-refill.json` holds them as `experiments[0]` (workflow run
+  35461771297, job 105946793371) and `research-two-symbol.json` as `experiments[4]`
+  (workflow run 35462000448, job 105947405103), each under a decoder-stage label
+  (an earlier version of this line said no run id was committed; that was wrong);
+  verification runs inside the timed region; the process-CPU statement depends on
+  `OMP_WAIT_POLICY=PASSIVE`; the research-queue gate (benefit under concurrent
+  compute) was never exercised (section 5 below).
 - **STATUS "read-ahead ring 1.70x measured"** is the memory ladder's 224 GB against
   8 GB ratio, captured before the ring existed (STATUS).
 - **Research queue "18.73 s of disk" and the 1.09x ceiling**: the I/O share cannot be
@@ -70,8 +74,8 @@ the evidence. Each is corrected in place; this list is the index.
   `experiments[0]` under the decoder stage label; `fixed-dictionary-rate-fd3b-avx2-x86_64.json`
   records SSSE3 compiler flags for an AVX2 binary; `mla-variants-x86_64.jsonl` keeps
   the projected one-thread L0 prefill (470.7 s) that the note supersedes;
-  `kda-simd-ci.json` predates the 24-gate `test_ops` count that `bench_kda.py` now
-  expects.
+  `kda-simd-ci.json` predates the 25-gate `test_ops` count that `bench_kda.py` now
+  expects (24 before the kv_b row split added its cases).
 
 ## 1. Bounded trunk rows: implemented, opt-in
 
