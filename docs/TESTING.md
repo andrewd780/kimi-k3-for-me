@@ -46,7 +46,11 @@ the engine's two layouts are compared on them too. L1 runs at three value-row bu
 and E+, L1 and A rerun on every thread on the cases of up to 48 positions. Each
 variant's kv_b application count, in whole-matrix equivalents (rows applied over
 kv_b's rows), is checked against its closed form (including the prefill shape C=0,
-T=256, where L0 makes 32,896, its key and value halves applied separately, and L1 256).
+T=256, where L0 makes 32,896, its key and value halves applied separately, and L1 256),
+and so is the engine's own: its trace hook counts the kv_b rows `k3_mla_cached` applies
+(`kvb_rows`), which must make L0's count in the latent layout and E's in the expanded one
+in every case, so a pass that went back to applying the whole matrix fails though its
+bits are the same.
 The engine's and the variants' scratch is poisoned first, so a pass that read the half
 of the rebuild buffer it did not write cannot pass. Ordinary random layers
 cannot see a reordered score chain, a double sum rounded to float, and the test prints
@@ -82,8 +86,9 @@ position's experts in fetch order changes the output (the CLI's tiny checkpoint 
 to the top 2 and cannot show that). Each also computes the wrong orders on the same data
 and fails if the data stops telling them apart. A third, `matmul_rows`, holds the
 row-selection kernels behind `--kv-latent`'s split `kv_b` passes (`k3_mmw_rows`, under
-every weight tag) to the full kernels bit for bit and checks that no unselected row is
-written.
+every weight tag) to the full kernels bit for bit, checks that no unselected row is
+written, and, where the platform can fork (not Windows), that a selection naming rows
+outside the matrix aborts.
 
 **`test_cache`**, the streaming expert cache: prefetch, eviction, and mixed batch/serial
 access. Uses a synthetic shard of structurally faithful experts, a few KB. With
@@ -97,8 +102,9 @@ guard, async prefetch, slot-isolation under concurrency, ring wrap-around,
 truncated-read failure isolation, and the `--trunk-rows` pipeline (two full walks
 and a batch of positions whose products must equal the resident trunk's bit for bit,
 one read per matrix per batch, row selections such as `kv_b`'s key and value halves that
-must equal the resident rows and read exactly their own tiles, a sticky failed read, a
-refused undersized budget).
+must equal the resident rows and request exactly their own tiles, a `--kv-latent` step of
+`k3_mla_cached` itself that must equal the resident layer and make exactly its passes'
+matrix calls and byte requests, a sticky failed read, a refused undersized budget).
 Uses a synthetic 3-layer trunk fixture of a few KB that is generated inline, so no
 checkpoint is required. **`test_trunk_rows`** is the same file built with
 `-DK3_TEST_ROWS_ONLY`: the row checks alone over 93 layers whose 257-row dense

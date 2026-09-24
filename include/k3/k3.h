@@ -252,17 +252,26 @@ void   k3_mla(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
  *   acc     [T][H][v_head]  the attention output before the gate
  *   n is the row stride of scores and quot and must be at least cached + T; the call
  *   aborts rather than write past it.
+ *   kvb_rows                kv_b rows applied, one per row per position, ADDED to (the
+ *                           caller zeroes it): the expanded layout's append counts
+ *                           T * H * (qk_nope + v_head); the latent layout counts, per
+ *                           visible position per query token, H * qk_nope in the score
+ *                           pass and H * v_head in the value pass, in the call that
+ *                           applies them. test_mla_variants holds kvb_rows over kv_b's
+ *                           H * (qk_nope + v_head) rows to the closed forms, which is
+ *                           the engine's own gate on the --kv-latent row split.
  *
  * Recording is copies of values the call has already computed, into memory it never
  * reads back, so it cannot change a bit of the output; with the hook NULL the cost is
- * one test per (token, head) row and one per probability. Set it only around a call
- * made from one thread: the pointer is global. */
+ * one test per (token, head) row, one per probability and one per kv_b application.
+ * Set it only around a call made from one thread: the pointer is global. */
 typedef struct {
     int     n;
     float  *scores;
     double *z;
     double *quot;
     float  *acc;
+    unsigned long long kvb_rows;
 } K3MlaTrace;
 extern K3MlaTrace *k3_mla_trace;
 
@@ -571,7 +580,8 @@ extern long k3_expert_drops;
  * --kv-latent caches the kv_lora_rank latent instead and rebuilds k and v on use, at
  * 0.055 MB per position: the same five rows become 0.23, 0.91, 1.81 and 7.25 GB, and
  * the 1M context 58.0 GB. It buys that with one kv_b matmul's worth per cached position
- * per step, applied in two halves: the key rows to score, the value rows to weight.
+ * per query token (per step at T = 1; prefill and --spec verification pay it per
+ * position), applied in two halves: the key rows to score, the value rows to weight.
  *
  * The CLI computes the requirement for the request it was given and refuses, with both
  * figures side by side, when it will not fit in available memory. Reaching the model's

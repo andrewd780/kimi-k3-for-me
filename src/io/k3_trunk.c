@@ -266,9 +266,10 @@ static void rows_apply_tile(const K3RowSel *sel, const unsigned char *weight, si
  * the tiles are cut from the selected runs, so only their bytes are read: half of kv_b
  * per --kv-latent pass at K3 geometry, as 96 reads of one head's 128 KiB of rows instead
  * of three 8 MiB tiles. That is fewer bytes in more requests: in an informal O_DIRECT
- * check on the development VM's disk (not a committed measurement) the 96 reads took
- * about 60% as long as the three, and a device whose per-request latency is high
- * relative to its bandwidth gains less. A compressed trunk
+ * check on the development VM's disk (two runs, the best of seven passes each; not a
+ * committed measurement) the 96 reads took 10.1 and 11.4 ms where the three took 16.9
+ * and 18.5, and a device whose per-request latency is high relative to its bandwidth
+ * gains less. A compressed trunk
  * decodes the whole block behind a read (1 MiB by default, four heads of kv_b), so
  * reading run by run would decode each block once per run it holds; there
  * (rows_whole_tiles) the tiles are whole-matrix tiles, read as a full pass reads them,

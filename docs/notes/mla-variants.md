@@ -59,7 +59,8 @@ between each variant and E. L1 runs at three value-row budgets (all, half, none)
 and A rerun on every thread (on the cases of up to 48 positions, which span three of
 their 16-position blocks); A is compared bitwise with a plain scalar rendering of its
 formulas. The count of kv_b applications each call makes, in whole-matrix equivalents,
-is checked against the closed form in the table above.
+is checked against the closed form in the table above, for every variant and for the
+engine itself, whose trace hook counts the kv_b rows it applies (`kvb_rows`).
 
 The engine's intermediates come from a recording hook, `k3_mla_trace` in `k3.h`, which
 is NULL outside tests. It is needed because the output cannot show them: z and e/z are
@@ -189,35 +190,37 @@ L1's value-row budget here is the benchmark default, 2,560 MB for one layer, whi
 | 65,536 | 1 | 65,537 | 78,991 | 0.83x | 19,840 | 23,903 | 165 | 48.6 |
 | 65,536 | 5 | 327,695 | 78,999 | 4.1x | 19,840 | 4,820 | 165 | 48.6 |
 
-**Correction (2026-09-24 review), and the change it led to.** L0's two applications
-per position were each a full 24,576-row kv_b, of which the score pass reads only the
-128 key rows per head and the value pass only the 128 value rows (`src/core/k3_ops.c`,
-the latent branch of `k3_mla_cached`). Applying only W_uk's rows in the first pass and
-only W_uv's in the second is bitwise identical, since the matvec is row-independent,
-and halves L0's kv_b multiply-adds and, from a plain `trunk.bin` under `--trunk-rows`,
-its streamed kv_b bytes. The engine has done so since commit ea6f419 (2026-09-24),
-through `k3_mmw_rows`, and L0 since 5f5208c; `test_mla_variants` and GATE 3b hold it
-bitwise, and the tables above are the counts after it. Before it, L0's counts were
-twice these, 2T(C+1) + T(T-1) (514 at C = 256, T = 1; 65,792 at the 256-token
-prefill), which is what the committed JSON records. Counted in whole applications, L0
-makes N per query token at T = 1, the same as L1 holding every value row, so the
-"L0 / L1 = 2.0x" that stood in the decode table before the change was L0's own waste,
-not an advantage of L1's loop order. L1's advantage at T > 1, rebuilding each position
-once per call rather than once per query token, stands: 5.0x at T = 5. L1's second
-rebuild of the positions past its value-row budget still applies the whole matrix
-where only the value rows are read; split the same way it would count N at every
-budget. It is not the engine's loop and was left as it was.
+**Correction (2026-09-24 review), and the change it led to.** L0's two applications per
+position were each a full 24,576-row kv_b, of which the score pass reads only the 128
+key rows per head and the value pass only the 128 value rows (`src/core/k3_ops.c`, the
+latent branch of `k3_mla_cached`). Applying only W_uk's rows in the first pass and only
+W_uv's in the second is bitwise identical, since the matvec is row-independent, and
+halves L0's kv_b multiply-adds and, from a plain `trunk.bin` under `--trunk-rows`, the
+kv_b bytes it requests at K3 geometry, where a head's run is 128 KiB (under O_DIRECT a
+run is rounded to whole 4 KiB pages, which on a small matrix can cancel the saving). The
+engine has done so since commit ea6f419 (2026-09-24), through `k3_mmw_rows`, and L0
+since 5f5208c; `test_mla_variants` and GATE 3b hold it bitwise, `test_mla_variants` also
+holds the engine's own kv_b row count (its trace hook's `kvb_rows`) to L0's closed form,
+and the tables above are the counts after it. Before it, L0's counts were twice these,
+2T(C+1) + T(T-1) (514 at C = 256, T = 1; 65,792 at the 256-token prefill), which is what
+the committed JSON records. Counted in whole applications, L0 makes N per query token at
+T = 1, the same as L1 holding every value row, so the "L0 / L1 = 2.0x" that stood in the
+decode table before the change was L0's own waste, not an advantage of L1's loop order.
+L1's advantage at T > 1, rebuilding each position once per call rather than once per
+query token, stands: 5.0x at T = 5. L1's second rebuild of the positions past its
+value-row budget still applies the whole matrix where only the value rows are read;
+split the same way it would count N at every budget. It is not the engine's loop and was
+left as it was.
 
 Three things follow, none of them a timing. At T = 1 a latent cache costs at least one
-kv_b application per cached position per layer, whichever loop runs it; L0 and L1 both
-make exactly N now, and no exact reorganisation can go below N. Verifying T drafted
-tokens at once
-(T = 5 here) is where L0's cost multiplies and L1's does not. And A's arithmetic is at
-most 3.4 times E's (the per-position ratio it approaches at long contexts), not the
-hundreds of times a rebuilding cache pays, because it never expands the cache: each
-cached position costs H(2 kv_lora + qk_rope) = 104,448 multiply-adds per query token
-against E's H(qk_nope + qk_rope + v_head) = 30,720, read from 2,304 cached bytes instead
-of 98,560.
+kv_b application per cached position per layer, whichever loop runs it; L0 and L1 with
+every value row held (vcap >= N) both make exactly N now, and no exact reorganisation
+can go below N. Verifying T drafted tokens at once (T = 5 here) is where L0's cost
+multiplies and L1's does not. And A's arithmetic is at most 3.4 times E's (the
+per-position ratio it approaches at long contexts), not the hundreds of times a
+rebuilding cache pays, because it never expands the cache: each cached position costs
+H(2 kv_lora + qk_rope) = 104,448 multiply-adds per query token against E's H(qk_nope +
+qk_rope + v_head) = 30,720, read from 2,304 cached bytes instead of 98,560.
 
 ## Numerics of the absorbed variant
 
@@ -291,9 +294,11 @@ today's L0, whose counts are the ones under
 retaken. An informal check after the change, not a measurement against variance:
 `bench_mla time --threads 4 --C 256 --T 1 --variants L0,L1 --runs 5`, three processes
 each with the binary from before the split and the one after, interleaved, on this VM.
-L0's per-process medians were 338, 381 and 325 ms before and 205, 177 and 210 ms after;
-L1, whose code did not change, gave 181, 194 and 174 ms, then 163, 160 and 147 ms, which
-is the size of the process-to-process noise there.
+L0's per-process medians were 338, 381 and 325 ms before and 205, 177 and 210 ms after.
+L1's were 181, 194 and 174 ms, then 163, 160 and 147 ms: every one lower, a shift rather
+than a spread. L1 is no control for noise here, because ea6f419 also refactored
+`k3_matmul_bf16`, the kernel L1's rebuilds run on, so its shift cannot be separated from
+noise, and L0's change cannot be attributed to the row split alone by these runs.
 
 Each of the four arms (one and four threads, decode and prefill) waited for the
 1-minute load average to fall under 1.0, and they started at 0.94, 0.95, 0.98 and

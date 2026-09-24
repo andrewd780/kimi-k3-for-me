@@ -95,6 +95,23 @@ static void k3_fatal_bound(const char *what, long value, long limit)
     abort();
 }
 
+/* The same rule, for a row selection (k3_matmul_rows and its siblings) that does not name
+ * rows of its matrix. Running it would write y and read W outside them, and returning
+ * would leave y unwritten for the caller to consume, so it aborts like the bound above.
+ * It is a caller's bug, never a property of the input, so the message says what a
+ * selection must be rather than how to shorten a run. */
+static void k3_fatal_rows(const char *who, int out, int blk, int r0, int nr)
+{
+    fprintf(stderr,
+            "k3: FATAL, %s was asked for rows %d .. %ld of every block of %d rows of a\n"
+            "    %d-row matrix, which is not a selection of its rows: blk must be at\n"
+            "    least 1 and divide the row count, and 0 <= r0 <= r0 + nr <= blk.\n"
+            "    Aborting rather than writing outside the output or returning without\n"
+            "    writing it.\n",
+            who, r0, (long)r0 + nr - 1, blk, out);
+    abort();
+}
+
 /* ------------------------------------------------------------- layer map ---- */
 /* The released config lists full_attn_layers ONE-BASED, and
  * configuration_kimi_k3.py:152-156 tests (layer_idx + 1) in kda_layers. Getting this
@@ -544,6 +561,16 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
 }
 
 /* ------------------------------------------------- selected output rows ---- */
+/* The number of rows a selection computes, after checking that it names rows of the
+ * matrix; see k3_fatal_rows. An empty selection (nr == 0, or out == 0) is valid and
+ * computes nothing. */
+static int k3_rows_selected(const char *who, int out, int blk, int r0, int nr)
+{
+    if (out < 0 || blk < 1 || out % blk != 0 || r0 < 0 || nr < 0 || (long)r0 + nr > blk)
+        k3_fatal_rows(who, out, blk, r0, nr);
+    return out / blk * nr;
+}
+
 /* y[o] = W[o] . x for SOME of W's out rows. W is taken as out / blk blocks of blk rows,
  * and rows r0 .. r0 + nr - 1 of every block are computed: selected row k, for
  * k < (out / blk) * nr, is row o = (k / nr) * blk + r0 + k % nr, and its output lands at
@@ -570,12 +597,14 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   x. So each y[o] written is the float k3_matmul, k3_matmul_bf16 or k3_matmul_q8
  *   stores at y[o]: the selection changes which rows are computed, never how. test_ops
  *   holds the three kernels, and k3_mmw_rows under every weight tag, to the full kernels
- *   bit for bit, and checks that no unselected row is written. */
+ *   bit for bit, checks that no unselected row is written, and (where it can fork)
+ *   that a selection naming rows outside the matrix aborts (k3_rows_selected). */
 void k3_matmul_rows(float *y, const float *x, const float *W, int in, int out, int blk,
                     int r0, int nr)
 {
-    if (blk <= 0 || nr <= 0 || out <= 0) return;
-    const int n16 = in & ~15, n = out / blk * nr;
+    const int n = k3_rows_selected("k3_matmul_rows", out, blk, r0, nr);
+    const int n16 = in & ~15;
+    if (n == 0) return;
     double *const xd = k3_f32_hoist(x, in);
 
 #ifdef _OPENMP
@@ -1000,9 +1029,26 @@ void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, i
  * doubles the output rounds away. The quotient is named before it is rounded so that the
  * value recorded IS the value used: `pq = sc[s] / z; (float)pq` is `(float)(sc[s] / z)`,
  * since a double quotient is evaluated in double on every target this file builds for
- * (FLT_EVAL_METHOD 0 on x86-64 and aarch64). Nothing else here reads the trace.
+ * (FLT_EVAL_METHOD 0 on x86-64 and aarch64). The hook also counts the kv_b rows each
+ * call applies (kvb_rows), the latent layout's inside k3_mla_rebuild, the one call that
+ * applies them. Nothing else here reads the trace.
  */
 K3MlaTrace *k3_mla_trace = NULL;
+
+/* One --kv-latent rebuild: rows r0 .. r0 + nr - 1 of every head's kvd rows of kv_b applied
+ * to one cached position's latent, each written to kb where a whole application puts it
+ * (k3_mmw_rows). Both passes rebuild through here, and the trace hook counts the rows here,
+ * beside the call that applies them, so the count is of what was applied: a pass that
+ * applied kv_b some other way, such as the whole matrix through k3_mmw, would go uncounted
+ * and fail test_mla_variants' closed form. That count is the engine's own gate on the row
+ * split; the benchmark's is a copy's. */
+static void k3_mla_rebuild(float *kb, const float *lat, const K3MlaW *w, const K3Cfg *c,
+                           int r0, int nr, K3MlaTrace *tr)
+{
+    const int H = c->n_heads, kvd = c->qk_nope + c->v_head;
+    k3_mmw_rows(kb, lat, w->kv_b, w->wdt, c->kv_lora, H * kvd, kvd, r0, nr);
+    if (tr) tr->kvb_rows += (unsigned long long)H * (unsigned long long)nr;
+}
 
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
@@ -1080,9 +1126,11 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     /* Positions cached .. cached+T-1 are consecutive rows of the expanded cache (or of
      * kvs), so kv_b writes all of them in one pass, reading each position's normalised
      * latent in place at stride kvw. */
-    if (!lat)
+    if (!lat) {
         k3_mmw_batch_ld(K3_KV_AT(cached), H * kvd, ct, kvw, w->kv_b, w->wdt,
                         c->kv_lora, H * kvd, T);
+        if (tr) tr->kvb_rows += (unsigned long long)T * (unsigned long long)H * kvd;
+    }
 
     /* ---- attention, per head, causal. Position t leaves its heads' outputs in its own
      * row of acc, so the gate and o_proj below can take every position in one pass. ---- */
@@ -1093,12 +1141,11 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             /* Pass one: rebuild each cached position's KEYS once and score it against
              * every head. Only kv_b's key rows (W_uk: rows h*kvd .. h*kvd + qn - 1 of
              * head h) are applied, which is all this pass reads; each lands in kb where
-             * a whole application puts it, the same float (k3_mmw_rows). Transposing the
-             * loops is what keeps the rebuild count at one per position rather than one
-             * per (position, head). */
+             * a whole application puts it, the same float (k3_mla_rebuild). Transposing
+             * the loops is what keeps the rebuild count at one per position rather than
+             * one per (position, head). */
             for (int s = 0; s <= p; s++) {
-                k3_mmw_rows(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd, kvd,
-                            0, qn);
+                k3_mla_rebuild(kb, K3_LAT_AT(s), w, c, 0, qn, tr);
                 const float *kr = K3_ROPE_AT(s);
                 for (int h = 0; h < H; h++) {
                     const float *qt = q + ((size_t)t * H + h) * qh;
@@ -1136,8 +1183,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
              * Each o[j] still receives its terms s ascending, which is the order the
              * sum must keep. */
             for (int s = 0; s <= p; s++) {
-                k3_mmw_rows(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd, kvd,
-                            qn, vh);
+                k3_mla_rebuild(kb, K3_LAT_AT(s), w, c, qn, vh, tr);
                 for (int h = 0; h < H; h++) {
                     const float pr = sc[(size_t)h * (last + 1) + s];
                     float *o = acct + (size_t)h * vh;
@@ -2480,8 +2526,9 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
 void k3_matmul_bf16_rows(float *y, const float *x, const uint16_t *W, int in, int out,
                          int blk, int r0, int nr)
 {
-    if (blk <= 0 || nr <= 0 || out <= 0) return;
-    const int n16 = in & ~15, n = out / blk * nr;
+    const int n = k3_rows_selected("k3_matmul_bf16_rows", out, blk, r0, nr);
+    const int n16 = in & ~15;
+    if (n == 0) return;
     double *const xd = k3_bf16_hoist(x, in);
 
     const int npair = (n + 1) / 2;
@@ -2585,10 +2632,10 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
 void k3_matmul_q8_rows(float *y, const float *x, const void *W, int in, int out, int blk,
                        int r0, int nr)
 {
-    if (blk <= 0 || nr <= 0 || out <= 0) return;
+    const int n = k3_rows_selected("k3_matmul_q8_rows", out, blk, r0, nr);
+    if (n == 0) return;
     const unsigned char *base = (const unsigned char *)W;
     const size_t rowb = (size_t)4 + (size_t)in;
-    const int n = out / blk * nr;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (n > 64)
 #endif

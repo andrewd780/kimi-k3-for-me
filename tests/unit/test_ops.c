@@ -14,6 +14,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <signal.h>            /* SIGABRT: the row-selection check, t_matmul_rows */
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #include "json.h"
 #include "k3.h"
@@ -1674,7 +1679,41 @@ static void t_matmul_batch(void)
  * last pair is one row) and in a run (a pair then spans two blocks), counts below and
  * above the OpenMP threshold, the fixture's and K3's kv_b head layouts, and every
  * in % 16 tail that matters; half the cases use cancelling operands, where a row summed
- * in any other order changes its float, and one set carries NaNs. */
+ * in any other order changes its float, and one set carries NaNs. An empty selection
+ * must write nothing, and where the platform can fork, a selection that names rows
+ * outside the matrix must abort before writing anything (see refuses_selection). */
+#ifndef _WIN32
+/* Run one row-selection kernel (0 fp32, 1 bf16, 2 int8) on a selection in a child
+ * process and report whether it aborted. The buffers are large and the pointers sit in
+ * their middle, so a kernel that skipped its check would still stay inside them on the
+ * selections used here and return: an abort can then only be the check's, even under
+ * ASan, whose report on a stray write would also end in abort(). */
+static int refuses_selection(int kernel, int out, int blk, int r0, int nr)
+{
+    enum { IN = 16, ROWS = 256 };
+    static float y[2 * ROWS], x[IN], wf[2 * ROWS * IN];
+    static uint16_t wb[2 * ROWS * IN];
+    static unsigned char w8[2 * ROWS * (4 + IN)];
+    fflush(stdout);
+    fflush(stderr);
+    const pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(3);   /* the FATAL message */
+        if (kernel == 0)
+            k3_matmul_rows(y + ROWS, x, wf + ROWS * IN, IN, out, blk, r0, nr);
+        else if (kernel == 1)
+            k3_matmul_bf16_rows(y + ROWS, x, wb + ROWS * IN, IN, out, blk, r0, nr);
+        else
+            k3_matmul_q8_rows(y + ROWS, x, w8 + ROWS * (4 + IN), IN, out, blk, r0, nr);
+        _exit(0);                                          /* returned: not refused */
+    }
+    int st = 0;
+    if (waitpid(pid, &st, 0) != pid) return 0;
+    return WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT;
+}
+#endif
+
 static void t_matmul_rows(void)
 {
     static const int ins[] = {1, 5, 16, 17, 33, 100, 257};
@@ -1772,26 +1811,74 @@ static void t_matmul_rows(void)
             free(Wb); free(Wf); free(W8); free(x); free(Yr); free(Ys);
         }
 
-    /* Selecting no rows writes nothing, through every tag. */
+    /* Selecting no rows writes nothing: each of the three kernels, and k3_mmw_rows under
+     * the fp32, bf16 and int8 tags and for a stream with apply_rows (a stream without it
+     * computes every row, which k3_mmw_rows's contract allows). */
     {
         float y[4] = {SENT, SENT, SENT, SENT}, x[3] = {1.0f, 2.0f, 3.0f};
         const float wf[12] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
         const uint16_t wb[12] = {0x3F80, 0x4000, 0x4040, 0x4080, 0x40A0, 0x40C0,
                                  0x40E0, 0x4100, 0x4110, 0x4120, 0x4130, 0x4140};
+        unsigned char w8[4 * 7];
+        for (int o = 0; o < 4; o++) {
+            const float sc = 0.5f;
+            memcpy(w8 + o * 7, &sc, 4);
+            for (int i = 0; i < 3; i++) w8[o * 7 + 4 + i] = (unsigned char)(o + i + 1);
+        }
+        MockStream ms; memset(&ms, 0, sizeof ms);
+        ms.s.apply = mock_apply;
+        ms.s.apply_rows = mock_apply_rows;
+        ms.W = wb;
         k3_matmul_rows(y, x, wf, 3, 4, 2, 1, 0);
         k3_matmul_bf16_rows(y, x, wb, 3, 4, 2, 1, 0);
+        k3_matmul_q8_rows(y, x, w8, 3, 4, 2, 1, 0);
+        k3_mmw_rows(y, x, wf, K3_WF32, 3, 4, 2, 1, 0);
+        k3_mmw_rows(y, x, wb, K3_WBF16, 3, 4, 2, 1, 0);
+        k3_mmw_rows(y, x, w8, K3_WI8, 3, 4, 2, 1, 0);
+        k3_mmw_rows(y, x, &ms, K3_WSTREAM, 3, 4, 2, 1, 0);
         cases++;
-        for (int o = 0; o < 4; o++)
-            if (y[o] != SENT) { bad++; snprintf(where, sizeof where, "empty selection"); break; }
+        int ok = ms.rows_calls == 1 && ms.calls == 0;
+        for (int o = 0; o < 4; o++) ok &= y[o] == SENT;
+        if (!ok) { bad++; snprintf(where, sizeof where, "empty selection"); }
     }
 
+#ifndef _WIN32
+    /* A selection that names rows outside the matrix aborts, in each kernel, before it
+     * writes: a run past the block's end (rows 5..9 of blocks of 8, which unchecked writes
+     * y[24] and y[25] of a 24-row matrix), a block that does not divide the rows, a
+     * negative start, a zero block and a negative count. The valid edges (a run ending at
+     * the block's end, an empty selection) are the cases above. */
+    {
+        static const int badsel[][4] = {{24, 8, 5, 5}, {24, 7, 0, 3}, {24, 8, -1, 2},
+                                        {24, 0, 0, 1}, {24, 8, 0, -1}};
+        for (int k = 0; k < 3; k++)
+            for (size_t i = 0; i < sizeof badsel / sizeof *badsel; i++) {
+                cases++;
+                if (!refuses_selection(k, badsel[i][0], badsel[i][1], badsel[i][2],
+                                       badsel[i][3])) {
+                    bad++;
+                    snprintf(where, sizeof where, "%s accepted out=%d blk=%d r0=%d nr=%d",
+                             k == 0 ? "k3_matmul_rows" : k == 1 ? "k3_matmul_bf16_rows"
+                                                                : "k3_matmul_q8_rows",
+                             badsel[i][0], badsel[i][1], badsel[i][2], badsel[i][3]);
+                }
+            }
+    }
+#endif
+
     if (bad) {
-        printf("  FAIL  matmul_rows    %ld/%ld cases differ from the full kernels or wrote an "
-               "unselected row, e.g. %s\n", bad, cases, where);
+        printf("  FAIL  matmul_rows    %ld/%ld cases differ from the full kernels, wrote "
+               "an unselected row or accepted a bad selection, e.g. %s\n", bad, cases,
+               where);
         g_fail++;
     } else {
+#ifndef _WIN32
+        const char *also = ", bad selections abort";
+#else
+        const char *also = "";                       /* no fork: not checked here */
+#endif
         printf("  PASS  matmul_rows    %ld cases, selected rows bit-identical to the full "
-               "kernels under every tag, no other row written\n", cases);
+               "kernels under every tag, no other row written%s\n", cases, also);
         g_pass++;
     }
 }

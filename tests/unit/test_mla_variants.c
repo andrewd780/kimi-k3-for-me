@@ -32,7 +32,12 @@
  *      engine's loop once did, counts more; one that applied the wrong half in a pass
  *      counts the same at K3 geometry, where the halves are equal, and fails 1 and 3.
  *      The prefill-shaped case C=0, T=256 is where L0's count is quadratic: 32,896
- *      against L1's 256.
+ *      against L1's 256. Those counts are the benchmark copies'. THE ENGINE'S OWN GATE
+ *      is the same closed form on the rows k3_mla_cached itself applies, which its trace
+ *      hook counts (K3MlaTrace.kvb_rows) in the one call each latent pass rebuilds
+ *      through: the latent layout must make L0's count and the expanded layout E's, in
+ *      every case. An engine pass that applied kv_b any other way, such as the whole
+ *      matrix through k3_mmw, goes uncounted and fails it.
  *   8. All of the above again on CANCELLING layers (see synth_cancelling), built so that
  *      summing any score chain in another order changes its float. On the ordinary
  *      layers it almost never would, so without these the memcmp gates could not see a
@@ -334,11 +339,15 @@ static void run_engine(Run *r, const Case *K, int latent)
     run_alloc_trace(r, K->T, c->n_heads, c->v_head, N);
     r->out = (float *)xmalloc((size_t)K->T * c->hidden * sizeof(float));
     cache_copy(&r->cache, latent ? &K->lat : &K->exp_, c, latent);
-    K3MlaTrace tr = {N, r->probe, r->z, r->quot, r->acc};
+    K3MlaTrace tr = {N, r->probe, r->z, r->quot, r->acc, 0};
     k3_mla_trace = &tr;
     k3_mla_cached(r->out, K->xnew, K->w, c, K->T, scr, r->cache.kv, r->cache.rope, K->C,
                   K->cap, latent);
     k3_mla_trace = NULL;
+    /* the kv_b rows the engine applied, in applications, as mla_kvb_applications counts
+     * the variants' */
+    r->kvb = (double)tr.kvb_rows
+             / ((double)c->n_heads * (double)(c->qk_nope + c->v_head));
     free(scr);
 }
 
@@ -531,7 +540,15 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
           "%s C=%d T=%d: softmax normalisers differ between E, E+ and L0", geom, C, T);
     CHECK(same(rEP.quot, rE.quot, qb) && same(rL0.quot, rE.quot, qb),
           "%s C=%d T=%d: probability quotients differ between E, E+ and L0", geom, C, T);
-    /* 7. kv_b applications */
+    /* 7. kv_b applications: the engine's own, through its trace hook, then the copies' */
+    CHECK(eng_l.kvb == mla_rebuilds(MLA_L0, T, C, 0),
+          "%s C=%d T=%d: the latent engine applied %.2f kv_b applications (its trace's "
+          "kvb_rows), L0's closed form is %.0f", geom, C, T, eng_l.kvb,
+          mla_rebuilds(MLA_L0, T, C, 0));
+    CHECK(eng_x.kvb == mla_rebuilds(MLA_E, T, C, 0),
+          "%s C=%d T=%d: the expanded engine applied %.2f kv_b applications (its trace's "
+          "kvb_rows), E's closed form is %.0f", geom, C, T, eng_x.kvb,
+          mla_rebuilds(MLA_E, T, C, 0));
     check_count(&rE, MLA_E, C, T, 0, geom);
     check_count(&rEP, MLA_EP, C, T, 0, geom);
     check_count(&rL0, MLA_L0, C, T, 0, geom);

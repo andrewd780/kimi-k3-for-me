@@ -40,10 +40,12 @@ the whole matrix and used half of it, twice that arithmetic (~604 MMAC); the row
 pass uses are the same floats either way.
 
 Under `--trunk-rows`, where `kv_b` is streamed, every pass rereads it for every cached
-position. From a plain `trunk.bin` a pass reads only its half, one read per head's 128
-rows (96 reads of 128 KiB instead of three 8 MiB tiles). A compressed `trunk.bin.k3z`
-decodes a whole 1 MiB block behind every read, four heads' worth of `kv_b`, so there a
-pass reads the whole matrix, as before, and applies only its half.
+position. From a plain `trunk.bin` a pass requests only its half, one read per head's
+128 rows (96 reads of 128 KiB instead of three 8 MiB tiles; O_DIRECT rounds each to
+whole 4 KiB pages, a small overhead at this size and none of the saving on a matrix
+whose runs are shorter than a page). A compressed `trunk.bin.k3z` decodes a whole 1 MiB
+block behind every read, four heads' worth of `kv_b`, so there a pass reads the whole
+matrix, as before, and applies only its half.
 
 **No speed claim is made here.** Nothing in this note was timed on the released
 checkpoint. The direction is not in question -- rebuilding is strictly more arithmetic

@@ -216,29 +216,44 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The latent branch of `k3_mla_cached` rebuilds every cached position twice per query
   token, but the score pass reads only each head's key rows (W_uk) and the value pass
   only its value rows (W_uv), and both used to apply all 24,576 rows of `kv_b`. Each
-  pass now applies its own 12,288 rows through the new `k3_mmw_rows`
-  (`k3_matmul_rows`, `k3_matmul_bf16_rows`, `k3_matmul_q8_rows`), still one OpenMP
-  region and one widening of x per call: one `kv_b` application's worth, 12.6M
-  multiply-adds, per cached position per query token instead of two. The matvec is
-  row-independent and every selected row runs the per-row code the full kernels run
-  (now shared and always inlined; on the x86 AVX-512 build the full kernels' outlined
-  loops compile to the same instruction counts as before), so every score, normaliser,
-  quotient and logit is unchanged: `test_mla_variants` (with the engine's scratch now
-  poisoned) and GATE 3b hold it bitwise, and a new `test_ops` gate, `matmul_rows`, holds
-  the three kernels and every weight tag to the full kernels and checks that no other
-  row is written (test_ops now reports 25 checks; the CI and `tools/bench_kda.py`
-  tripwires expect 25). Under `--trunk-rows` a pass reads only its half of `kv_b` from
-  a plain `trunk.bin`, at K3 geometry 96 reads of 128 KiB instead of three 8 MiB
-  tiles, which `test_trunk` checks byte for byte; a compressed trunk still reads whole
-  tiles and applies only the selected rows, since reading head by head would decode
-  each 1 MiB block about four times per pass. `bench_mla counts` now counts `kv_b` in
-  whole-matrix equivalents (rows applied), so L0's closed form is T(C+1) + T(T-1)/2,
-  half the old one: 257 at C = 256, T = 1 (was 514) and 32,896 at a 256-token prefill
-  (was 65,792). In an informal timing on the 4-core VM, L0 at C = 256, T = 1 on four
-  threads went from 325-381 ms to 177-210 ms per call, beside about 10%
-  process-to-process noise; see [the note](docs/notes/mla-variants.md). **Public
-  API:** `K3WeightStream` gains a third optional callback, `apply_rows` (NULL falls
-  back to `apply`, every row), so a stream built on the stack must zero it too.
+  pass now applies its own 12,288 rows through the new `k3_mmw_rows` (`k3_matmul_rows`,
+  `k3_matmul_bf16_rows`, `k3_matmul_q8_rows`), still one OpenMP region and one widening
+  of x per call: one `kv_b` application's worth, 12.6M multiply-adds, per cached
+  position per query token instead of two. The matvec is row-independent and every
+  selected row runs the per-row code the full kernels run (now shared and always
+  inlined; the full kernels' outlined loops were compared on this x86 AVX-512 build
+  only, where they compile to the same instruction counts as before), so every score,
+  normaliser, quotient and logit is unchanged: `test_mla_variants` (with the engine's
+  scratch now poisoned) and GATE 3b hold it bitwise. The engine's own count is gated
+  too: its trace hook counts the `kv_b` rows each call applies (`K3MlaTrace.kvb_rows`,
+  new), and `test_mla_variants` holds the latent layout to L0's closed form and the
+  expanded one to E's in every case, so a pass that went back to applying the whole
+  matrix fails even though its bits are the same. A new `test_ops` gate, `matmul_rows`,
+  holds the three kernels and every weight tag to the full kernels, checks that no other
+  row is written, and where the platform can fork, that a selection naming rows outside
+  the matrix aborts, which the kernels now check (test_ops reports 25 checks; the CI and
+  `tools/bench_kda.py` tripwires expect 25). Under `--trunk-rows` a pass requests only
+  its half of `kv_b` from a plain `trunk.bin`, at K3 geometry 96 reads of 128 KiB
+  instead of three 8 MiB tiles. The saving is in requested bytes and appears at that
+  geometry: under O_DIRECT a run shorter than a 4 KiB page still costs a page, so on
+  `test_trunk`'s fixture, whose `kv_b` runs are 32 bytes, the key half requests at least
+  as many bytes as a full pass. `test_trunk` checks the exact requested bytes and matrix
+  calls of each selection and of a whole `--kv-latent` step of `k3_mla_cached`, against
+  the resident layer bitwise. A compressed trunk still reads whole tiles and applies
+  only the selected rows, since reading head by head would decode each 1 MiB block about
+  four times per pass; the run report's new `trunk_rows_whole_tiles` says which, and
+  `test_offline_cli.py` asserts it is true for a real compressed trunk and false for a
+  plain one. `bench_mla counts` now counts `kv_b` in whole-matrix equivalents (rows
+  applied), so L0's closed form is T(C+1) + T(T-1)/2, half the old one: 257 at C = 256,
+  T = 1 (was 514) and 32,896 at a 256-token prefill (was 65,792). An informal timing on
+  the 4-core VM, not a measurement against variance: L0 at C = 256, T = 1 on four
+  threads, three processes per binary, went from per-process medians of 325-381 ms to
+  177-210 ms per call. L1's medians moved too, from 174-194 to 147-163 ms, and since
+  this change also refactored the `k3_matmul_bf16` that L1's rebuilds run on, that shift
+  cannot be separated from noise; see [the note](docs/notes/mla-variants.md). **Public
+  API:** `K3WeightStream` gains a third optional callback, `apply_rows` (NULL falls back
+  to `apply`, every row), so a stream built on the stack must zero it too; `K3MlaTrace`
+  gains `kvb_rows`, which a caller building one must zero.
 - **Decode matmul kernels do less work per weight, with the same bits.** `k3_matmul`,
   `k3_matmul_bf16` and `k3_matmul_mxfp4` widen x to double once per call instead of once
   per row (x86 reads it in an even/odd layout that drops the bf16 zero-extend shuffles);

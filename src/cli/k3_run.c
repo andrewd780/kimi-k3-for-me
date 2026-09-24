@@ -427,9 +427,10 @@ static void usage(FILE *f)
 "  --kv-latent           cache MLA's compressed latent instead of the expanded k and\n"
 "                        v, and rebuild them on use: 0.055 MB per position instead of\n"
 "                        2.37, at the cost of one kv_b matmul's worth per cached\n"
-"                        position per step (its key rows to score, its value rows\n"
-"                        to weight). Logits are bitwise identical either way. Needs\n"
-"                        --incremental\n"
+"                        position per query token (per step at T = 1; prefill and\n"
+"                        --spec verification pay it per position): its key rows to\n"
+"                        score, its value rows to weight. Logits are bitwise\n"
+"                        identical either way. Needs --incremental\n"
 "  --save-state PATH     write the carried state after the run, so the next turn of a\n"
 "                        conversation resumes instead of re-reading the whole prompt\n"
 "  --load-state PATH     resume from a saved state; the prompt given now is treated as\n"
@@ -2217,7 +2218,7 @@ int main(int argc, char **argv)
                 "\"model_resident_bytes\":%zu,\"model_stream_buffer_bytes\":%zu,"
                 "\"memory_plan_bytes\":%.0f,\"trunk_rows\":%s,"
                 "\"trunk_row_buffer_bytes\":%llu,\"trunk_small_buffer_bytes\":%llu,"
-                "\"trunk_matrix_calls\":%llu,"
+                "\"trunk_matrix_calls\":%llu,\"trunk_rows_whole_tiles\":%s,"
                 "\"stopped_at\":%d,"
                 "\"decode_steps\":%d,\"forward_sweeps\":%ld,\"spec_n\":%d,"
                 "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
@@ -2242,7 +2243,9 @@ int main(int argc, char **argv)
                 memory_plan_bytes, trunk_rows ? "true" : "false",
                 (unsigned long long)(w.trunk ? w.trunk->row_buffer_bytes : 0),
                 (unsigned long long)(w.trunk ? w.trunk->small_buffer_bytes : 0),
-                (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0), stopped_at,
+                (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0),
+                trunk_rows && w.trunk && w.trunk->rows_whole_tiles ? "true" : "false",
+                stopped_at,
                 steps, w.forwards, spec_n, spec_sweeps, spec_drafted, spec_accepted,
                 spec_full, spec_partial, spec_cut, spec_dropped,
                 spec_log_bytes,

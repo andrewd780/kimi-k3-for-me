@@ -143,6 +143,11 @@ class OfflineCliTests(unittest.TestCase):
                     rows = self.run_cli(self.selective, [*args, "--trunk-rows", "--expert-pipeline"])
                     self.assert_same(baseline, rows)
                     self.assertTrue(rows[0]["trunk_rows"])
+                    # A compressed trunk reads a --kv-latent row selection in whole-matrix
+                    # tiles (each block would otherwise be decoded once per head run), a
+                    # plain one only the selected rows (rows_run in src/io/k3_trunk.c).
+                    self.assertEqual(rows[0]["trunk_rows_whole_tiles"], trunk == self.ztrunk)
+                    self.assertFalse(baseline[0]["trunk_rows_whole_tiles"])
                     self.assertEqual(rows[0]["trunk_ring_slots"], 2)
                     self.assertGreater(rows[0]["trunk_matrix_calls"], 0)
                     self.assertLess(rows[0]["trunk_row_buffer_bytes"] +
