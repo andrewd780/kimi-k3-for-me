@@ -570,7 +570,8 @@ extern long k3_expert_drops;
  *
  * --kv-latent caches the kv_lora_rank latent instead and rebuilds k and v on use, at
  * 0.055 MB per position: the same five rows become 0.23, 0.91, 1.81 and 7.25 GB, and
- * the 1M context 58.0 GB. It buys that with a kv_b matmul per cached position per step.
+ * the 1M context 58.0 GB. It buys that with one kv_b matmul's worth per cached position
+ * per step, applied in two halves: the key rows to score, the value rows to weight.
  *
  * The CLI computes the requirement for the request it was given and refuses, with both
  * figures side by side, when it will not fit in available memory. Reaching the model's
@@ -587,7 +588,8 @@ extern long k3_expert_drops;
 #define K3_KV_BYTES_PER_POS 2370000.0
 
 /* The same, with --kv-latent: 24 x (512 latent + 64 rope) x 4 = 55,296 B, 42.8x less.
- * k and v are rebuilt through kv_b on every use instead of being stored. */
+ * k and v are rebuilt through kv_b on every use instead of being stored, k from its key
+ * rows for the scores and v from its value rows for the values (k3_mmw_rows). */
 #define K3_KV_LATENT_BYTES_PER_POS 55296.0
 
 /* idx and wt must each hold topk entries; scratch holds k3_moe_scratch(c, T) floats. */

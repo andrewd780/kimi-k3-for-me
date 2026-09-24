@@ -28,12 +28,22 @@ never rebuilt. `k` and `v` are rebuilt through `kv_b` at the moment they are use
 
 ## The compute that buys it
 
-Every cached position must be rebuilt on every step, and `kv_b` is 24576x512, so each
-rebuild is 12.6M MACs. It is paid **twice** per query token: once to score, once to
-weight the values, because softmax needs every score before any value may be used, and
-holding the rebuilt block across the two passes would mean holding the expanded cache
-again, which is the thing being avoided. That is ~604 MMAC per cached position per token
-across the 24 MLA layers, against zero for the expanded cache.
+Every cached position must be rebuilt on every step, and `kv_b` is 24576x512, 12.6M
+MACs. The rebuild comes in two halves, because softmax needs every score before any
+value may be used: the score pass applies only `kv_b`'s key rows (W_uk, 12,288 rows) and
+the value pass only its value rows (W_uv, the other 12,288), each through `k3_mmw_rows`.
+Holding the rebuilt block across the two passes would mean holding the expanded cache
+again, which is the thing being avoided. That is one `kv_b`'s worth per cached position
+per query token, ~302 MMAC per cached position per token across the 24 MLA layers,
+against zero for the expanded cache. Until commit ea6f419 (2026-09-24) each pass applied
+the whole matrix and used half of it, twice that arithmetic (~604 MMAC); the rows each
+pass uses are the same floats either way.
+
+Under `--trunk-rows`, where `kv_b` is streamed, every pass rereads it for every cached
+position. From a plain `trunk.bin` a pass reads only its half, one read per head's 128
+rows (96 reads of 128 KiB instead of three 8 MiB tiles). A compressed `trunk.bin.k3z`
+decodes a whole 1 MiB block behind every read, four heads' worth of `kv_b`, so there a
+pass reads the whole matrix, as before, and applies only its half.
 
 **No speed claim is made here.** Nothing in this note was timed on the released
 checkpoint. The direction is not in question -- rebuilding is strictly more arithmetic
@@ -43,12 +53,14 @@ threads and context length, and an untimed number would be a guess.
 ## Why the output is identical rather than close
 
 The stored latent is exactly the bytes the expanded path fed to `kv_b`, and the rebuild
-calls the same kernel, which is deterministic per output row. The attention loops are
-transposed (position outer, head inner) so that one rebuild serves all 96 heads, but
-every reduction keeps its order: scores are formed position-ascending, the running max
-is taken position-ascending, and each output element accumulates position-ascending, per
-head. Reordering any of those would be a different number in the last bits, which is why
-the gate compares floats and not argmaxes.
+computes each row it uses with the same kernel code, which is deterministic per output
+row: applying the key rows in one call and the value rows in another changes which rows
+are computed, never how a row is summed. The attention loops are transposed (position
+outer, head inner) so that one rebuild serves all 96 heads, but every reduction keeps
+its order: scores are formed position-ascending, the running max is taken
+position-ascending, and each output element accumulates position-ascending, per head.
+Reordering any of those would be a different number in the last bits, which is why the
+gate compares floats and not argmaxes.
 
 ## Interop
 

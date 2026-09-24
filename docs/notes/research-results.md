@@ -50,9 +50,10 @@ the evidence. Each is corrected in place; this list is the index.
 - **Research queue "18.73 s of disk" and the 1.09x ceiling**: the I/O share cannot be
   a pure disk service time at the host's recorded rates, and the eightfold cut is
   stated for the trunk matmul only ([queue](research-queue.md)).
-- **MLA variants**: L0's "twice per query token" applies all of kv_b on both passes
-  and uses half each time; a row split halves it at identical bits, and the 2x credited
-  to L1 at T = 1 is that waste ([note](mla-variants.md#the-decode-shapes-c-cached-positions-t--1-or-5-new-tokens)).
+- **MLA variants**: L0's "twice per query token" applied all of kv_b on both passes
+  and used half each time, and the 2x credited to L1 at T = 1 was that waste. The row
+  split was then made at identical bits, in the engine (ea6f419) and in L0 (5f5208c),
+  and the note's counts are the ones after it ([note](mla-variants.md#the-decode-shapes-c-cached-positions-t--1-or-5-new-tokens)).
 - **Trunk rows tests**: the wraparound walk shares its code path with any layer
   boundary; layers 1 to 92 of the fixture hold one-tile matrices; the sanitizer jobs
   build without OpenMP, so the error-flag race was not seen by ThreadSanitizer; the
@@ -110,7 +111,9 @@ streaming does. That holds at any prompt length: the MoE deduplicates routed exp
 over sub-chunks of 64 positions, but its five trunk matrices span the whole batch.
 `test_offline_cli.py` checks that 1-, 3-, 8-, 65-, 129- and 130-token forwards read
 identical bytes. Before that change prefill reread each matrix for every token.
-`--kv-latent` still rereads `kv_b` for every cached position it rebuilds.
+`--kv-latent` still rereads `kv_b` for every cached position it rebuilds: from a plain
+`trunk.bin` only the rows each pass applies, half the matrix, and from a compressed
+trunk the whole matrix, whose blocks would otherwise be decoded once per head.
 Inspect `trunk_matrix_calls` and `trunk_bytes_read`; lower memory does not prove
 lower latency. Cross-matrix and cross-layer prefetch are not implemented.
 Compressed archives may decode a block repeatedly across small reads. The byte

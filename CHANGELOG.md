@@ -64,16 +64,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   probability quotients the output rounds away, which the engine exposes through a new
   test-only hook, `k3_mla_trace` (NULL outside tests); a mutation run shows the gate
   catches reordered chains in the variants and in both engine layouts. `bench_mla
-  counts` counts kv_b applications: at a 256-token prefill L0 makes 65,792 per layer and
-  L1 256 (L0 applies all of kv_b on both of its passes and uses only the key rows in
-  one and the value rows in the other, so a row split would halve its count at
-  identical bits; found in review, not done). A differs from E by ~1e-6 relative, as
-  much as E differs from a double reference, with no argmax change in 3 x 10,000
-  attention-score rows of a flat synthetic softmax; it is not bitwise, so it
-  cannot be a mode under the exactness contract. Timed on the idle 4-core VM with the
+  counts` counts kv_b applications: at a 256-token prefill L0 makes 32,896 per layer and
+  L1 256 (L0 applied all of kv_b on both of its passes and used only the key rows in one
+  and the value rows in the other, 65,792 applications; the row split that halves that
+  at identical bits was found in review and is now done, see Changed). A differs from E
+  by ~1e-6 relative, as much as E differs from a double reference, with no argmax change
+  in 3 x 10,000 attention-score rows of a flat synthetic softmax; it is not bitwise, so
+  it cannot be a mode under the exactness contract. Timed on the idle 4-core VM with the
   shipped kernels (one layer, four threads): E+ is 4.8-5.5x faster than E for one new
-  token and 6.6-15x for five; L1 halves L0 at decode and takes a 256-token prefill from
-  43 s to 0.53 s per layer, but rebuilding stays 34-51x slower than E+ at decode; A is
+  token and 6.6-15x for five; L1 halved the L0 of that study at decode and takes a
+  256-token prefill from its 43 s to 0.53 s per layer, but rebuilding stays 34-51x
+  slower than E+ at decode; A is
   the fastest at long contexts. The hosted macOS arm64 and Ubuntu runs pass the same
   gates and counts. See [the note](docs/notes/mla-variants.md).
 - **Fixed-width trunk dictionary gates** (benchmark-only, not in inference): a
@@ -113,7 +114,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two 93-layer row walks with wraparound over position-dependent fixture bytes
   (`test_trunk_rows`), ThreadSanitizer and ASan/UBSan. A batch of
   positions reads each matrix once (see the batched matmul entry above); `--kv-latent`
-  still rereads `kv_b` per rebuilt position. `--trunk-gb` caps the two buffers in this
+  still rereads `kv_b` per rebuilt position, from a plain `trunk.bin` only the half each
+  pass applies (see Changed). `--trunk-gb` caps the two buffers in this
   mode and the memory plan charges the whole budget, so pass a small one; the run
   report gives the mode's binds, matrix passes, reader tile time and main-thread
   waits. No full-model speedup is claimed. Fixes the trunk JSON ownership leak, which
@@ -158,10 +160,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-head k and v through `kv_b` on every use, which is what MLA's own design caches.
   That is 0.055 MB per position across the 24 MLA layers instead of 2.37 MB, 42.8x less,
   and it turns a 131,072-position context from 310.04 GB of cache into 7.25 GB. It is
-  paid for in arithmetic: every cached position is re-expanded twice per decode step,
-  once to score and once to weight the values. Output is BITWISE identical, not close:
-  the latent stored is exactly the bytes the expanded path fed to `kv_b`, the rebuild
-  uses the same kernel, and every softmax reduction keeps its order, so GATE 3b of the
+  paid for in arithmetic: every cached position is re-expanded on every decode step,
+  its key rows to score and its value rows to weight the values, one `kv_b`
+  application's worth (see Changed for the row split). Output is BITWISE identical, not
+  close: the latent stored is exactly the bytes the expanded path fed to `kv_b`, the
+  rebuild computes each row with the same kernel code, and every softmax reduction
+  keeps its order, so GATE 3b of the
   oracle compares all logits of all steps rather than tokens. The memory plan, the KV
   line and `k3_run.json` report the layout actually allocated; `--save-state` records it
   in the header and a cross-layout `--load-state` is refused by name rather than read at
@@ -208,6 +212,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--kv-latent` applies only the `kv_b` rows each pass reads, with the same bits.**
+  The latent branch of `k3_mla_cached` rebuilds every cached position twice per query
+  token, but the score pass reads only each head's key rows (W_uk) and the value pass
+  only its value rows (W_uv), and both used to apply all 24,576 rows of `kv_b`. Each
+  pass now applies its own 12,288 rows through the new `k3_mmw_rows`
+  (`k3_matmul_rows`, `k3_matmul_bf16_rows`, `k3_matmul_q8_rows`), still one OpenMP
+  region and one widening of x per call: one `kv_b` application's worth, 12.6M
+  multiply-adds, per cached position per query token instead of two. The matvec is
+  row-independent and every selected row runs the per-row code the full kernels run
+  (now shared and always inlined; on the x86 AVX-512 build the full kernels' outlined
+  loops compile to the same instruction counts as before), so every score, normaliser,
+  quotient and logit is unchanged: `test_mla_variants` (with the engine's scratch now
+  poisoned) and GATE 3b hold it bitwise, and a new `test_ops` gate, `matmul_rows`, holds
+  the three kernels and every weight tag to the full kernels and checks that no other
+  row is written (test_ops now reports 25 checks; the CI and `tools/bench_kda.py`
+  tripwires expect 25). Under `--trunk-rows` a pass reads only its half of `kv_b` from
+  a plain `trunk.bin`, at K3 geometry 96 reads of 128 KiB instead of three 8 MiB
+  tiles, which `test_trunk` checks byte for byte; a compressed trunk still reads whole
+  tiles and applies only the selected rows, since reading head by head would decode
+  each 1 MiB block about four times per pass. `bench_mla counts` now counts `kv_b` in
+  whole-matrix equivalents (rows applied), so L0's closed form is T(C+1) + T(T-1)/2,
+  half the old one: 257 at C = 256, T = 1 (was 514) and 32,896 at a 256-token prefill
+  (was 65,792). In an informal timing on the 4-core VM, L0 at C = 256, T = 1 on four
+  threads went from 325-381 ms to 177-210 ms per call, beside about 10%
+  process-to-process noise; see [the note](docs/notes/mla-variants.md). **Public
+  API:** `K3WeightStream` gains a third optional callback, `apply_rows` (NULL falls
+  back to `apply`, every row), so a stream built on the stack must zero it too.
 - **Decode matmul kernels do less work per weight, with the same bits.** `k3_matmul`,
   `k3_matmul_bf16` and `k3_matmul_mxfp4` widen x to double once per call instead of once
   per row (x86 reads it in an even/odd layout that drops the bf16 zero-extend shuffles);
