@@ -24,9 +24,15 @@
  *      absorbed attention bitwise, so bench_mla's numerical study measures absorption
  *      itself, not an artefact of the vectorised loop. It is NOT equal to E, and the
  *      test only checks that it is close (a wrong W_uk/W_uv split would not be).
- *   7. The kv_b applications each variant makes are exactly mla_rebuilds(): T for E
- *      and E+, 2T(C+1) + T(T-1) for L0, 2N - vcap for L1, none for A. The prefill-
- *      shaped case C=0, T=256 is where L0's count is quadratic: 65,792 against L1's 256.
+ *   7. The kv_b applications each variant makes are exactly mla_rebuilds(), counted as
+ *      whole-matrix equivalents (kv_b rows applied over kv_b's rows, which must come out
+ *      a whole number): T for E and E+, T(C+1) + T(T-1)/2 for L0 (its key rows to score
+ *      and its value rows to weight, per visible position per query token), 2N - vcap
+ *      for L1, none for A. An L0 that applied the whole matrix in either pass, as the
+ *      engine's loop once did, counts more; one that applied the wrong half in a pass
+ *      counts the same at K3 geometry, where the halves are equal, and fails 1 and 3.
+ *      The prefill-shaped case C=0, T=256 is where L0's count is quadratic: 32,896
+ *      against L1's 256.
  *   8. All of the above again on CANCELLING layers (see synth_cancelling), built so that
  *      summing any score chain in another order changes its float. On the ordinary
  *      layers it almost never would, so without these the memcmp gates could not see a
@@ -248,7 +254,7 @@ typedef struct {
     double *z;                  /* [T][H] softmax normalisers */
     double *quot;               /* [T][H][N] probability quotients e/z, before rounding */
     MlaCache cache;             /* after the call */
-    unsigned long long kvb;     /* kv_b applications the call made */
+    double kvb;                 /* kv_b applications the call made (mla_kvb_applications) */
 } Run;
 
 static void run_free(Run *r)
@@ -281,13 +287,17 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     float *ct   = (float *)xmalloc((size_t)T * kvw * sizeof(float));
     float *ql   = (float *)xmalloc((size_t)c->q_lora * sizeof(float));
     float *gbuf = (float *)xmalloc((size_t)H * vh * sizeof(float));
-    void  *scr  = xmalloc(mla_scratch_bytes(v, c, T, N, vcap));
+    const size_t scrb = mla_scratch_bytes(v, c, T, N, vcap);
+    void  *scr  = xmalloc(scrb);
+    /* Poisoned like the engine's scratch (run_engine): L0's rebuild buffer holds only key
+     * rows in its score pass and only value rows in its value pass. */
+    memset(scr, 0x7F, scrb ? scrb : 1);
     run_alloc_trace(r, T, H, vh, N);
     r->out   = (float *)xmalloc((size_t)T * E * sizeof(float));
     cache_copy(&r->cache, mla_is_latent(v) ? &K->lat : &K->exp_, c, mla_is_latent(v));
 
     mla_project(q, ct, xnew, K->w, c, T, ql);
-    const unsigned long long k0 = mla_kvb_calls;
+    const unsigned long long k0 = mla_kvb_rows;
     mla_zprobe = r->z;
     mla_qprobe = r->quot;
     set_threads(g_attend_threads);
@@ -298,7 +308,7 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     set_threads(1);
     mla_zprobe = NULL;
     mla_qprobe = NULL;
-    r->kvb = mla_kvb_calls - k0;
+    r->kvb = mla_kvb_applications(k0, c);
     /* The gate works in place, so keep the pre-gate accumulator for comparison. */
     float *acc2 = (float *)xmalloc((size_t)T * H * vh * sizeof(float));
     memcpy(acc2, r->acc, (size_t)T * H * vh * sizeof(float));
@@ -441,7 +451,7 @@ static int witness(Witness *W, const Case *K, const Run *rE)
 static void check_count(const Run *r, int v, int C, int T, int vcap, const char *geom)
 {
     const double want = mla_rebuilds(v, T, C, vcap);
-    CHECK((double)r->kvb == want, "%s C=%d T=%d: %s (vcap %d) made %llu kv_b applications, "
+    CHECK(r->kvb == want, "%s C=%d T=%d: %s (vcap %d) made %.2f kv_b applications, "
           "mla_rebuilds says %.0f", geom, C, T, MLA_NAME[v], vcap, r->kvb, want);
 }
 
@@ -822,8 +832,9 @@ static void print_witness(const char *label, const Witness *w)
 
 int main(void)
 {
-    /* {0, 256} is the prefill shape: no cache, 256 new tokens, where L0 makes 65,792
-     * kv_b applications and L1 makes 256. */
+    /* {0, 256} is the prefill shape: no cache, 256 new tokens, where L0 makes 32,896
+     * kv_b applications' worth (in 65,792 calls, a key half or a value half each) and
+     * L1 makes 256. */
     struct { int C, T; } tiny[] = {{0, 1}, {0, 3}, {1, 1}, {5, 2}, {7, 5}, {31, 4},
                                    {64, 1}, {200, 5}, {257, 3}, {0, 256}};
     struct { int C, T; } odd[] = {{0, 2}, {3, 5}, {13, 3}, {50, 7}};
