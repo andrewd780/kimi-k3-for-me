@@ -198,9 +198,10 @@ static void k3_state_fp(const K3Cfg *c, int32_t *fp)
 
 /* Positions whose logits one lm_head pass serves when a run needs EVERY position's logits
  * (--tf-check, --score-prompt, and a --spec verify sweep of spec_n + 1 <= K3_SPEC_MAX + 1
- * positions). One pass of the batched kernel covers 16 positions at hidden 7168 (see
- * k3_mm_pass in k3_ops.c), so for a resident head a larger block would buy no fewer
- * passes. A streamed head (--stream-lm-head, --ultra-low-memory) is read from disk once
+ * positions). One pass of the batched kernel covers 16 positions at hidden 7168 on x86
+ * (see k3_mm_pass in k3_ops.c; on NEON, K3_MM_TB = 2, a pass covers 18), so for a
+ * resident head a larger block would buy no fewer passes on x86. A streamed head
+ * (--stream-lm-head, --ultra-low-memory) is read from disk once
  * per block, 16x less than once per position; a larger block would cut that further but
  * costs a vocab row (0.66 MB) per position, and 16 keeps the buffer at 10.5 MB. */
 #define K3_LOGIT_ROWS 16
@@ -397,7 +398,8 @@ static void usage(FILE *f)
 "  --trunk-gb X          trunk ring / pinned-layer budget\n"
 "  --trunk-rows          exact double-buffered matrix rows; needs --trunk\n"
 "                        bounded buffers, no pins; a batch of positions reads each\n"
-"                        matrix once (--kv-latent still rereads kv_b per position).\n"
+"                        matrix once (--kv-latent still rereads kv_b per position,\n"
+"                        from a plain trunk.bin only the half each pass applies).\n"
 "                        --trunk-gb (default 16) then caps two row buffers of at most\n"
 "                        8 MiB each plus the current layer's vectors, and the memory\n"
 "                        plan charges the whole budget; pass a small one\n"
@@ -424,9 +426,11 @@ static void usage(FILE *f)
 "  --incremental         carry KV cache and recurrent state between tokens\n"
 "  --kv-latent           cache MLA's compressed latent instead of the expanded k and\n"
 "                        v, and rebuild them on use: 0.055 MB per position instead of\n"
-"                        2.37, at the cost of one kv_b matmul per cached position per\n"
-"                        step. Logits are bitwise identical either way. Needs\n"
-"                        --incremental\n"
+"                        2.37, at the cost of one kv_b matmul's worth per cached\n"
+"                        position per query token (per step at T = 1; prefill and\n"
+"                        --spec verification pay it per position): its key rows to\n"
+"                        score, its value rows to weight. Logits are bitwise\n"
+"                        identical either way. Needs --incremental\n"
 "  --save-state PATH     write the carried state after the run, so the next turn of a\n"
 "                        conversation resumes instead of re-reading the whole prompt\n"
 "  --load-state PATH     resume from a saved state; the prompt given now is treated as\n"
@@ -441,7 +445,8 @@ static void usage(FILE *f)
 "                        verify them in ONE batched sweep. Output is identical to\n"
 "                        serial decode by construction; needs --incremental. A sweep\n"
 "                        reads the trunk and lm_head once for all its positions (but\n"
-"                        --kv-latent with --trunk-rows rereads kv_b for every cached\n"
+"                        --kv-latent with --trunk-rows rereads kv_b, from a plain\n"
+"                        trunk.bin the half each pass applies, for every cached\n"
 "                        position it rebuilds); each extra position still costs its\n"
 "                        own experts and arithmetic.\n"
 "                        No full-checkpoint speedup has been measured.\n"
@@ -2213,7 +2218,7 @@ int main(int argc, char **argv)
                 "\"model_resident_bytes\":%zu,\"model_stream_buffer_bytes\":%zu,"
                 "\"memory_plan_bytes\":%.0f,\"trunk_rows\":%s,"
                 "\"trunk_row_buffer_bytes\":%llu,\"trunk_small_buffer_bytes\":%llu,"
-                "\"trunk_matrix_calls\":%llu,"
+                "\"trunk_matrix_calls\":%llu,\"trunk_rows_whole_tiles\":%s,"
                 "\"stopped_at\":%d,"
                 "\"decode_steps\":%d,\"forward_sweeps\":%ld,\"spec_n\":%d,"
                 "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
@@ -2238,7 +2243,9 @@ int main(int argc, char **argv)
                 memory_plan_bytes, trunk_rows ? "true" : "false",
                 (unsigned long long)(w.trunk ? w.trunk->row_buffer_bytes : 0),
                 (unsigned long long)(w.trunk ? w.trunk->small_buffer_bytes : 0),
-                (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0), stopped_at,
+                (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0),
+                trunk_rows && w.trunk && w.trunk->rows_whole_tiles ? "true" : "false",
+                stopped_at,
                 steps, w.forwards, spec_n, spec_sweeps, spec_drafted, spec_accepted,
                 spec_full, spec_partial, spec_cut, spec_dropped,
                 spec_log_bytes,

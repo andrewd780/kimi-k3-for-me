@@ -953,13 +953,16 @@ static int run_numerics(const NumOpt *o)
 /* ================================================================== counts ==== */
 /* How many kv_b applications a call makes depends only on (C, T, vcap): the loops that
  * make them never look at the geometry. So they are counted where counting is cheap, by
- * running each variant on the fixture geometry (4 heads, kv_lora 32) with mla_kvb_calls
- * watching, and held to the closed form mla_rebuilds(); a mismatch fails the run. The
+ * running each variant on the fixture geometry (4 heads, kv_lora 32) with mla_kvb_rows
+ * watching, in whole-matrix equivalents (rows applied over kv_b's rows: L0 applies the
+ * key rows and the value rows in separate calls), and held to the closed form
+ * mla_rebuilds(); a mismatch, or a count that is not a whole number, fails the run. The
  * multiply-adds (mla_macs), bytes, and kv_b weight bytes touched are then quoted at the
  * released geometry. None of it moves with machine load, which is why this phase of the
  * study reports it and leaves wall time to a quiet machine. */
 
-/* kv_b at K3 geometry in bf16: 24,576 rows of 512, read in full by every application. */
+/* kv_b at K3 geometry in bf16: 24,576 rows of 512, read in full by every application
+ * (L0's key and value calls read half each, one application's worth together). */
 #define KVB_BYTES_K3 (24576.0 * 512.0 * 2.0)
 
 /* kv_b weight traffic per call, in whole-matrix units: one per application, except A,
@@ -989,9 +992,11 @@ static int run_counts(const CountOpt *o)
     if (mla_synth_layer(&S, &fx, K3_WBF16, 0.1f, 0.1f, 3, 0)) return 1;
     int bad = 0;
     printf("kv_b applications per call, COUNTED on the fixture geometry (the count does not\n"
-           "depend on it) and checked against mla_rebuilds(); multiply-adds and bytes at K3\n"
-           "geometry (96 heads, 128+64, v 128, kv_lora 512), one MLA layer; x24 = all MLA\n"
-           "layers. L1's value-row budget is --vbuf-mb %.0f MB at K3 geometry.\n",
+           "depend on it) in whole-matrix equivalents (L0 applies the key rows and the value\n"
+           "rows separately, one application's worth per visible position per query token)\n"
+           "and checked against mla_rebuilds(); multiply-adds and bytes at K3 geometry (96\n"
+           "heads, 128+64, v 128, kv_lora 512), one MLA layer; x24 = all MLA layers. L1's\n"
+           "value-row budget is --vbuf-mb %.0f MB at K3 geometry.\n",
            o->vbuf_mb);
     for (int ic = 0; ic < o->nC; ic++)
         for (int it = 0; it < o->nT; it++) {
@@ -1023,14 +1028,14 @@ static int run_counts(const CountOpt *o)
             for (int i = 0; i < 6; i++) {
                 const int v = rv[i];
                 void *scr = xmalloc(mla_scratch_bytes(v, &fx, T, N, rc[i]));
-                const unsigned long long k0 = mla_kvb_calls;
+                const unsigned long long k0 = mla_kvb_rows;
                 if (mla_attend(v, acc, q, ct, T, C, mla_is_latent(v) ? &lat : &ex, &S.w, &fx,
                                scr, rc[i], NULL)) {
                     fprintf(stderr, "%s refused the layer\n", MLA_NAME[v]);
                     return 1;
                 }
                 free(scr);
-                counted[i] = (double)(mla_kvb_calls - k0);
+                counted[i] = mla_kvb_applications(k0, &fx);
                 const double want = mla_rebuilds(v, T, C, rc[i]);
                 const double macs = mla_macs(v, &k3, T, C, rc[i]);
                 const double pbytes = (double)mla_cache_floats(&k3, mla_is_latent(v)) * 4.0;

@@ -25,7 +25,8 @@
  *       that is really only a better loop. Bitwise identical to E.
  *   L0  LATENT cache: the 512-float post-norm latent plus the rope row, 2,304 B per
  *       position per layer. The loop in k3_mla_cached today: every cached position is
- *       rebuilt through kv_b TWICE PER QUERY TOKEN (score pass, value pass).
+ *       rebuilt through kv_b TWICE PER QUERY TOKEN, its key rows to score it and its
+ *       value rows to weight its values (k3_mmw_rows), one application's worth in all.
  *   L1  LATENT cache, each position rebuilt ONCE PER CALL. Bitwise identical to E and
  *       L0; the argument is below.
  *   A   ABSORBED: kv_b's per-head key rows are folded into the query and its value rows
@@ -61,7 +62,9 @@
  *                within a block ascending, and one thread owns each head throughout,
  *                so no term moves.
  *   What L1 changes is only how often the kernel runs: N rebuilds per call instead of
- *   2 * sum_t (C+t+1). The value rows rebuilt in the score pass are kept in a transient
+ *   L0's sum_t (C+t+1), each of which L0 makes in two halves, the key rows to score and
+ *   the value rows to weight (a row selection computes each row through the same code,
+ *   see k3_mmw_rows). The value rows rebuilt in the score pass are kept in a transient
  *   buffer for the value pass. That buffer is H*v_head floats = 49,152 B per position
  *   -- half an expanded position -- for ONE layer at a time, reused by the next layer.
  *   `vcap` bounds it: positions at or beyond vcap are rebuilt a second time instead,
@@ -98,7 +101,8 @@
  *   rendering of the formulas above, bitwise.
  *
  * THREADING
- *   kv_b goes through k3_mmw everywhere, which splits output rows across OpenMP threads.
+ *   kv_b goes through k3_mmw or k3_mmw_rows everywhere, which split output rows across
+ *   OpenMP threads.
  *   E and L0 are otherwise single-threaded, as in the engine. E+, L1 and A split heads,
  *   positions or (query, head) pairs across threads, never a reduction. Where A calls
  *   k3_mmw inside its own parallel loop the inner region is inactive under the default
@@ -205,18 +209,51 @@ static void mla_project_kv(float *ct, const float *x, const K3MlaW *w, const K3C
     }
 }
 
-/* ONE application of kv_b: one position's latent in, all H heads' k_nope and v out.
- * Every full-matrix kv_b call in this file goes through here, so mla_kvb_calls is an
- * exact count of them. The test holds that count to mla_rebuilds() for every variant,
- * and bench_mla's `counts` mode reports it; counts, unlike timings, do not move with
- * machine load. The calls are all made from serial code (k3_mmw threads INSIDE the
- * kernel), so a plain counter is race-free. */
-static unsigned long long mla_kvb_calls;
+/* kv_b ROWS applied, by every kv_b call in this file: mla_kvb applies all H*(qk_nope +
+ * v_head) of them, mla_kvb_keys and mla_kvb_values only the key or only the value rows.
+ * mla_kvb_applications() turns a difference of this counter into APPLICATIONS, whole-
+ * matrix equivalents (rows applied over kv_b's rows), the unit mla_rebuilds() counts in
+ * and the one multiply-adds and weight bytes are proportional to. The test holds that
+ * count to mla_rebuilds() for every variant, and bench_mla's `counts` mode reports it;
+ * counts, unlike timings, do not move with machine load. The calls are all made from
+ * serial code (the kernels thread INSIDE themselves), so a plain counter is race-free. */
+static unsigned long long mla_kvb_rows;
 
+/* ONE application of kv_b: one position's latent in, all H heads' k_nope and v out. */
 static inline void mla_kvb(float *out, const float *lat, const K3MlaW *w, const K3Cfg *c)
 {
-    mla_kvb_calls++;
-    k3_mmw(out, lat, w->kv_b, w->wdt, c->kv_lora, c->n_heads * (c->qk_nope + c->v_head));
+    const int rows = c->n_heads * (c->qk_nope + c->v_head);
+    mla_kvb_rows += (unsigned long long)rows;
+    k3_mmw(out, lat, w->kv_b, w->wdt, c->kv_lora, rows);
+}
+
+/* The key rows alone (W_uk: rows h*kvd .. h*kvd + qk_nope - 1 of every head h, k_nope) or
+ * the value rows alone (W_uv: the v_head rows after them, v), each written where mla_kvb
+ * writes it and the same float (k3_mmw_rows). The other rows of out are left as they
+ * were. The engine's latent passes, and so L0's, apply kv_b this way. */
+static inline void mla_kvb_keys(float *out, const float *lat, const K3MlaW *w,
+                                const K3Cfg *c)
+{
+    const int kvd = c->qk_nope + c->v_head;
+    mla_kvb_rows += (unsigned long long)c->n_heads * (unsigned long long)c->qk_nope;
+    k3_mmw_rows(out, lat, w->kv_b, w->wdt, c->kv_lora, c->n_heads * kvd, kvd, 0, c->qk_nope);
+}
+
+static inline void mla_kvb_values(float *out, const float *lat, const K3MlaW *w,
+                                  const K3Cfg *c)
+{
+    const int kvd = c->qk_nope + c->v_head;
+    mla_kvb_rows += (unsigned long long)c->n_heads * (unsigned long long)c->v_head;
+    k3_mmw_rows(out, lat, w->kv_b, w->wdt, c->kv_lora, c->n_heads * kvd, kvd, c->qk_nope,
+                c->v_head);
+}
+
+/* kv_b applications since the counter read rows0, for geometry c: an integer whenever
+ * every rebuilt position got its key rows and its value rows alike, or the whole matrix. */
+static inline double mla_kvb_applications(unsigned long long rows0, const K3Cfg *c)
+{
+    return (double)(mla_kvb_rows - rows0)
+           / ((double)c->n_heads * (double)(c->qk_nope + c->v_head));
 }
 
 /* Store the T new tokens at positions C..C+T-1: the latent layout keeps the kv_b INPUT,
@@ -435,9 +472,11 @@ static void mla_attend_EP(float *acc, const float *q, int T, int C, const MlaCac
 }
 
 /* ------------------------------------------------------------------- L0 ---- */
-/* k3_mla_cached's latent branch, statement for statement: per query token, rebuild
- * every visible position to score it, softmax, rebuild every visible position again to
- * weight its values. The score rows have stride N (the engine's last + 1). */
+/* k3_mla_cached's latent branch, statement for statement: per query token, rebuild the
+ * key rows of every visible position to score it, softmax, rebuild the value rows of
+ * every visible position to weight its values. kb holds one position as mla_kvb lays it
+ * out; each pass writes and reads only its own half. The score rows have stride N (the
+ * engine's last + 1). */
 static void mla_attend_L0(float *acc, const float *q, int T, int C, const MlaCache *k,
                           const K3MlaW *w, const K3Cfg *c, void *scratch, float *probe)
 {
@@ -449,7 +488,7 @@ static void mla_attend_L0(float *acc, const float *q, int T, int C, const MlaCac
     for (int t = 0; t < T; t++) {
         const int p = C + t;
         for (int s = 0; s <= p; s++) {
-            mla_kvb(kb, k->kv + (size_t)s * kvl, w, c);
+            mla_kvb_keys(kb, k->kv + (size_t)s * kvl, w, c);
             const float *kr = k->rope + (size_t)s * qr;
             for (int h = 0; h < H; h++) {
                 const float *qt = q + ((size_t)t * H + h) * qh;
@@ -478,7 +517,7 @@ static void mla_attend_L0(float *acc, const float *q, int T, int C, const MlaCac
             for (int j = 0; j < vh; j++) o[j] = 0.0f;
         }
         for (int s = 0; s <= p; s++) {
-            mla_kvb(kb, k->kv + (size_t)s * kvl, w, c);
+            mla_kvb_values(kb, k->kv + (size_t)s * kvl, w, c);
             for (int h = 0; h < H; h++) {
                 const float pr = sc[(size_t)h * N + s];
                 float *o = acc + ((size_t)t * H + h) * vh;
@@ -730,13 +769,17 @@ static int mla_attend(int v, float *acc, const float *q, const float *ct, int T,
     return -1;
 }
 
-/* Full kv_b applications (mla_kvb calls) per call, the unit of latent-path cost (and,
- * under --trunk-rows, of 25 MB kv_b re-reads from disk at K3 dimensions). They depend
- * only on (C, T, vcap), never on the geometry, which is why the test and bench_mla's
- * `counts` mode can count them on the fixture geometry and quote them for K3's.
+/* kv_b applications per call, in whole-matrix equivalents (mla_kvb_applications), the
+ * unit of latent-path cost (and, under --trunk-rows, of 25 MB of kv_b read from disk at
+ * K3 dimensions). They depend only on (C, T, vcap), never on the geometry, which is why
+ * the test and bench_mla's `counts` mode can count them on the fixture geometry and
+ * quote them for K3's.
  *   E, E+  T: each new token's k and v are built once, when it is appended.
- *   L0     2 * sum_t (C + t + 1) = 2T(C + 1) + T(T - 1): every visible position, twice,
- *          per query token. At C = 0 (a prefill) that is T(T + 1), QUADRATIC in T.
+ *   L0     sum_t (C + t + 1) = T(C + 1) + T(T - 1)/2: every visible position per query
+ *          token, its key rows to score and its value rows to weight, one application's
+ *          worth in two calls (before the passes applied only their own rows, each call
+ *          was a whole application and the count was twice this). At C = 0 (a prefill)
+ *          that is T(T + 1)/2, QUADRATIC in T.
  *   L1     N + (N - vcap) with N = C + T: once per position per call, plus a second
  *          time for the positions beyond the value-row budget. LINEAR in T.
  *   A      0: A never applies the whole of kv_b to anything. Its absorption (W_uk^T q)
@@ -749,7 +792,7 @@ static inline double mla_rebuilds(int v, int T, int C, int vcap)
     if (vcap < 0) vcap = 0;
     switch (v) {
     case MLA_E: case MLA_EP: return t;                        /* appending new tokens */
-    case MLA_L0: return 2.0 * (t * ((double)C + 1.0) + t * (t - 1.0) / 2.0);
+    case MLA_L0: return t * ((double)C + 1.0) + t * (t - 1.0) / 2.0;
     case MLA_L1: return n + (n - (double)vcap);
     case MLA_A:  return 0.0;
     }

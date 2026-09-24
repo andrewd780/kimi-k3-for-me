@@ -73,9 +73,11 @@ int main(int argc, char **argv)
         bad++;
     }
 
-    /* Five positions in one streamed pass: a full register block of positions plus a
-     * remainder on every build. Each row must be the one-position projection to the bit,
-     * and the head must be read once for all five, not once per position. */
+    /* Five positions in one streamed pass: a full block of 4 plus a remainder on AVX2
+     * and NEON builds; on an AVX-512VL build (K3_MM_TB = 8) five positions run as a
+     * 4-wide sub-tile plus one, so the full 8-wide block is exercised by test_ops, not
+     * here. Each row must be the one-position projection to the bit, and the head must
+     * be read once for all five, not once per position. */
     {
         enum { NB = 5 };
         float xb[NB][7], got_b[NB][11], one[11];

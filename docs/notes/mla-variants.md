@@ -1,13 +1,20 @@
 # MLA KV-cache variants: what each one costs, and what absorbing `kv_b` changes
 
-**A benchmark and a numerical study. Nothing in the engine's arithmetic changed**; the
-only engine change is a recording hook for the test (`k3_mla_trace`, below). Four ways to run
+**A benchmark and a numerical study. Nothing in the engine's arithmetic changed**: the
+study added a recording hook for the test (`k3_mla_trace`, below), and the review that
+followed it led to a row split of the engine's latent path (commit ea6f419, see the
+[correction](#the-decode-shapes-c-cached-positions-t--1-or-5-new-tokens) under Counts)
+that computes the same floats with half the kv_b work. Four ways to run
 one MLA layer's cached attention, plus one bit-exact restructuring added as a fair
 baseline, are implemented side by side in `benchmarks/mla_variants.h`. They are held to
 the engine bit for bit by `tests/unit/test_mla_variants.c`, which is part of `make test`,
 and measured by `benchmarks/bench_mla.c`. `benchmarks/mla-study.sh` reproduces every
-number below, and the raw JSON lines are in
-[`docs/measurements/mla-variants-x86_64.jsonl`](../measurements/mla-variants-x86_64.jsonl).
+number below except two, and the raw JSON lines are in
+[`docs/measurements/mla-variants-x86_64.jsonl`](../measurements/mla-variants-x86_64.jsonl):
+the shared-work timing (17.8 ms per layer) is printed by `time_common` but not written
+to JSON, and the mutation table's mutants are not committed, so it can be re-derived
+only by hand. The JSON predates the row split: its L0 lines count, and time, the loop
+that applied all of kv_b in both passes, twice the kv_b work of today's L0.
 
 The study has two halves. The **exact half**, the bitwise gates, the kv_b application
 counts and the numerics of the absorbed variant, does not depend on machine load. The
@@ -22,12 +29,15 @@ the conditions are under [Timing](#timing) and the commands under
 One MLA layer at the released geometry: 96 heads, qk_nope 128, qk_rope 64, v_head 128,
 kv_lora 512. `kv_b` is 24,576 x 512 (12.6 M multiply-adds, 25.2 MB in bf16). A call
 appends T new tokens after C cached ones and attends over N = C + T positions, causally.
+kv_b applications are counted in whole-matrix equivalents, kv_b rows applied over its
+24,576: L0's key-rows call and value-rows call are half an application each at this
+geometry.
 
 | | cache per position per layer | kv_b applications per call | exact? | what it is |
 |---|---:|---|---|---|
 | **E** | 98,560 B | T | reference | the engine's default loop, copied statement for statement |
 | **E+** | 98,560 B | T | bitwise = E | the same arithmetic threaded over heads, each cached row read once per call instead of once per query token |
-| **L0** | 2,304 B | 2T(C+1) + T(T-1) | bitwise = E | the engine's `--kv-latent` loop: every visible position rebuilt through kv_b twice per query token |
+| **L0** | 2,304 B | T(C+1) + T(T-1)/2 | bitwise = E | the engine's `--kv-latent` loop: every visible position rebuilt through kv_b twice per query token, its key rows to score it and its value rows to weight its values, one application's worth in all (before ea6f419 each rebuild applied all of kv_b's rows and the count was twice this; see the correction under the decode counts) |
 | **L1** | 2,304 B, plus up to 49,152 B per position transiently, for one layer at a time | 2N - vcap | bitwise = E | each position rebuilt once per call; value rows kept for the first vcap positions, the rest rebuilt a second time |
 | **A** | 2,304 B | none (T kv_b's worth of multiply-adds in per-head slices) | **no** | absorbed: W_uk folded into the query, W_uv applied after the latent-weighted sum |
 
@@ -48,8 +58,9 @@ two layouts, between E and the expanded engine, between L0 and the latent engine
 between each variant and E. L1 runs at three value-row budgets (all, half, none); E+, L1
 and A rerun on every thread (on the cases of up to 48 positions, which span three of
 their 16-position blocks); A is compared bitwise with a plain scalar rendering of its
-formulas. The count of kv_b applications each call makes is checked against the closed
-form in the table above.
+formulas. The count of kv_b applications each call makes, in whole-matrix equivalents,
+is checked against the closed form in the table above, for every variant and for the
+engine itself, whose trace hook counts the kv_b rows it applies (`kvb_rows`).
 
 The engine's intermediates come from a recording hook, `k3_mla_trace` in `k3.h`, which
 is NULL outside tests. It is needed because the output cannot show them: z and e/z are
@@ -76,8 +87,9 @@ also runs two constructed kinds of layer through the same gates:
   score chain then meets huge terms that cancel exactly, and its ordinary terms lose bits
   that depend on the partial sums they meet.
 - **Sharp layers** scale the query norm by 16 (exact), for score ranges of tens of nats.
-  Until softmax terms fall below about 2^-29 the double normaliser is a sum of floats that
-  is exact in any order; on sharp rows it is not.
+  While every softmax term is at least about 2^-29 of the normaliser itself (a float has
+  24 significant bits and a double 53), the double normaliser is a sum of floats that is
+  exact in any order; on sharp rows the smallest terms fall below that, and it is not.
 
 | order witness (this commit) | score chains | changed if reversed | nope and rope summed apart | two lanes | normalisers of 3+ terms changed if reversed | quotients changed as e*(1/z) |
 |---|---:|---:|---:|---:|---:|---:|
@@ -92,7 +104,10 @@ never does.
 The witness only says whether a reordering *could* be seen. A mutation run shows that
 the test does see one: each mutant below was compiled into a scratch copy of the header,
 or for the engine rows of `src/core/k3_ops.c`, and run through the unchanged test on
-four threads (57 cases: 29 ordinary, 16 cancelling, 12 sharp).
+four threads (57 cases: 29 ordinary, 16 cancelling, 12 sharp). The mutants are not
+committed, so the table is a record, not a reproducible artifact; the first row's
+13 of 16 holds for the mutation applied to the four-chain E+ path alone, and applied
+to both E+ chains it fails all 16 cancelling cases.
 
 | mutant | ordinary cases failed | cancelling | sharp |
 |---|---:|---:|---:|
@@ -125,13 +140,18 @@ committed.
 
 ## Counts: kv_b applications, multiply-adds and bytes
 
-`bench_mla counts` runs each variant on the fixture geometry with a counter on every
-kv_b application, fails if a count differs from its closed form, and quotes the
-multiply-adds and bytes at K3 geometry. The count depends only on (C, T, vcap), never on
-the geometry, which is why counting on the small one is enough. "x24" is all 24 MLA
-layers per token. "kv_b read" is whole-matrix passes over kv_b's 25.2 MB: resident, that
-is DRAM or cache traffic; under `--trunk-rows`, where the MLA weights are bound as
-streamed (`src/model/k3_bind.c`), each pass is a read through the row stream. For A it is
+`bench_mla counts` runs each variant on the fixture geometry with a counter on the kv_b
+rows every call applies, turns it into applications (whole-matrix equivalents: rows
+applied over kv_b's rows), fails if a count differs from its closed form or is not a
+whole number, and quotes the multiply-adds and bytes at K3 geometry. The count depends
+only on (C, T, vcap), never on the geometry, which is why counting on the small one is
+enough. "x24" is all 24 MLA layers per token. "kv_b read" is whole-matrix passes over
+kv_b's 25.2 MB, each of L0's half calls counting half a pass: resident, that is DRAM or
+cache traffic; under `--trunk-rows`, where the MLA weights are bound as streamed
+(`src/model/k3_bind.c`), it is what the row stream reads from a plain `trunk.bin`, where
+each of L0's calls reads only its half. A compressed trunk reads the whole matrix on
+each call, twice this for L0, because reading one head's rows at a time would decode
+each 1 MiB block once per head it holds (`rows_run` in `src/io/k3_trunk.c`). For A it is
 the key half once per call plus the value half once per query token. The non-attention
 work of the whole model is about 103 GMAC per token, for scale.
 
@@ -139,14 +159,15 @@ work of the whole model is about 103 GMAC per token, for scale.
 
 | T | L0 kv_b applications | L1 applications (all value rows held) | L0 / L1 | L0 GMAC per token x24 | L1 GMAC per token x24 | A GMAC per token x24 | L0 kv_b read | L1 kv_b read |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 2 | 1 | 2.0x | 0.61 | 0.30 | 0.30 | 0.05 GB | 0.03 GB |
-| 16 | 272 | 16 | 17.0x | 5.14 | 0.31 | 0.32 | 6.8 GB | 0.40 GB |
-| 64 | 4,160 | 64 | 65.0x | 19.7 | 0.33 | 0.38 | 105 GB | 1.6 GB |
-| 256 | 65,792 | 256 | 257.0x | 77.7 | 0.40 | 0.62 | 1,656 GB | 6.4 GB |
+| 1 | 1 | 1 | 1.0x | 0.30 | 0.30 | 0.30 | 0.03 GB | 0.03 GB |
+| 16 | 136 | 16 | 8.5x | 2.57 | 0.31 | 0.32 | 3.4 GB | 0.40 GB |
+| 64 | 2,080 | 64 | 32.5x | 9.84 | 0.33 | 0.38 | 52 GB | 1.6 GB |
+| 256 | 32,896 | 256 | 128.5x | 38.9 | 0.40 | 0.62 | 828 GB | 6.4 GB |
 
-L0's count is T(T+1): **quadratic** in the prompt length. At a 256-token prompt its
-attention alone is 77.7 GMAC per token, three quarters of the rest of the model, and a
-1.66 TB pass over kv_b per layer. L1's count is T, the same as appending to the
+L0's count is T(T+1)/2: **quadratic** in the prompt length. At a 256-token prompt its
+attention alone is 38.9 GMAC per token, more than a third of the rest of the model, and
+828 GB of kv_b traffic per layer (77.7 GMAC and 1.66 TB before the row split, when the
+count was T(T+1)). L1's count is T, the same as appending to the
 expanded cache, with 12.6 MB of transient value rows for one layer at a time; holding
 no value rows at all it is 2T, still linear (512 at T = 256). The engine's `--kv-latent`
 path runs L0's loop today.
@@ -158,26 +179,48 @@ L1's value-row budget here is the benchmark default, 2,560 MB for one layer, whi
 
 | C | T | L0 applications | L1 applications | L0 / L1 | L0 GMAC/token x24 | L1 GMAC/token x24 | A GMAC/token x24 | E GMAC/token x24 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 256 | 1 | 514 | 257 | 2.0x | 155 | 78 | 0.95 | 0.49 |
-| 256 | 5 | 2,590 | 261 | 9.9x | 157 | 16 | 0.95 | 0.49 |
-| 1,024 | 1 | 2,050 | 1,025 | 2.0x | 620 | 310 | 2.87 | 1.06 |
-| 1,024 | 5 | 10,270 | 1,029 | 10.0x | 621 | 63 | 2.88 | 1.06 |
-| 4,096 | 1 | 8,194 | 4,097 | 2.0x | 2,478 | 1,240 | 10.6 | 3.32 |
-| 4,096 | 5 | 40,990 | 4,101 | 10.0x | 2,479 | 251 | 10.6 | 3.32 |
-| 16,384 | 1 | 32,770 | 16,385 | 2.0x | 9,908 | 4,960 | 41.4 | 12.4 |
-| 16,384 | 5 | 163,870 | 16,389 | 10.0x | 9,909 | 1,002 | 41.4 | 12.4 |
-| 65,536 | 1 | 131,074 | 78,991 | 1.7x | 39,631 | 23,903 | 165 | 48.6 |
-| 65,536 | 5 | 655,390 | 78,999 | 8.3x | 39,633 | 4,820 | 165 | 48.6 |
+| 256 | 1 | 257 | 257 | 1.0x | 78 | 78 | 0.95 | 0.49 |
+| 256 | 5 | 1,295 | 261 | 5.0x | 78 | 16 | 0.95 | 0.49 |
+| 1,024 | 1 | 1,025 | 1,025 | 1.0x | 310 | 310 | 2.87 | 1.06 |
+| 1,024 | 5 | 5,135 | 1,029 | 5.0x | 311 | 63 | 2.88 | 1.06 |
+| 4,096 | 1 | 4,097 | 4,097 | 1.0x | 1,240 | 1,240 | 10.6 | 3.32 |
+| 4,096 | 5 | 20,495 | 4,101 | 5.0x | 1,241 | 251 | 10.6 | 3.32 |
+| 16,384 | 1 | 16,385 | 16,385 | 1.0x | 4,960 | 4,960 | 41.4 | 12.4 |
+| 16,384 | 5 | 81,935 | 16,389 | 5.0x | 4,961 | 1,002 | 41.4 | 12.4 |
+| 65,536 | 1 | 65,537 | 78,991 | 0.83x | 19,840 | 23,903 | 165 | 48.6 |
+| 65,536 | 5 | 327,695 | 78,999 | 4.1x | 19,840 | 4,820 | 165 | 48.6 |
+
+**Correction (2026-09-24 review), and the change it led to.** L0's two applications per
+position were each a full 24,576-row kv_b, of which the score pass reads only the 128
+key rows per head and the value pass only the 128 value rows (`src/core/k3_ops.c`, the
+latent branch of `k3_mla_cached`). Applying only W_uk's rows in the first pass and only
+W_uv's in the second is bitwise identical, since the matvec is row-independent, and
+halves L0's kv_b multiply-adds and, from a plain `trunk.bin` under `--trunk-rows`, the
+kv_b bytes it requests at K3 geometry, where a head's run is 128 KiB (under O_DIRECT a
+run is rounded to whole 4 KiB pages, which on a small matrix can cancel the saving). The
+engine has done so since commit ea6f419 (2026-09-24), through `k3_mmw_rows`, and L0
+since 5f5208c; `test_mla_variants` and GATE 3b hold it bitwise, `test_mla_variants` also
+holds the engine's own kv_b row count (its trace hook's `kvb_rows`) to L0's closed form,
+and the tables above are the counts after it. Before it, L0's counts were twice these,
+2T(C+1) + T(T-1) (514 at C = 256, T = 1; 65,792 at the 256-token prefill), which is what
+the committed JSON records. Counted in whole applications, L0 makes N per query token at
+T = 1, the same as L1 holding every value row, so the "L0 / L1 = 2.0x" that stood in the
+decode table before the change was L0's own waste, not an advantage of L1's loop order.
+L1's advantage at T > 1, rebuilding each position once per call rather than once per
+query token, stands: 5.0x at T = 5. L1's second rebuild of the positions past its
+value-row budget still applies the whole matrix where only the value rows are read;
+split the same way it would count N at every budget. It is not the engine's loop and was
+left as it was.
 
 Three things follow, none of them a timing. At T = 1 a latent cache costs at least one
-kv_b application per cached position per layer, whichever loop runs it; L1 halves L0's
-count and no exact reorganisation can go below N. Verifying T drafted tokens at once
-(T = 5 here) is where L0's cost multiplies and L1's does not. And A's arithmetic is at
-most 3.4 times E's (the per-position ratio it approaches at long contexts), not the
-hundreds of times a rebuilding cache pays, because it never expands the cache: each
-cached position costs H(2 kv_lora + qk_rope) = 104,448 multiply-adds per query token
-against E's H(qk_nope + qk_rope + v_head) = 30,720, read from 2,304 cached bytes instead
-of 98,560.
+kv_b application per cached position per layer, whichever loop runs it; L0 and L1 with
+every value row held (vcap >= N) both make exactly N now, and no exact reorganisation
+can go below N. Verifying T drafted tokens at once (T = 5 here) is where L0's cost
+multiplies and L1's does not. And A's arithmetic is at most 3.4 times E's (the
+per-position ratio it approaches at long contexts), not the hundreds of times a
+rebuilding cache pays, because it never expands the cache: each cached position costs
+H(2 kv_lora + qk_rope) = 104,448 multiply-adds per query token against E's H(qk_nope +
+qk_rope + v_head) = 30,720, read from 2,304 cached bytes instead of 98,560.
 
 ## Numerics of the absorbed variant
 
@@ -204,7 +247,7 @@ than these weights give (score rms 4.9, largest score 32).
 | scores bitwise equal | 74.2% | 74.1% | 74.1% |
 | \|score_A - score_E\|, 99th percentile | 1.2e-7 | 1.2e-7 | 5.0e-7 |
 | \|score_A - score_E\|, max (score rms) | 4.8e-7 (0.83) | 4.8e-7 (0.82) | 3.8e-6 (4.95) |
-| **argmax changed**, of 10,000 softmax rows | 0 | 0 | 0 |
+| **argmax changed**, of 10,000 softmax rows (the first 10,000 of the 10,080, the `--rows` cap) | 0 | 0 | 0 |
 | smallest top-2 score gap among those rows | 9.1e-6 | 1.9e-5 | 2.6e-4 |
 | rows whose gap is within 2x their largest score difference | 0 | 0 | 0 |
 
@@ -243,6 +286,19 @@ says AVX2 because `bench_mla` then named a build by `__AVX2__` alone; it now rep
 AVX-512 for such a build. These tables replace ones taken at 475a7a8 with the kernel
 before that change, when one kv_b application took 3.86 ms on one thread and 0.93 ms
 on four; it now takes 2.36 and 0.58.
+
+**L0 in every table of this section is the loop before the row split** (ea6f419 in the
+engine, 5f5208c in L0), which applied all of kv_b in both passes: twice the kv_b work of
+today's L0, whose counts are the ones under
+[Counts](#counts-kv_b-applications-multiply-adds-and-bytes). The tables were not
+retaken. An informal check after the change, not a measurement against variance:
+`bench_mla time --threads 4 --C 256 --T 1 --variants L0,L1 --runs 5`, three processes
+each with the binary from before the split and the one after, interleaved, on this VM.
+L0's per-process medians were 338, 381 and 325 ms before and 205, 177 and 210 ms after.
+L1's were 181, 194 and 174 ms, then 163, 160 and 147 ms: every one lower, a shift rather
+than a spread. L1 is no control for noise here, because ea6f419 also refactored
+`k3_matmul_bf16`, the kernel L1's rebuilds run on, so its shift cannot be separated from
+noise, and L0's change cannot be attributed to the row split alone by these runs.
 
 Each of the four arms (one and four threads, decode and prefill) waited for the
 1-minute load average to fall under 1.0, and they started at 0.94, 0.95, 0.98 and
@@ -369,25 +425,27 @@ the VM. The shared work above adds 0.427 s.
   [Numerics](#numerics-of-the-absorbed-variant)), so under this project's contract its
   speed is not on offer beside E.
 - **Rebuilding the cache costs what the counts say, and that is far too much for
-  decode.** L1 is 1.8 to 2.05 times faster than L0 at T = 1 up to 16,384 positions and
-  8.6 to 10.1 times at T = 5 where both ran; the counts give 2.0 and 9.9 to 10.0. At
-  65,536 positions, where L1 holds value rows for only 52,083 positions and the counts
-  give 1.66, L0 measured 85.8 s per call on four threads against L1's 49.6 s, 1.73
-  times. The latent decode configurations took 1.06 to 1.36 times their applications
-  times the unit cost (medians): with the faster kv_b, the attention loops around it
-  are a larger share. But each rebuilt position is a 12.6 M multiply-add matmul, and
-  L1 is 34 to 51 times slower than E+ at T = 1 on four threads (17 to 21 times at
-  T = 5). At 4,096 positions that is 66 s per token over 24 layers, against E+'s 1.9 s
-  and the 16 s assumed for the rest of the model (`NONATTN_SECONDS`, a round figure,
-  not a measurement). The engine's `--kv-latent` path, L0, takes 128 s per token
-  there.
+  decode.** L1 was 1.8 to 2.05 times faster than the old L0 at T = 1 up to 16,384
+  positions and 8.6 to 10.1 times at T = 5 where both ran, when the counts gave 2.0 and
+  9.9 to 10.0 (since the row split they give 1.0 and 5.0). At 65,536 positions, where L1
+  holds value rows for only 52,083 positions and the counts then gave 1.66, the old L0
+  measured 85.8 s per call on four threads against L1's 49.6 s, 1.73 times. The latent
+  decode configurations took 1.06 to 1.36 times their applications times the unit cost
+  (medians): with the faster kv_b, the attention loops around it are a larger share. But
+  each rebuilt position is a 12.6 M multiply-add matmul, and L1 is 34 to 51 times slower
+  than E+ at T = 1 on four threads (17 to 21 times at T = 5). At 4,096 positions that is
+  66 s per token over 24 layers, against E+'s 1.9 s and the 16 s assumed for the rest of
+  the model (`NONATTN_SECONDS`, a round figure, not a measurement). The engine's
+  `--kv-latent` path, L0, took 128 s per token there before the row split, which halved
+  its kv_b work.
 - **At prefill, L1 sits among the expanded variants.** At C = 0 and T = 256, L1 makes
   as many kv_b applications as E. On four threads it takes 528 ms: about twice E+'s
   272, level with A's 553 and under a third of E's 1,729. L0 at the same point was
   measured on four threads at 43.3 s for one layer, 82 times L1. That is roughly what
-  `--kv-latent` pays for a 256-token prompt today: 17 minutes over 24 layers. L0 / L1
-  is 82 rather than the counted 257 because most of L1's time at T = 256 is the
-  attention itself, not kv_b.
+  `--kv-latent` paid for a 256-token prompt before the row split: 17 minutes over 24
+  layers, of which the split removes about half the kv_b work. L0 / L1 was 82 rather
+  than the 257 then counted because most of L1's time at T = 256 is the attention
+  itself, not kv_b.
 - **Beside a fast variant the shared work is not small.** At 17.8 ms per token per
   layer it is three quarters of A's attention at 4,096 positions (23.2 ms) and a
   quarter of E+'s (78.2 ms).
@@ -400,7 +458,9 @@ Three cautions about individual cells:
   is attention. L0's own ratio on one thread was 1.06 to 1.13 at the five decode points
   it ran, and on four threads its measured prefill was 1.07 times its count times the
   unit. Scaled by its own ratio, the one-thread L0 prefill is about 163 to 176 s
-  (65,792 applications x 2.35 to 2.36 ms x 1.06 to 1.13), not the 471 s in the JSON. The decode projections are calibrated on runs whose ratios are
+  (65,792 applications x 2.35 to 2.36 ms x 1.06 to 1.13), not the 471 s in the JSON,
+  which keeps that projected value under `status: projected`; read it with this
+  caveat. The decode projections are calibrated on runs whose ratios are
   1.06 to 1.36, and the four-thread prefill needed no projection.
 - **E and E+ at 65,536 positions are not measured.** The JSON's `seconds_per_call` for
   those lines (status `not_run_memory`) is the bench's linear extrapolation from 16,384.

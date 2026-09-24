@@ -24,9 +24,20 @@
  *      absorbed attention bitwise, so bench_mla's numerical study measures absorption
  *      itself, not an artefact of the vectorised loop. It is NOT equal to E, and the
  *      test only checks that it is close (a wrong W_uk/W_uv split would not be).
- *   7. The kv_b applications each variant makes are exactly mla_rebuilds(): T for E
- *      and E+, 2T(C+1) + T(T-1) for L0, 2N - vcap for L1, none for A. The prefill-
- *      shaped case C=0, T=256 is where L0's count is quadratic: 65,792 against L1's 256.
+ *   7. The kv_b applications each variant makes are exactly mla_rebuilds(), counted as
+ *      whole-matrix equivalents (kv_b rows applied over kv_b's rows, which must come out
+ *      a whole number): T for E and E+, T(C+1) + T(T-1)/2 for L0 (its key rows to score
+ *      and its value rows to weight, per visible position per query token), 2N - vcap
+ *      for L1, none for A. An L0 that applied the whole matrix in either pass, as the
+ *      engine's loop once did, counts more; one that applied the wrong half in a pass
+ *      counts the same at K3 geometry, where the halves are equal, and fails 1 and 3.
+ *      The prefill-shaped case C=0, T=256 is where L0's count is quadratic: 32,896
+ *      against L1's 256. Those counts are the benchmark copies'. THE ENGINE'S OWN GATE
+ *      is the same closed form on the rows k3_mla_cached itself applies, which its trace
+ *      hook counts (K3MlaTrace.kvb_rows) in the one call each latent pass rebuilds
+ *      through: the latent layout must make L0's count and the expanded layout E's, in
+ *      every case. An engine pass that applied kv_b any other way, such as the whole
+ *      matrix through k3_mmw, goes uncounted and fails it.
  *   8. All of the above again on CANCELLING layers (see synth_cancelling), built so that
  *      summing any score chain in another order changes its float. On the ordinary
  *      layers it almost never would, so without these the memcmp gates could not see a
@@ -248,7 +259,7 @@ typedef struct {
     double *z;                  /* [T][H] softmax normalisers */
     double *quot;               /* [T][H][N] probability quotients e/z, before rounding */
     MlaCache cache;             /* after the call */
-    unsigned long long kvb;     /* kv_b applications the call made */
+    double kvb;                 /* kv_b applications the call made (mla_kvb_applications) */
 } Run;
 
 static void run_free(Run *r)
@@ -281,13 +292,17 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     float *ct   = (float *)xmalloc((size_t)T * kvw * sizeof(float));
     float *ql   = (float *)xmalloc((size_t)c->q_lora * sizeof(float));
     float *gbuf = (float *)xmalloc((size_t)H * vh * sizeof(float));
-    void  *scr  = xmalloc(mla_scratch_bytes(v, c, T, N, vcap));
+    const size_t scrb = mla_scratch_bytes(v, c, T, N, vcap);
+    void  *scr  = xmalloc(scrb);
+    /* Poisoned like the engine's scratch (run_engine): L0's rebuild buffer holds only key
+     * rows in its score pass and only value rows in its value pass. */
+    memset(scr, 0x7F, scrb ? scrb : 1);
     run_alloc_trace(r, T, H, vh, N);
     r->out   = (float *)xmalloc((size_t)T * E * sizeof(float));
     cache_copy(&r->cache, mla_is_latent(v) ? &K->lat : &K->exp_, c, mla_is_latent(v));
 
     mla_project(q, ct, xnew, K->w, c, T, ql);
-    const unsigned long long k0 = mla_kvb_calls;
+    const unsigned long long k0 = mla_kvb_rows;
     mla_zprobe = r->z;
     mla_qprobe = r->quot;
     set_threads(g_attend_threads);
@@ -298,7 +313,7 @@ static void run_variant(Run *r, const Case *K, const float *xnew, int v, int vca
     set_threads(1);
     mla_zprobe = NULL;
     mla_qprobe = NULL;
-    r->kvb = mla_kvb_calls - k0;
+    r->kvb = mla_kvb_applications(k0, c);
     /* The gate works in place, so keep the pre-gate accumulator for comparison. */
     float *acc2 = (float *)xmalloc((size_t)T * H * vh * sizeof(float));
     memcpy(acc2, r->acc, (size_t)T * H * vh * sizeof(float));
@@ -316,15 +331,23 @@ static void run_engine(Run *r, const Case *K, int latent)
     const int N = K->C + K->T;
     const size_t n = k3_mla_scratch_cached(c, K->T, K->cap, 1, latent);
     float *scr = (float *)xmalloc(n * sizeof(float));
+    /* Poisoned, as the caches are: the latent layout's rebuild buffer holds only key rows
+     * in the score pass and only value rows in the value pass, and an engine that read
+     * the other half, or any scratch it had not written, cannot pass by luck. */
+    memset(scr, 0x7F, n * sizeof(float));
     memset(r, 0, sizeof *r);
     run_alloc_trace(r, K->T, c->n_heads, c->v_head, N);
     r->out = (float *)xmalloc((size_t)K->T * c->hidden * sizeof(float));
     cache_copy(&r->cache, latent ? &K->lat : &K->exp_, c, latent);
-    K3MlaTrace tr = {N, r->probe, r->z, r->quot, r->acc};
+    K3MlaTrace tr = {N, r->probe, r->z, r->quot, r->acc, 0};
     k3_mla_trace = &tr;
     k3_mla_cached(r->out, K->xnew, K->w, c, K->T, scr, r->cache.kv, r->cache.rope, K->C,
                   K->cap, latent);
     k3_mla_trace = NULL;
+    /* the kv_b rows the engine applied, in applications, as mla_kvb_applications counts
+     * the variants' */
+    r->kvb = (double)tr.kvb_rows
+             / ((double)c->n_heads * (double)(c->qk_nope + c->v_head));
     free(scr);
 }
 
@@ -437,7 +460,7 @@ static int witness(Witness *W, const Case *K, const Run *rE)
 static void check_count(const Run *r, int v, int C, int T, int vcap, const char *geom)
 {
     const double want = mla_rebuilds(v, T, C, vcap);
-    CHECK((double)r->kvb == want, "%s C=%d T=%d: %s (vcap %d) made %llu kv_b applications, "
+    CHECK(r->kvb == want, "%s C=%d T=%d: %s (vcap %d) made %.2f kv_b applications, "
           "mla_rebuilds says %.0f", geom, C, T, MLA_NAME[v], vcap, r->kvb, want);
 }
 
@@ -517,7 +540,15 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
           "%s C=%d T=%d: softmax normalisers differ between E, E+ and L0", geom, C, T);
     CHECK(same(rEP.quot, rE.quot, qb) && same(rL0.quot, rE.quot, qb),
           "%s C=%d T=%d: probability quotients differ between E, E+ and L0", geom, C, T);
-    /* 7. kv_b applications */
+    /* 7. kv_b applications: the engine's own, through its trace hook, then the copies' */
+    CHECK(eng_l.kvb == mla_rebuilds(MLA_L0, T, C, 0),
+          "%s C=%d T=%d: the latent engine applied %.2f kv_b applications (its trace's "
+          "kvb_rows), L0's closed form is %.0f", geom, C, T, eng_l.kvb,
+          mla_rebuilds(MLA_L0, T, C, 0));
+    CHECK(eng_x.kvb == mla_rebuilds(MLA_E, T, C, 0),
+          "%s C=%d T=%d: the expanded engine applied %.2f kv_b applications (its trace's "
+          "kvb_rows), E's closed form is %.0f", geom, C, T, eng_x.kvb,
+          mla_rebuilds(MLA_E, T, C, 0));
     check_count(&rE, MLA_E, C, T, 0, geom);
     check_count(&rEP, MLA_EP, C, T, 0, geom);
     check_count(&rL0, MLA_L0, C, T, 0, geom);
@@ -626,8 +657,9 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
  *   Every score is a double chain rounded to float once, at the end. With terms of one
  *   size, the same terms summed in another order differ by ~1e-16 relative and round to
  *   the same float almost always, so a variant that reordered its chain would pass every
- *   memcmp in test_case. The order witness measures this: on the ordinary layers only a
- *   few percent of reordered chains change their float.
+ *   memcmp in test_case. The order witness measures this: on the ordinary layers none of
+ *   the reordered chains changed its float (0 of 305,712 in the committed run), so an
+ *   output-only gate on such layers has no power against a reordering at all.
  *
  * WHAT THIS LAYER DOES INSTEAD
  *   Every chain CANCELS. Huge terms, in exactly negated pairs, arrive at shuffled points
@@ -817,8 +849,9 @@ static void print_witness(const char *label, const Witness *w)
 
 int main(void)
 {
-    /* {0, 256} is the prefill shape: no cache, 256 new tokens, where L0 makes 65,792
-     * kv_b applications and L1 makes 256. */
+    /* {0, 256} is the prefill shape: no cache, 256 new tokens, where L0 makes 32,896
+     * kv_b applications' worth (in 65,792 calls, a key half or a value half each) and
+     * L1 makes 256. */
     struct { int C, T; } tiny[] = {{0, 1}, {0, 3}, {1, 1}, {5, 2}, {7, 5}, {31, 4},
                                    {64, 1}, {200, 5}, {257, 3}, {0, 256}};
     struct { int C, T; } odd[] = {{0, 2}, {3, 5}, {13, 3}, {50, 7}};

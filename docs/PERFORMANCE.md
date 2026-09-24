@@ -18,9 +18,13 @@ right and this page has a bug.
 Twelve budgets, each enforced by a hard cgroup cap, same prompt, same binary.
 Raw: [data/memory-ladder.tsv](data/memory-ladder.tsv).
 
-The `GB read/tok` column is **expert payload only**, excluding the streamed trunk.
-The tables below are historical measurements, not results for the fork's new cache
-policy. See [the trace audit and calibrated pinning](EXPERT_PROFILES.md) for its scope.
+The `GB read/tok` column is **expert payload only**, excluding the streamed trunk, and
+it is the per-later-step figure; `s/token` and the I/O share are averages over the
+whole 8-step run including the prompt prefill (99.70 GB of expert reads), so the
+columns are in different scopes and one cannot be divided by the other for a
+bandwidth. The tables below are historical measurements, not results for the fork's
+new cache policy. See [the trace audit and calibrated pinning](EXPERT_PROFILES.md) for
+its scope.
 
 | RAM | pinned layers | expert cache | s/token | vs 8 GB | expert hit | trunk hit | GB read/tok | peak RSS |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|

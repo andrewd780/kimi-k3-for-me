@@ -95,6 +95,23 @@ static void k3_fatal_bound(const char *what, long value, long limit)
     abort();
 }
 
+/* The same rule, for a row selection (k3_matmul_rows and its siblings) that does not name
+ * rows of its matrix. Running it would write y and read W outside them, and returning
+ * would leave y unwritten for the caller to consume, so it aborts like the bound above.
+ * It is a caller's bug, never a property of the input, so the message says what a
+ * selection must be rather than how to shorten a run. */
+static void k3_fatal_rows(const char *who, int out, int blk, int r0, int nr)
+{
+    fprintf(stderr,
+            "k3: FATAL, %s was asked for rows %d .. %ld of every block of %d rows of a\n"
+            "    %d-row matrix, which is not a selection of its rows: blk must be at\n"
+            "    least 1 and divide the row count, and 0 <= r0 <= r0 + nr <= blk.\n"
+            "    Aborting rather than writing outside the output or returning without\n"
+            "    writing it.\n",
+            who, r0, (long)r0 + nr - 1, blk, out);
+    abort();
+}
+
 /* ------------------------------------------------------------- layer map ---- */
 /* The released config lists full_attn_layers ONE-BASED, and
  * configuration_kimi_k3.py:152-156 tests (layer_idx + 1) in kda_layers. Getting this
@@ -486,34 +503,119 @@ static inline double k3_f32_row_v(const float *row, const double *xd, int n16)
 }
 #endif /* K3_MM_HOIST */
 
-void k3_matmul(float *y, const float *x, const float *W, int in, int out)
-{
-    const int n16 = in & ~15;
+/* Force inlining. The per-row and per-pair bodies below are shared by two kernels each,
+ * and a shared body would otherwise become a call per row inside the hot loop; the
+ * batched tiles use it too (see K3_MM_TB). */
+#if defined(__GNUC__)
+#define K3_ALWAYS_INLINE static inline __attribute__((always_inline))
+#else
+#define K3_ALWAYS_INLINE static inline
+#endif
 
-    /* x widened once per call rather than once per row; see k3_matmul_mxfp4. A failed
-     * allocation selects k3_f32_row_c, the same sum without the copy. */
+/* ONE fp32 OUTPUT ROW: everything k3_matmul does for a row. The whole chunks go through
+ * the partition and tree (from the hoisted xd when there is one, else widened in place),
+ * the in % 16 tail is fused sequentially in ascending order, and the sum is stored
+ * through k3_out_f32. k3_matmul and k3_matmul_rows compute every row they compute here,
+ * so a row is the same float whichever of them computes it and whichever other rows
+ * that call computes. */
+K3_ALWAYS_INLINE float k3_f32_row(const float *row, const float *x, const double *xd,
+                                  int in, int n16)
+{
+#if K3_MM_HOIST
+    double acc = xd ? k3_f32_row_v(row, xd, n16) : k3_f32_row_c(row, x, n16);
+#else
+    (void)xd;
+    double acc = k3_f32_row_c(row, x, n16);
+#endif
+    for (int i = n16; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
+    return k3_out_f32(acc);
+}
+
+/* x widened once per call rather than once per row; see k3_matmul_mxfp4. NULL when there
+ * is no vector unit to feed or the allocation fails: the rows then take k3_f32_row_c,
+ * the same sum without the copy. The caller frees it (free(NULL) is a no-op). */
+static double *k3_f32_hoist(const float *x, int in)
+{
 #if K3_MM_HOIST
     double *const xd = (double *)malloc((size_t)in * sizeof(double));
     if (xd) for (int i = 0; i < in; i++) xd[i] = (double)x[i];
+    return xd;
+#else
+    (void)x; (void)in;
+    return NULL;
 #endif
+}
+
+void k3_matmul(float *y, const float *x, const float *W, int in, int out)
+{
+    const int n16 = in & ~15;
+    double *const xd = k3_f32_hoist(x, in);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
-    for (int o = 0; o < out; o++) {
-        const float *row = W + (size_t)o * in;
-#if K3_MM_HOIST
-        double acc = xd ? k3_f32_row_v(row, xd, n16) : k3_f32_row_c(row, x, n16);
-#else
-        double acc = k3_f32_row_c(row, x, n16);
+    for (int o = 0; o < out; o++)
+        y[o] = k3_f32_row(W + (size_t)o * in, x, xd, in, n16);
+
+    free(xd);
+}
+
+/* ------------------------------------------------- selected output rows ---- */
+/* The number of rows a selection computes, after checking that it names rows of the
+ * matrix; see k3_fatal_rows. An empty selection (nr == 0, or out == 0) is valid and
+ * computes nothing. */
+static int k3_rows_selected(const char *who, int out, int blk, int r0, int nr)
+{
+    if (out < 0 || blk < 1 || out % blk != 0 || r0 < 0 || nr < 0 || (long)r0 + nr > blk)
+        k3_fatal_rows(who, out, blk, r0, nr);
+    return out / blk * nr;
+}
+
+/* y[o] = W[o] . x for SOME of W's out rows. W is taken as out / blk blocks of blk rows,
+ * and rows r0 .. r0 + nr - 1 of every block are computed: selected row k, for
+ * k < (out / blk) * nr, is row o = (k / nr) * blk + r0 + k % nr, and its output lands at
+ * y[o], where the full product puts it. Rows not selected are not written. The same
+ * selection exists for bf16 (k3_matmul_bf16_rows), int8 (k3_matmul_q8_rows) and, through
+ * K3WeightStream.apply_rows, streamed matrices; k3_mmw_rows in k3.h dispatches.
+ *
+ * WHY THIS EXISTS
+ *   kv_b interleaves its rows per head: head h's key rows (W_uk) are h*kvd .. h*kvd +
+ *   qk_nope - 1 and its value rows (W_uv) are the v_head rows after them. The --kv-latent
+ *   branch of k3_mla_cached rebuilds every cached position twice per query token, once
+ *   to score it, which reads only the key rows, and once to weight its values, which
+ *   reads only the value rows. Applying the whole matrix both times computed twice the
+ *   rows each pass reads. With blk = kvd and (r0, nr) = (0, qk_nope) or (qk_nope, v_head)
+ *   each pass computes exactly the rows it reads, still in one call, one OpenMP region
+ *   and one widening of x, and a streamed kv_b is read only where those rows are.
+ *
+ * WHY IT IS EXACT
+ *   Output rows are independent (property 1 in the matmul notes above): a row's float
+ *   is fixed by its own weights, x, the partition, the tree, the tail and the store, and
+ *   by nothing about which other rows the call computes, how many there are or which
+ *   thread takes it. Every selected row goes through k3_f32_row (k3_bf16_pair for bf16,
+ *   k3_q8_row for int8), the code the full kernels run for every row, on the same widened
+ *   x. So each y[o] written is the float k3_matmul, k3_matmul_bf16 or k3_matmul_q8
+ *   stores at y[o]: the selection changes which rows are computed, never how. test_ops
+ *   holds the three kernels, and k3_mmw_rows under every weight tag, to the full kernels
+ *   bit for bit, checks that no unselected row is written, and (where it can fork)
+ *   that a selection naming rows outside the matrix aborts (k3_rows_selected). */
+void k3_matmul_rows(float *y, const float *x, const float *W, int in, int out, int blk,
+                    int r0, int nr)
+{
+    const int n = k3_rows_selected("k3_matmul_rows", out, blk, r0, nr);
+    const int n16 = in & ~15;
+    if (n == 0) return;
+    double *const xd = k3_f32_hoist(x, in);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n > 64)
 #endif
-        for (int i = n16; i < in; i++) acc = fma((double)row[i], (double)x[i], acc);
-        y[o] = k3_out_f32(acc);
+    for (int k = 0; k < n; k++) {
+        const size_t o = (size_t)(k / nr) * (size_t)blk + (size_t)(r0 + k % nr);
+        y[o] = k3_f32_row(W + o * (size_t)in, x, xd, in, n16);
     }
 
-#if K3_MM_HOIST
-    free(xd);                                     /* free(NULL) is a no-op */
-#endif
+    free(xd);
 }
 
 /* ------------------------------------------------------- batched matmul ---- */
@@ -561,6 +663,8 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   the per-position f32 -> f64 conversion of x, and the wider form does not remove it.
  *   Widening X to double once per call instead turns the loop into an L2 stream of
  *   doubles, and that measured slower still, including with the tile packed for L1.
+ *   (Those two were orientation runs during development; no report of them is
+ *   committed, so they are recollection, not a recorded measurement.)
  *   So an AVX-512 build runs the 256-bit tiles below beside the single-position
  *   kernels' 512-bit rows. That is not a second arithmetic: the tiles and every
  *   k3_matmul / k3_matmul_bf16 path hold the same sixteen accumulators, each fed its
@@ -581,16 +685,14 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out)
  *   So 8 when __AVX512VL__ is defined, else 4; NEON keeps 2, since each position needs
  *   eight of its 32 registers for accumulators. The block size is a loop shape only:
  *   each position keeps its own accumulators whatever the block, so no output can
- *   depend on it, and test_ops checks every block size and remainder bitwise. It may be
- *   forced with -DK3_MM_TB=1, 2, 4 or 8 to compare them. */
+ *   depend on it; test_ops checks the block size it was built with and its remainders
+ *   bitwise, and CI builds it with -DK3_MM_TB=8 on AVX2 as well as with each ISA's
+ *   default, so both x86 blocks are covered. It may be forced with -DK3_MM_TB=1, 2, 4
+ *   or 8 to compare them. */
 
-/* Force inlining so that each call below, made with a literal block size, gets its own
- * copy with the position loops unrolled and the accumulators held in registers. */
-#if defined(__GNUC__)
-#define K3_ALWAYS_INLINE static inline __attribute__((always_inline))
-#else
-#define K3_ALWAYS_INLINE static inline
-#endif
+/* The batched tiles below are K3_ALWAYS_INLINE (defined above k3_f32_row) so that each
+ * call, made with a literal block size, gets its own copy with the position loops
+ * unrolled and the accumulators held in registers. */
 
 #ifndef K3_MM_TB
 #if defined(__ARM_NEON) && defined(__aarch64__) && !defined(__AVX2__)
@@ -892,18 +994,24 @@ void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, i
  *   rope slot, 0.055 MB per position across the 24 layers -- 42.8x smaller -- and it
  *   is what makes a long context a memory question rather than an impossible one.
  *
- *   The trade is compute, and it is not small: kv_b is 24576x512, so every cached
- *   position costs a 12.6M-MAC matmul, paid TWICE per query token (once to score, once
- *   to weight the values) because softmax needs every score before any value is used.
- *   Holding the rebuilt block across the two passes would mean holding the expanded
- *   cache again, which is the thing being avoided.
+ *   The trade is compute, and it is not small: kv_b is 24576x512, 12.6M multiply-adds,
+ *   and every cached position costs that much per query token, in two halves, because
+ *   softmax needs every score before any value is used: its key rows (W_uk, 12,288 rows
+ *   at K3 geometry) to score it, then its value rows (W_uv, the other 12,288) to weight
+ *   its values. Each pass applies only its own rows (k3_mmw_rows). Applying the whole
+ *   matrix in each pass, as this loop once did, pays the 12.6M-MAC matmul twice per
+ *   position and computes twice the rows either pass reads. Holding the rebuilt block
+ *   across the two passes would mean holding the expanded cache again, which is the
+ *   thing being avoided.
  *
  *   The latent is stored exactly as it was fed to kv_b in the expanded path, and the
- *   rebuild calls the SAME kernel with the SAME reduction order, so the two layouts are
- *   bitwise identical, not merely close. Nothing here may reorder the softmax: scores
- *   are still formed s ascending, the running max is still taken s ascending, and the
- *   value accumulation is still s ascending, per head. The loops are transposed (s
- *   outer, h inner) only so that ONE rebuild serves all 96 heads.
+ *   rebuild computes every row it uses through the SAME per-row code with the SAME
+ *   reduction order as the expanded path's kv_b (a row selection changes which rows are
+ *   computed, never how: see "selected output rows" at k3_matmul_rows), so the two
+ *   layouts are bitwise identical, not merely close. Nothing here may reorder the
+ *   softmax: scores are still formed s ascending, the running max is still taken s
+ *   ascending, and the value accumulation is still s ascending, per head. The loops are
+ *   transposed (s outer, h inner) only so that ONE rebuild serves all 96 heads.
  *
  *   The rope slot is cached separately in both layouts because it is SHARED across
  *   heads: 64 values per position, not per head. Folding it into the per-head block
@@ -921,9 +1029,26 @@ void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, i
  * doubles the output rounds away. The quotient is named before it is rounded so that the
  * value recorded IS the value used: `pq = sc[s] / z; (float)pq` is `(float)(sc[s] / z)`,
  * since a double quotient is evaluated in double on every target this file builds for
- * (FLT_EVAL_METHOD 0 on x86-64 and aarch64). Nothing else here reads the trace.
+ * (FLT_EVAL_METHOD 0 on x86-64 and aarch64). The hook also counts the kv_b rows each
+ * call applies (kvb_rows), the latent layout's inside k3_mla_rebuild, the one call that
+ * applies them. Nothing else here reads the trace.
  */
 K3MlaTrace *k3_mla_trace = NULL;
+
+/* One --kv-latent rebuild: rows r0 .. r0 + nr - 1 of every head's kvd rows of kv_b applied
+ * to one cached position's latent, each written to kb where a whole application puts it
+ * (k3_mmw_rows). Both passes rebuild through here, and the trace hook counts the rows here,
+ * beside the call that applies them, so the count is of what was applied: a pass that
+ * applied kv_b some other way, such as the whole matrix through k3_mmw, would go uncounted
+ * and fail test_mla_variants' closed form. That count is the engine's own gate on the row
+ * split; the benchmark's is a copy's. */
+static void k3_mla_rebuild(float *kb, const float *lat, const K3MlaW *w, const K3Cfg *c,
+                           int r0, int nr, K3MlaTrace *tr)
+{
+    const int H = c->n_heads, kvd = c->qk_nope + c->v_head;
+    k3_mmw_rows(kb, lat, w->kv_b, w->wdt, c->kv_lora, H * kvd, kvd, r0, nr);
+    if (tr) tr->kvb_rows += (unsigned long long)H * (unsigned long long)nr;
+}
 
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
@@ -965,6 +1090,9 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * loop there and every head's row must survive until its own softmax runs. */
     float *sc   = gbuf + (size_t)T * H * vh;        /* [last+1], latent [H][last+1] */
     const size_t scn = lat ? (size_t)H * (size_t)(last + 1) : (size_t)(last + 1);
+    /* One rebuilt position in the latent layout, laid out as a whole kv_b application
+     * lays it out. Pass one writes and reads only its key rows, pass two only its value
+     * rows, so the other half is never read, whatever it holds. */
     float *kb   = sc   + scn;                       /* latent: [H][kvd] one position */
     /* Without a cache the keys/values live in scratch and cover only this call. */
     float *kvs  = kb   + (lat ? (size_t)H * kvd : 0);       /* [T][H][kvd]    */
@@ -998,9 +1126,11 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     /* Positions cached .. cached+T-1 are consecutive rows of the expanded cache (or of
      * kvs), so kv_b writes all of them in one pass, reading each position's normalised
      * latent in place at stride kvw. */
-    if (!lat)
+    if (!lat) {
         k3_mmw_batch_ld(K3_KV_AT(cached), H * kvd, ct, kvw, w->kv_b, w->wdt,
                         c->kv_lora, H * kvd, T);
+        if (tr) tr->kvb_rows += (unsigned long long)T * (unsigned long long)H * kvd;
+    }
 
     /* ---- attention, per head, causal. Position t leaves its heads' outputs in its own
      * row of acc, so the gate and o_proj below can take every position in one pass. ---- */
@@ -1008,11 +1138,14 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         const int p = cached + t;
         float *acct = acc + (size_t)t * H * vh;
         if (lat) {
-            /* Pass one: rebuild each cached position ONCE and score it against every
-             * head. Transposing the loops is what keeps the rebuild count at one per
-             * position rather than one per (position, head). */
+            /* Pass one: rebuild each cached position's KEYS once and score it against
+             * every head. Only kv_b's key rows (W_uk: rows h*kvd .. h*kvd + qn - 1 of
+             * head h) are applied, which is all this pass reads; each lands in kb where
+             * a whole application puts it, the same float (k3_mla_rebuild). Transposing
+             * the loops is what keeps the rebuild count at one per position rather than
+             * one per (position, head). */
             for (int s = 0; s <= p; s++) {
-                k3_mmw(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd);
+                k3_mla_rebuild(kb, K3_LAT_AT(s), w, c, 0, qn, tr);
                 const float *kr = K3_ROPE_AT(s);
                 for (int h = 0; h < H; h++) {
                     const float *qt = q + ((size_t)t * H + h) * qh;
@@ -1024,8 +1157,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 }
             }
             /* Softmax per head, s ascending in both sweeps, exactly as above. The
-             * probability is folded back into sc so the second rebuild pass needs no
-             * per-head denominator: (float)(sc[s]/z) is the same value either way. */
+             * probability is folded back into sc so the value pass needs no per-head
+             * denominator: (float)(sc[s]/z) is the same value either way. */
             for (int h = 0; h < H; h++) {
                 float *sh = sc + (size_t)h * (last + 1);
                 const size_t row = (size_t)t * H + h;          /* trace row (t, h) */
@@ -1045,10 +1178,12 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                 float *o = acct + (size_t)h * vh;
                 for (int j = 0; j < vh; j++) o[j] = 0.0f;
             }
-            /* Pass two: rebuild again and accumulate the values. Each o[j] still
-             * receives its terms s ascending, which is the order the sum must keep. */
+            /* Pass two: rebuild the VALUES and accumulate them: only the value rows
+             * (W_uv: rows h*kvd + qn .. (h+1)*kvd - 1), which is all this pass reads.
+             * Each o[j] still receives its terms s ascending, which is the order the
+             * sum must keep. */
             for (int s = 0; s <= p; s++) {
-                k3_mmw(kb, K3_LAT_AT(s), w->kv_b, w->wdt, c->kv_lora, H * kvd);
+                k3_mla_rebuild(kb, K3_LAT_AT(s), w, c, qn, vh, tr);
                 for (int h = 0; h < H; h++) {
                     const float pr = sc[(size_t)h * (last + 1) + s];
                     float *o = acct + (size_t)h * vh;
@@ -2182,8 +2317,8 @@ static inline double k3_tree16_eo(const double *ev, const double *od)
 /* Rows r0 and r1 over the first n16 elements, xd in the even/odd chunk layout. Per 16
  * elements and row: one 32-byte load, a shift and a mask, two float-to-double
  * conversions and two FMAs. r1 may equal r0 (an odd row count's last row). */
-static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
-                                   const uint16_t *r1, const double *xd, int n16)
+K3_ALWAYS_INLINE void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                      const uint16_t *r1, const double *xd, int n16)
 {
     const __m256i hi = _mm256_set1_epi32((int)0xFFFF0000u);
     __m512d e0 = _mm512_setzero_pd(), o0 = _mm512_setzero_pd();
@@ -2217,8 +2352,8 @@ static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r
  * accumulators, one x vector and two temporaries fit the sixteen ymm registers without
  * a spill. The gain was seen only in unrecorded exploratory runs on a shared VM, so no
  * figure is claimed for it (see the CHANGELOG). */
-static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
-                                   const uint16_t *r1, const double *xd, int n16)
+K3_ALWAYS_INLINE void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                      const uint16_t *r1, const double *xd, int n16)
 {
     const __m128i hi = _mm_set1_epi32((int)0xFFFF0000u);
     __m256d el0 = _mm256_setzero_pd(), eh0 = _mm256_setzero_pd();
@@ -2270,7 +2405,7 @@ static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r
  * f32 is the usual 16-bit left shift; vshll_n_u16 widens and shifts in one instruction.
  * The x widening this loop used to repeat per row (eight vcvt per 16 elements) is gone:
  * xd holds x already widened, in natural order. */
-static inline double k3_bf16_row_neon(const uint16_t *row, const double *xd, int n16)
+K3_ALWAYS_INLINE double k3_bf16_row_neon(const uint16_t *row, const double *xd, int n16)
 {
     float64x2_t w0 = vdupq_n_f64(0.0), w1 = vdupq_n_f64(0.0);
     float64x2_t w2 = vdupq_n_f64(0.0), w3 = vdupq_n_f64(0.0);
@@ -2301,22 +2436,20 @@ static inline double k3_bf16_row_neon(const uint16_t *row, const double *xd, int
 
 /* NEON keeps one row per pass: nothing here can measure a two-row form on Apple
  * Silicon, and its three load ports make the shared-xd saving small there. */
-static inline void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
-                                   const uint16_t *r1, const double *xd, int n16)
+K3_ALWAYS_INLINE void k3_bf16_rows2_v(double *acc0, double *acc1, const uint16_t *r0,
+                                      const uint16_t *r1, const double *xd, int n16)
 {
     *acc0 = k3_bf16_row_neon(r0, xd, n16);
     *acc1 = (r1 != r0) ? k3_bf16_row_neon(r1, xd, n16) : *acc0;
 }
 #endif
 
-void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+/* WIDEN x ONCE, in the order the vector loop reads it (see the notes above and "WIDEN x
+ * ONCE" in k3_matmul_mxfp4). Read-only and shared by every thread. NULL is a valid
+ * result: the rows then take k3_bf16_row_c, the same sum without the copy, so an
+ * allocation failure costs speed and nothing else. The caller frees it. */
+static double *k3_bf16_hoist(const float *x, int in)
 {
-    const int n16 = in & ~15;
-
-    /* WIDEN x ONCE, in the order the vector loop reads it (see the notes above and
-     * "WIDEN x ONCE" in k3_matmul_mxfp4). Read-only and shared by every thread. NULL is
-     * a valid state: the rows then take k3_bf16_row_c, the same sum without the copy,
-     * so an allocation failure costs speed and nothing else. */
 #if K3_MM_HOIST
     double *const xd = (double *)malloc((size_t)in * sizeof(double));
     if (xd) {
@@ -2326,7 +2459,46 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
         for (int i = 0; i < in; i++) xd[i] = (double)x[i];
 #endif
     }
+    return xd;
+#else
+    (void)x; (void)in;
+    return NULL;
 #endif
+}
+
+/* ONE PAIR of bf16 output rows: everything k3_matmul_bf16 does for a pair. Rows r0 and r1
+ * are summed side by side (the whole chunks through the partition and tree, from xd when
+ * it exists), each tail is fused sequentially, and each row is stored once through
+ * k3_out_f32. two == 0 means r1 is r0, an odd row count's last row, stored once at *y0.
+ * The two are still two independent sums, so a row is the same float whichever row it
+ * is paired with; k3_matmul_bf16 and k3_matmul_bf16_rows compute every row here. */
+K3_ALWAYS_INLINE void k3_bf16_pair(float *y0, float *y1, int two, const uint16_t *r0,
+                                   const uint16_t *r1, const float *x, const double *xd,
+                                   int in, int n16)
+{
+    double acc0, acc1;
+#if K3_MM_HOIST
+    if (xd) k3_bf16_rows2_v(&acc0, &acc1, r0, r1, xd, n16);
+    else
+#else
+    (void)xd;
+#endif
+    {
+        acc0 = k3_bf16_row_c(r0, x, n16);
+        acc1 = two ? k3_bf16_row_c(r1, x, n16) : acc0;
+    }
+    for (int i = n16; i < in; i++) {
+        acc0 = fma((double)k3_bf16f(r0[i]), (double)x[i], acc0);
+        acc1 = fma((double)k3_bf16f(r1[i]), (double)x[i], acc1);
+    }
+    *y0 = k3_out_f32(acc0);
+    if (two) *y1 = k3_out_f32(acc1);
+}
+
+void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out)
+{
+    const int n16 = in & ~15;
+    double *const xd = k3_bf16_hoist(x, in);
 
     /* Row PAIRS are the unit of parallel work. Output rows stay independent -- each is
      * summed by exactly one thread in exactly the order above -- so pairing them changes
@@ -2339,28 +2511,40 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
     for (int p = 0; p < npair; p++) {
         const int o0 = 2 * p;
         const int o1 = (o0 + 1 < out) ? o0 + 1 : o0;
-        const uint16_t *r0 = W + (size_t)o0 * in;
-        const uint16_t *r1 = W + (size_t)o1 * in;
-        double acc0, acc1;
-#if K3_MM_HOIST
-        if (xd) k3_bf16_rows2_v(&acc0, &acc1, r0, r1, xd, n16);
-        else
-#endif
-        {
-            acc0 = k3_bf16_row_c(r0, x, n16);
-            acc1 = (o1 != o0) ? k3_bf16_row_c(r1, x, n16) : acc0;
-        }
-        for (int i = n16; i < in; i++) {
-            acc0 = fma((double)k3_bf16f(r0[i]), (double)x[i], acc0);
-            acc1 = fma((double)k3_bf16f(r1[i]), (double)x[i], acc1);
-        }
-        y[o0] = k3_out_f32(acc0);
-        if (o1 != o0) y[o1] = k3_out_f32(acc1);
+        k3_bf16_pair(y + o0, y + o1, o1 != o0, W + (size_t)o0 * in, W + (size_t)o1 * in,
+                     x, xd, in, n16);
     }
 
-#if K3_MM_HOIST
-    free(xd);                                     /* free(NULL) is a no-op */
+    free(xd);
+}
+
+/* k3_matmul_bf16 on a selection of rows: see "selected output rows" at k3_matmul_rows.
+ * Pairs are formed over the selected rows in order, so a pair may join the last selected
+ * row of one block to the first of the next; they are still two independent sums. The
+ * row after selected row o is o + 1 inside a block's run and skips the blk - nr rows
+ * that are not selected at the end of one. */
+void k3_matmul_bf16_rows(float *y, const float *x, const uint16_t *W, int in, int out,
+                         int blk, int r0, int nr)
+{
+    const int n = k3_rows_selected("k3_matmul_bf16_rows", out, blk, r0, nr);
+    const int n16 = in & ~15;
+    if (n == 0) return;
+    double *const xd = k3_bf16_hoist(x, in);
+
+    const int npair = (n + 1) / 2;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n > 64)
 #endif
+    for (int p = 0; p < npair; p++) {
+        const int k0 = 2 * p, two = k0 + 1 < n;
+        const int b = k0 / nr, i = k0 - b * nr;              /* block, row in its run */
+        const size_t o0 = (size_t)b * (size_t)blk + (size_t)(r0 + i);
+        const size_t o1 = !two ? o0 : (i + 1 < nr ? o0 + 1 : o0 + 1 + (size_t)(blk - nr));
+        k3_bf16_pair(y + o0, y + o1, two, W + o0 * (size_t)in, W + o1 * (size_t)in, x, xd,
+                     in, n16);
+    }
+
+    free(xd);
 }
 
 /* Per-row int8 matmul for the draft model: each row is [f32 scale][int8 * in]. The int8
@@ -2368,7 +2552,70 @@ void k3_matmul_bf16(float *y, const float *x, const uint16_t *W, int in, int out
  * applied once at the end. Unlike the trunk kernels this carries NO cross-path
  * determinism contract (K3_WI8 is draft-only, and the exact model decides every emitted
  * token), so it accumulates in float with fused products and the natural AVX2 reduction,
- * which is what makes it fast. */
+ * which is what makes it fast. This is one row of it, everything k3_matmul_q8 does for a
+ * row; k3_matmul_q8_rows computes its rows here too. */
+K3_ALWAYS_INLINE float k3_q8_row(const unsigned char *row, const float *x, int in)
+{
+    float scale;
+    memcpy(&scale, row, 4);
+    const int8_t *w = (const int8_t *)(row + 4);
+    int i = 0;
+    float acc;
+#if defined(__AVX2__)
+    {
+        __m256 v0 = _mm256_setzero_ps(), v1 = _mm256_setzero_ps();
+        for (; i + 15 < in; i += 16) {
+            const __m128i b0 = _mm_loadl_epi64((const __m128i *)(w + i));
+            const __m128i b1 = _mm_loadl_epi64((const __m128i *)(w + i + 8));
+            v0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)),
+                                 _mm256_loadu_ps(x + i), v0);
+            v1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)),
+                                 _mm256_loadu_ps(x + i + 8), v1);
+        }
+        __m256 vs = _mm256_add_ps(v0, v1);
+        __m128 lo = _mm_add_ps(_mm256_castps256_ps128(vs),
+                               _mm256_extractf128_ps(vs, 1));
+        lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+        lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
+        acc = _mm_cvtss_f32(lo);
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    {
+        /* Draft-only kernel, no determinism contract: fused float accumulation
+         * and the natural NEON reduction, same as the AVX2 form's spirit. */
+        float32x4_t v0 = vdupq_n_f32(0.0f), v1 = vdupq_n_f32(0.0f);
+        float32x4_t v2 = vdupq_n_f32(0.0f), v3 = vdupq_n_f32(0.0f);
+        for (; i + 15 < in; i += 16) {
+            const int8x16_t b = vld1q_s8(w + i);
+            const int16x8_t s0 = vmovl_s8(vget_low_s8(b));
+            const int16x8_t s1 = vmovl_s8(vget_high_s8(b));
+            v0 = vfmaq_f32(v0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))),
+                           vld1q_f32(x + i));
+            v1 = vfmaq_f32(v1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))),
+                           vld1q_f32(x + i + 4));
+            v2 = vfmaq_f32(v2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))),
+                           vld1q_f32(x + i + 8));
+            v3 = vfmaq_f32(v3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))),
+                           vld1q_f32(x + i + 12));
+        }
+        acc = vaddvq_f32(vaddq_f32(vaddq_f32(v0, v1), vaddq_f32(v2, v3)));
+    }
+#else
+    {
+        float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        for (; i + 3 < in; i += 4) {
+            a0 += (float)w[i]     * x[i];
+            a1 += (float)w[i + 1] * x[i + 1];
+            a2 += (float)w[i + 2] * x[i + 2];
+            a3 += (float)w[i + 3] * x[i + 3];
+        }
+        acc = (a0 + a1) + (a2 + a3);
+    }
+#endif
+    for (; i < in; i++) acc += (float)w[i] * x[i];
+    return acc * scale;
+}
+
 void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
 {
     const unsigned char *base = (const unsigned char *)W;
@@ -2376,66 +2623,25 @@ void k3_matmul_q8(float *y, const float *x, const void *W, int in, int out)
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) if (out > 64)
 #endif
-    for (int o = 0; o < out; o++) {
-        const unsigned char *row = base + (size_t)o * rowb;
-        float scale;
-        memcpy(&scale, row, 4);
-        const int8_t *w = (const int8_t *)(row + 4);
-        int i = 0;
-        float acc;
-#if defined(__AVX2__)
-        {
-            __m256 v0 = _mm256_setzero_ps(), v1 = _mm256_setzero_ps();
-            for (; i + 15 < in; i += 16) {
-                const __m128i b0 = _mm_loadl_epi64((const __m128i *)(w + i));
-                const __m128i b1 = _mm_loadl_epi64((const __m128i *)(w + i + 8));
-                v0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b0)),
-                                     _mm256_loadu_ps(x + i), v0);
-                v1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(b1)),
-                                     _mm256_loadu_ps(x + i + 8), v1);
-            }
-            __m256 vs = _mm256_add_ps(v0, v1);
-            __m128 lo = _mm_add_ps(_mm256_castps256_ps128(vs),
-                                   _mm256_extractf128_ps(vs, 1));
-            lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
-            lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
-            acc = _mm_cvtss_f32(lo);
-        }
-#elif defined(__ARM_NEON) && defined(__aarch64__)
-        {
-            /* Draft-only kernel, no determinism contract: fused float accumulation
-             * and the natural NEON reduction, same as the AVX2 form's spirit. */
-            float32x4_t v0 = vdupq_n_f32(0.0f), v1 = vdupq_n_f32(0.0f);
-            float32x4_t v2 = vdupq_n_f32(0.0f), v3 = vdupq_n_f32(0.0f);
-            for (; i + 15 < in; i += 16) {
-                const int8x16_t b = vld1q_s8(w + i);
-                const int16x8_t s0 = vmovl_s8(vget_low_s8(b));
-                const int16x8_t s1 = vmovl_s8(vget_high_s8(b));
-                v0 = vfmaq_f32(v0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))),
-                               vld1q_f32(x + i));
-                v1 = vfmaq_f32(v1, vcvtq_f32_s32(vmovl_s16(vget_high_s16(s0))),
-                               vld1q_f32(x + i + 4));
-                v2 = vfmaq_f32(v2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))),
-                               vld1q_f32(x + i + 8));
-                v3 = vfmaq_f32(v3, vcvtq_f32_s32(vmovl_s16(vget_high_s16(s1))),
-                               vld1q_f32(x + i + 12));
-            }
-            acc = vaddvq_f32(vaddq_f32(vaddq_f32(v0, v1), vaddq_f32(v2, v3)));
-        }
-#else
-        {
-            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-            for (; i + 3 < in; i += 4) {
-                a0 += (float)w[i]     * x[i];
-                a1 += (float)w[i + 1] * x[i + 1];
-                a2 += (float)w[i + 2] * x[i + 2];
-                a3 += (float)w[i + 3] * x[i + 3];
-            }
-            acc = (a0 + a1) + (a2 + a3);
-        }
+    for (int o = 0; o < out; o++) y[o] = k3_q8_row(base + (size_t)o * rowb, x, in);
+}
+
+/* k3_matmul_q8 on a selection of rows: see "selected output rows" at k3_matmul_rows. The
+ * draft kernel has no exactness contract, but a selected row is still k3_q8_row's float,
+ * the one k3_matmul_q8 stores there. */
+void k3_matmul_q8_rows(float *y, const float *x, const void *W, int in, int out, int blk,
+                       int r0, int nr)
+{
+    const int n = k3_rows_selected("k3_matmul_q8_rows", out, blk, r0, nr);
+    if (n == 0) return;
+    const unsigned char *base = (const unsigned char *)W;
+    const size_t rowb = (size_t)4 + (size_t)in;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (n > 64)
 #endif
-        for (; i < in; i++) acc += (float)w[i] * x[i];
-        y[o] = acc * scale;
+    for (int k = 0; k < n; k++) {
+        const size_t o = (size_t)(k / nr) * (size_t)blk + (size_t)(r0 + k % nr);
+        y[o] = k3_q8_row(base + o * rowb, x, in);
     }
 }
 

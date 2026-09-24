@@ -58,7 +58,9 @@ of the per-run ratios the harness prints.
 | 4 | avx2 | 1.16 | 1.19 | 0.97x | 1.01 | 1.01 |
 
 **Exactness in the same log.** All 40 runs print the same two output hashes, old
-kernels and new, native and AVX2, 1 and 4 threads:
+kernels and new, native and AVX2, 1 and 4 threads (a same-data check on benign inputs,
+which cannot see a reordering; the order is held by `test_matmul_exact` on cancelling
+data):
 
 ```
      40              bf16  OUTPUT FNV1a = 83c8504a4cb3fac6
@@ -143,7 +145,9 @@ All 40 runs print the same `router OUTPUT FNV1a = e27b309fc654a05f`. The old and
 ranges do not overlap at either thread count. The engine runs the router threaded, so
 the four-thread row is the one that applies: 0.93 ms less per MoE layer, which over the
 92 of them is 0.09 s per token by arithmetic (0.35 s at one thread), not a measured
-s/token. The hash is a same-data check only: on this ordinary data a reordered chain
+s/token; the 25.7 MB fp32 router weight fits the 33 MiB L3 and is re-read every call,
+so these are cache-resident rates, where in the engine each layer's router is read
+once from the trunk stream. The hash is a same-data check only: on this ordinary data a reordered chain
 almost never moves a float, which is why `test_ops` holds the order on cancelling data
 instead.
 
@@ -165,7 +169,7 @@ differs only in its output format (load 0.72 to 0.94), with the same hash in all
 
 - **aarch64 / NEON.** No native arm64 machine was available; timings under qemu mean
   nothing, so none were taken. The NEON paths are covered for bits by `test_matmul_exact`
-  under qemu, not for speed.
+  in the `macos-14` CI job's `make test`, natively, not for speed.
 - **Full-model s/token.** A kernel microbenchmark on one 4-vCPU guest does not establish
   an end-to-end speedup, whose floor is set by SSD reads at small memory budgets.
 

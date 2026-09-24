@@ -26,8 +26,13 @@
  *                   the slot is never published and bind returns an error.
  *   7  ROWS         the --trunk-rows pipeline (k3_trunk_open_rows): two full walks and
  *                   a batch of positions give products bitwise equal to the resident
- *                   trunk's, a batch reads each matrix once, a failed read is sticky and
- *                   an undersized budget is refused.
+ *                   trunk's, a batch reads each matrix once, a selection of rows
+ *                   (apply_rows: kv_b's key rows, its value rows) equals the resident
+ *                   rows and reads only the tiles that hold them (or, in a compressed
+ *                   trunk's mode, the tiles a full pass reads), a --kv-latent step of
+ *                   k3_mla_cached itself equals the resident one and makes exactly the
+ *                   matrix calls and byte requests of its passes, a failed read is sticky
+ *                   and an undersized budget is refused.
  *
  * usage: test_trunk
  *   writes a synthetic trunk fixture to a temp directory, then drives k3_trunk_open /
@@ -563,6 +568,141 @@ static int test_truncated(const char *dir, const K3Cfg *c)
     return 0;
 }
 
+/* Bytes rows_read requests for one tile of len bytes at absolute file offset off: the
+ * tile itself, or under O_DIRECT the aligned span that covers it. */
+static uint64_t tile_bytes(const K3Trunk *tr, int64_t off, size_t len)
+{
+    if (!tr->direct) return len;
+    const size_t prefix = (size_t)(off % K3_TRUNK_ALIGN);
+    return ((uint64_t)len + prefix + K3_TRUNK_ALIGN - 1) & ~(uint64_t)(K3_TRUNK_ALIGN - 1);
+}
+
+/* Absolute trunk.bin offset of layer L's tensor `suffix`, or -1. */
+static int64_t tensor_file_off(const K3Trunk *tr, int L, const char *suffix)
+{
+    char name[256];
+    snprintf(name, sizeof name, PRE "layers.%d.%s", L, suffix);
+    for (int i = 0; i < tr->lay[L].nt; i++)
+        if (!strcmp(tr->lay[L].t[i].name, name)) return tr->lay[L].file_off + tr->lay[L].t[i].off;
+    return -1;
+}
+
+/* Bytes one pass requests for the rows it reads of a matrix of out rows of rowb bytes at
+ * file offset off: each block's run of the selection (rows r0 .. r0 + nr - 1 of every
+ * block of blk rows) cut at the row buffer's capacity, or with tr->rows_whole_tiles (a
+ * compressed trunk's mode) the whole matrix's tiles. A whole matrix is {out, 0, out}.
+ * These are REQUESTED bytes, what rows_read asks for and bytes_read counts: under O_DIRECT
+ * each tile widens to whole 4 KiB pages, so on this fixture, whose runs are a few dozen
+ * bytes, every run costs at least a page and a selection's runs cost at least as much as
+ * a full pass. The saving a selection makes appears only where a run spans many pages, as
+ * kv_b's 128 KiB head runs do at K3 geometry. */
+static uint64_t pass_bytes(const K3Trunk *tr, int64_t off, size_t rowb, int out, int blk,
+                           int r0, int nr)
+{
+    const size_t per = (size_t)(tr->slot_bytes - 2 * K3_TRUNK_ALIGN) / rowb;
+    if (tr->rows_whole_tiles) { blk = out; r0 = 0; nr = out; }
+    uint64_t sum = 0;
+    for (int b = 0; b < out / blk; b++)
+        for (int i = 0; i < nr;) {
+            const size_t n = (size_t)(nr - i) < per ? (size_t)(nr - i) : per;
+            sum += tile_bytes(tr, off + (int64_t)((size_t)(b * blk + r0 + i) * rowb),
+                              n * rowb);
+            i += (int)n;
+        }
+    return sum;
+}
+
+/* One row selection (rows r0 .. r0 + nr - 1 of each block of blk rows, k3_mmw_rows) of a
+ * bf16 matrix of out rows of `in`, streamed (Ws, through the row pipeline tr) against the
+ * same matrix resident (Wr). The streamed selection must equal the resident one and the
+ * resident full product on every selected row, bit for bit, write no other row, cost one
+ * matrix call, and request exactly the bytes its mode reads (pass_bytes). */
+static int check_selection(K3Trunk *tr, const void *Ws, int wdts, const void *Wr, int wdtr,
+                           int64_t off, int in, int out, int blk, int r0, int nr)
+{
+    enum { W = DENSE_INTER > HIDDEN ? DENSE_INTER : HIDDEN };
+    const float SENT = -12345.0f;
+    float x[W], got[W], want[W], full[W];
+    if (off < 0 || in > W || out > W) return 0;
+    for (int i = 0; i < in; i++) x[i] = (float)((i * 5) % 9 - 4) / 4;
+    for (int o = 0; o < out; o++) got[o] = want[o] = SENT;
+    const uint64_t expect = pass_bytes(tr, off, (size_t)in * 2, out, blk, r0, nr);
+    const uint64_t calls0 = tr->matrix_calls, bytes0 = tr->bytes_read;
+    k3_mmw_rows(got, x, Ws, wdts, in, out, blk, r0, nr);
+    int ok = tr->matrix_calls - calls0 == 1 && tr->bytes_read - bytes0 == expect &&
+             !tr->read_error;
+    k3_mmw_rows(want, x, Wr, wdtr, in, out, blk, r0, nr);
+    k3_mmw(full, x, Wr, wdtr, in, out);
+    for (int o = 0; o < out; o++) {
+        const int picked = o % blk >= r0 && o % blk < r0 + nr;
+        if (picked) ok &= !memcmp(&got[o], &want[o], 4) && !memcmp(&got[o], &full[o], 4);
+        else        ok &= got[o] == SENT && want[o] == SENT;
+    }
+    return ok;
+}
+
+/* A --kv-latent --trunk-rows STEP through the engine itself: k3_mla_cached on MLA layer
+ * Lm streamed (ws, through tr) and resident (wr), C0 positions and then a step of T more
+ * on a latent cache. Every output and every cached latent and rope row must match
+ * bitwise, and the step must cost exactly one pass over each projection (q_a, q_b, kv_a,
+ * o; the fixture has no output gate) plus, per visible position per query token, one pass
+ * over kv_b's key rows and one over its value rows: those matrix calls and those
+ * requested bytes (pass_bytes), no others. An engine pass that applied the whole of kv_b
+ * requests other tiles and fails, so this is the streamed path's own gate on the row
+ * split, as test_mla_variants' trace count is the resident path's. */
+static int check_latent_step(K3Trunk *tr, const K3Cfg *c, const K3MlaW *ws,
+                             const K3MlaW *wr, int Lm)
+{
+    enum { C0 = 3, T = 2, CAP = C0 + T };
+    const int E = c->hidden, H = c->n_heads, qn = c->qk_nope, qr = c->qk_rope;
+    const int vh = c->v_head, kvd = qn + vh, kvl = c->kv_lora, ql = c->q_lora;
+    const size_t ns = k3_mla_scratch_cached(c, C0 > T ? C0 : T, CAP, 1, 1);
+    float *scr = (float *)malloc(ns * sizeof(float));
+    float *x = (float *)malloc((size_t)CAP * E * sizeof(float));
+    float *out[2], *kvc[2], *rope[2];
+    int ok = scr && x;
+    for (int a = 0; a < 2; a++) {
+        out[a] = (float *)calloc((size_t)CAP * E, sizeof(float));
+        kvc[a] = (float *)calloc((size_t)CAP * kvl, sizeof(float));
+        rope[a] = (float *)calloc((size_t)CAP * qr, sizeof(float));
+        ok &= out[a] && kvc[a] && rope[a];
+    }
+    const int64_t oqa = tensor_file_off(tr, Lm, "self_attn.q_a_proj.weight");
+    const int64_t oqb = tensor_file_off(tr, Lm, "self_attn.q_b_proj.weight");
+    const int64_t oka = tensor_file_off(tr, Lm, "self_attn.kv_a_proj_with_mqa.weight");
+    const int64_t okb = tensor_file_off(tr, Lm, "self_attn.kv_b_proj.weight");
+    const int64_t oo = tensor_file_off(tr, Lm, "self_attn.o_proj.weight");
+    ok &= oqa >= 0 && oqb >= 0 && oka >= 0 && okb >= 0 && oo >= 0 && !ws->g;
+    uint64_t calls = 0, bytes = 0;
+    if (ok) {
+        for (int i = 0; i < CAP * E; i++) x[i] = (float)((i * 7) % 13 - 6) / 8;
+        for (int a = 0; a < 2; a++) {
+            const K3MlaW *w = a ? wr : ws;
+            k3_mla_cached(out[a], x, w, c, C0, scr, kvc[a], rope[a], 0, CAP, 1);
+            const uint64_t calls0 = tr->matrix_calls, bytes0 = tr->bytes_read;
+            k3_mla_cached(out[a] + (size_t)C0 * E, x + (size_t)C0 * E, w, c, T, scr, kvc[a],
+                          rope[a], C0, CAP, 1);
+            if (!a) { calls = tr->matrix_calls - calls0; bytes = tr->bytes_read - bytes0; }
+        }
+        uint64_t seen = 0;                        /* visible positions, summed over t */
+        for (int t = 0; t < T; t++) seen += (uint64_t)(C0 + t + 1);
+        const int qb = H * (qn + qr);                  /* q_b's rows */
+        const uint64_t want = pass_bytes(tr, oqa, (size_t)E * 2, ql, ql, 0, ql)
+            + pass_bytes(tr, oqb, (size_t)ql * 2, qb, qb, 0, qb)
+            + pass_bytes(tr, oka, (size_t)E * 2, kvl + qr, kvl + qr, 0, kvl + qr)
+            + pass_bytes(tr, oo, (size_t)H * vh * 2, E, E, 0, E)
+            + seen * (pass_bytes(tr, okb, (size_t)kvl * 2, H * kvd, kvd, 0, qn)
+                      + pass_bytes(tr, okb, (size_t)kvl * 2, H * kvd, kvd, qn, vh));
+        ok = calls == 4 + 2 * seen && bytes == want && !tr->read_error &&
+             !memcmp(out[0], out[1], (size_t)CAP * E * sizeof(float)) &&
+             !memcmp(kvc[0], kvc[1], (size_t)CAP * kvl * sizeof(float)) &&
+             !memcmp(rope[0], rope[1], (size_t)CAP * qr * sizeof(float));
+    }
+    for (int a = 0; a < 2; a++) { free(out[a]); free(kvc[a]); free(rope[a]); }
+    free(scr); free(x);
+    return ok;
+}
+
 static int test_rows(const char *dir, const K3Cfg *c)
 {
     K3Trunk tr, resident;
@@ -570,6 +710,8 @@ static int test_rows(const char *dir, const K3Cfg *c)
     if (k3_trunk_open(&resident, dir, c, 2 * FIXTURE_RUN_BYTES + 32768)) {
         k3_trunk_close(&tr); return 1;
     }
+    /* The cap is derived from the same budget, so this holds by construction: it
+     * documents the accounting rather than testing the memory bound independently. */
     ck(tr.row_buffer_bytes + tr.small_buffer_bytes < 32768,
        "rows: bounded two-buffer arena", "metadata also charged at allocation");
     /* The comparisons below can only see a misplaced tile if rows differ: see fixture_byte. */
@@ -608,6 +750,9 @@ static int test_rows(const char *dir, const K3Cfg *c)
             k3_trunk_prefetch(&tr, (L + 1) % N_LAYERS); /* must not race row reads */
         }
     }
+    /* Layer 0's 257-row matrices span several tiles; layers 1..92 compare one-tile
+     * matrices and the norms. The 92 -> 0 boundary shares the row pipeline's path with
+     * every other layer boundary, since rows_run drains its reads before returning. */
     ck(same, "rows: two full walks, exact matrices", "including final -> first layer and ragged row tiles");
 
     /* BATCHED positions read each row tile ONCE. Three positions through apply_batch must
@@ -638,6 +783,58 @@ static int test_rows(const char *dir, const K3Cfg *c)
         }
         ck(ok, "rows: batched positions, one pass", "3 positions == resident bitwise, bytes == 1 position");
     }
+
+    /* SELECTED ROWS are applied alone (K3WeightStream.apply_rows, the two --kv-latent
+     * passes), and from a plain trunk.bin read alone. An MLA layer's kv_b is split as
+     * k3_mla_cached splits it: each head's key rows, then its value rows. Layer 0's dense
+     * matrices take selections whose runs span several row tiles or hold one row each,
+     * and runs at odd offsets, where the O_DIRECT prefixes differ run to run (93-layer
+     * build; in the 3-layer build every run fits one tile). check_selection holds each to
+     * the resident matrix bit for bit and to the exact bytes of its tiles, in both read
+     * modes: the selected runs (a plain trunk.bin) and whole-matrix tiles with only the
+     * selected rows applied (rows_whole_tiles, a compressed trunk's mode, forced here on
+     * the plain file). */
+    for (int whole = 0; whole < 2; whole++) {
+        const int Lm = 2;                             /* the first MLA layer (fa[] below) */
+        const int H = c->n_heads, kvd = c->qk_nope + c->v_head;
+        tr.rows_whole_tiles = whole;
+        K3LayerBind a, b;
+        int ok = !k3_trunk_bind(&tr, c, Lm, &a) && !k3_trunk_bind(&resident, c, Lm, &b) &&
+                 a.mla.wdt == K3_WSTREAM && b.mla.wdt == K3_WBF16;
+        const int64_t kvb = tensor_file_off(&tr, Lm, "self_attn.kv_b_proj.weight");
+        if (ok) {
+            ok &= check_selection(&tr, a.mla.kv_b, a.mla.wdt, b.mla.kv_b, b.mla.wdt, kvb,
+                                  c->kv_lora, H * kvd, kvd, 0, c->qk_nope);
+            ok &= check_selection(&tr, a.mla.kv_b, a.mla.wdt, b.mla.kv_b, b.mla.wdt, kvb,
+                                  c->kv_lora, H * kvd, kvd, c->qk_nope, c->v_head);
+            ok &= check_selection(&tr, a.mla.kv_b, a.mla.wdt, b.mla.kv_b, b.mla.wdt, kvb,
+                                  c->kv_lora, H * kvd, H * kvd, 0, H * kvd);
+        }
+        ck(ok, whole ? "rows: kv_b halves, whole tiles" : "rows: kv_b key rows, value rows",
+           whole ? "== resident bitwise, reads the tiles a full pass reads"
+                 : "== resident bitwise, reads only those rows");
+        ok = !k3_trunk_bind(&tr, c, Lm, &a) && !k3_trunk_bind(&resident, c, Lm, &b) &&
+             check_latent_step(&tr, c, &a.mla, &b.mla, Lm);
+        ck(ok, whole ? "rows: kv-latent step, whole tiles" : "rows: kv-latent engine step",
+           "k3_mla_cached == resident bitwise, exact matrix calls and requested bytes");
+        ok = !k3_trunk_bind(&tr, c, 0, &a) && !k3_trunk_bind(&resident, c, 0, &b);
+        const int64_t gate = tensor_file_off(&tr, 0, "mlp.gate_proj.weight");
+        const int64_t down = tensor_file_off(&tr, 0, "mlp.down_proj.weight");
+        if (ok) {
+            ok &= check_selection(&tr, a.lay.dense_gate, a.lay.wdt, b.lay.dense_gate,
+                                  b.lay.wdt, gate, HIDDEN, DENSE_INTER, DENSE_INTER, 3,
+                                  DENSE_INTER - 5);
+            ok &= check_selection(&tr, a.lay.dense_gate, a.lay.wdt, b.lay.dense_gate,
+                                  b.lay.wdt, gate, HIDDEN, DENSE_INTER, 1, 0, 1);
+            ok &= check_selection(&tr, a.lay.dense_down, a.lay.wdt, b.lay.dense_down,
+                                  b.lay.wdt, down, DENSE_INTER, HIDDEN, 4, 1, 2);
+            ok &= check_selection(&tr, a.lay.dense_down, a.lay.wdt, b.lay.dense_down,
+                                  b.lay.wdt, down, DENSE_INTER, HIDDEN, 8, 0, 8);
+        }
+        ck(ok, whole ? "rows: selections, whole tiles" : "rows: selections across tiles",
+           "one run over tiles, one row per run, odd offsets");
+    }
+    tr.rows_whole_tiles = 0;
     k3_trunk_close(&resident);
     K3LayerBind b;
     if (k3_trunk_bind(&tr, c, 0, &b)) { k3_trunk_close(&tr); return 1; }

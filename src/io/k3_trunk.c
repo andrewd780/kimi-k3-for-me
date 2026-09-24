@@ -213,6 +213,45 @@ static int rows_wait(K3Rows *r)
     return result;
 }
 
+/* THE ROWS A PASS APPLIES: rows r0 .. r0 + nr - 1 of each block of blk rows, out / blk
+ * blocks, as in k3_mmw_rows. A whole matrix is the one block {blk = nr = out, r0 = 0}.
+ * Selected row k is matrix row (k / nr) * blk + r0 + k % nr; a block's selected rows are
+ * one contiguous run on disk, and consecutive runs are not. */
+typedef struct { int blk, r0, nr; } K3RowSel;
+
+static int rows_sel_row(const K3RowSel *s, int k)
+{
+    return (k / s->nr) * s->blk + s->r0 + k % s->nr;
+}
+
+/* Rows in the tile that starts at selected row k: at most `per`, and never past the end
+ * of k's run, since the next run is not adjacent on disk. For a whole matrix this is the
+ * tiling of old, one run of out rows cut every `per` rows. */
+static size_t rows_sel_tile(const K3RowSel *s, int k, size_t per)
+{
+    const size_t left = (size_t)(s->nr - k % s->nr);
+    return left < per ? left : per;
+}
+
+/* Apply the selected rows that tile [first, first + count) holds: the part of each run
+ * inside it, written to its own rows of Y. A tile cut from the selection's own runs holds
+ * one run's part, a single call; a whole-matrix tile holds a part of every run it
+ * crosses. The whole matrix itself is one run, so its tile is one call, as always. */
+static void rows_apply_tile(const K3RowSel *sel, const unsigned char *weight, size_t row,
+                            int wdt, int first, int count, float *Y, int ldy,
+                            const float *X, int ldx, int in, int T)
+{
+    const int end = first + count;
+    for (int b = first / sel->blk; b * sel->blk < end; b++) {
+        int lo = b * sel->blk + sel->r0, hi = lo + sel->nr;
+        if (lo < first) lo = first;
+        if (hi > end) hi = end;
+        if (lo < hi)
+            k3_mmw_batch_ld(Y + lo, ldy, X, ldx, weight + (size_t)(lo - first) * row, wdt, in,
+                            hi - lo, T);
+    }
+}
+
 /* One pass over a streamed matrix for T positions: position t reads X + t*ldx and writes
  * Y + t*ldy. Each row tile is read from disk ONCE and applied to every position before the
  * next tile replaces it, so a T-position batch costs one matrix of I/O rather than T. The
@@ -220,35 +259,60 @@ static int rows_wait(K3Rows *r)
  * the per-position kernel's (see k3_ops.c), and tiling splits output ROWS only, so every
  * output is the same float whether the matrix is tiled, resident, or batched. T == 1 takes
  * the single-position kernel through k3_mmw_batch_ld, so decode runs exactly as before.
- * matrix_calls counts passes, which is what the no-reread gate in test_offline_cli.py
- * compares. */
+ *
+ * A pass applies only the rows `sel` selects (every row for apply and apply_batch; the
+ * rows k3_mmw_rows asks for through apply_rows) and writes each to its own row of Y, as
+ * the whole product would. HOW IT READS THEM depends on the file. From a plain trunk.bin
+ * the tiles are cut from the selected runs, so only their bytes are read: half of kv_b
+ * per --kv-latent pass at K3 geometry, as 96 reads of one head's 128 KiB of rows instead
+ * of three 8 MiB tiles. That is fewer bytes in more requests: in an informal O_DIRECT
+ * check on the development VM's disk (two runs, the best of seven passes each; not a
+ * committed measurement) the 96 reads took 10.1 and 11.4 ms where the three took 16.9
+ * and 18.5, and a device whose per-request latency is high relative to its bandwidth
+ * gains less. A compressed trunk
+ * decodes the whole block behind a read (1 MiB by default, four heads of kv_b), so
+ * reading run by run would decode each block once per run it holds; there
+ * (rows_whole_tiles) the tiles are whole-matrix tiles, read as a full pass reads them,
+ * and only their selected rows are applied.
+ *
+ * On a failure every row of Y is zeroed and read_error is set. matrix_calls counts passes,
+ * which is what the no-reread gate in test_offline_cli.py compares. */
 static void rows_run(const K3RowMatrix *m, float *Y, int ldy, const float *X, int ldx,
-                     int in, int out, int T)
+                     int in, int out, int T, K3RowSel sel)
 {
     K3Rows *r = m->owner;
     const size_t esz = m->dtype == K3_DT_BF16 ? 2u : 4u;
+    const int wdt = m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32;
     if (T <= 0) return;
     if (in <= 0 || out <= 0 || (uint64_t)in * (uint64_t)out > INT64_MAX / esz ||
         (int64_t)((uint64_t)in * (uint64_t)out * esz) != m->nbytes ||
-        (T > 1 && (ldy < out || ldx < in))) goto failed;
+        (T > 1 && (ldy < out || ldx < in)) ||
+        sel.blk <= 0 || out % sel.blk != 0 || sel.nr <= 0 || sel.r0 < 0 ||
+        sel.nr > sel.blk - sel.r0) goto failed;
     const size_t row = (size_t)in * esz;
     if (r->tr->read_error || row > r->payload) goto failed;
     const size_t per = r->payload / row;
+    const K3RowSel whole = {out, 0, out};
+    const K3RowSel cut = r->tr->rows_whole_tiles ? whole : sel;   /* rows the reads cover */
+    const int total = out / cut.blk * cut.nr;
     r->tr->matrix_calls++;
-    int first = 0, slot = 0;
-    size_t count = (size_t)out < per ? (size_t)out : per;
-    rows_submit(r, slot, m->off, count * row);
-    while (first < out) {
+    int k = 0, slot = 0;
+    size_t count = rows_sel_tile(&cut, 0, per);
+    rows_submit(r, slot, m->off + (int64_t)rows_sel_row(&cut, 0) * (int64_t)row, count * row);
+    while (k < total) {
         if (rows_wait(r)) goto failed;
-        const int next = first + (int)count;
-        const size_t nnext = (size_t)(out - next) < per ? (size_t)(out - next) : per;
-        if (nnext) rows_submit(r, 1 - slot, m->off + (int64_t)next * (int64_t)row, nnext * row);
+        const int next = k + (int)count;
+        const size_t nnext = next < total ? rows_sel_tile(&cut, next, per) : 0;
+        if (nnext)
+            rows_submit(r, 1 - slot,
+                        m->off + (int64_t)rows_sel_row(&cut, next) * (int64_t)row,
+                        nnext * row);
+        const int first = rows_sel_row(&cut, k);
         const int64_t off = m->off + (int64_t)first * (int64_t)row;
         const size_t prefix = r->tr->direct ? (size_t)(off % K3_TRUNK_ALIGN) : 0;
-        const void *weight = r->buf[slot] + prefix;
-        k3_mmw_batch_ld(Y + first, ldy, X, ldx, weight,
-                        m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32, in, (int)count, T);
-        first = next; count = nnext; slot = 1 - slot;
+        rows_apply_tile(&sel, r->buf[slot] + prefix, row, wdt, first, (int)count, Y, ldy, X,
+                        ldx, in, T);
+        k = next; count = nnext; slot = 1 - slot;
     }
     return;
 failed:
@@ -259,13 +323,27 @@ failed:
 
 static void rows_apply(const K3WeightStream *stream, float *y, const float *x, int in, int out)
 {
-    rows_run((const K3RowMatrix *)stream, y, out, x, in, in, out, 1);
+    const K3RowSel all = {out, 0, out};
+    rows_run((const K3RowMatrix *)stream, y, out, x, in, in, out, 1, all);
 }
 
 static void rows_apply_batch(const K3WeightStream *stream, float *Y, int ldy,
                              const float *X, int ldx, int in, int out, int T)
 {
-    rows_run((const K3RowMatrix *)stream, Y, ldy, X, ldx, in, out, T);
+    const K3RowSel all = {out, 0, out};
+    rows_run((const K3RowMatrix *)stream, Y, ldy, X, ldx, in, out, T, all);
+}
+
+/* The --kv-latent passes: kv_b's key rows to score a cached position, its value rows to
+ * weight it, each applied without the other half and, from a plain trunk.bin, read
+ * without it (see rows_run). Selecting no rows reads and writes nothing, as in the
+ * resident kernels. */
+static void rows_apply_rows(const K3WeightStream *stream, float *y, const float *x, int in,
+                            int out, int blk, int r0, int nr)
+{
+    if (nr == 0) return;
+    const K3RowSel sel = {blk, r0, nr};
+    rows_run((const K3RowMatrix *)stream, y, out, x, in, in, out, 1, sel);
 }
 
 static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
@@ -277,6 +355,7 @@ static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
         if (r->count == 64) return -1;
         K3RowMatrix *m = &r->matrix[r->count++];
         m->stream.apply = rows_apply; m->stream.apply_batch = rows_apply_batch;
+        m->stream.apply_rows = rows_apply_rows;
         m->owner = r;
         m->off = off; m->nbytes = nb; m->dtype = dt;
         *dest = m;
@@ -516,6 +595,7 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
         }
     }
 
+    tr->rows_whole_tiles = tr->zfile != NULL;
     if (rows) return rows_open(tr, c, budget_bytes);
     const size_t widen = k3_bind_widen_bytes(c);
     int64_t total = 0;

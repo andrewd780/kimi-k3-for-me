@@ -36,6 +36,8 @@ class LookaheadTests(unittest.TestCase):
     def test_full_jacobi_convergence_cannot_prove_a_speedup(self):
         # w draft sweeps + one verification emit at most w+1 tokens. Even free
         # replay cannot improve on plain decode when every sweep costs one step.
+        # This checks the cost model's identity (w+1)/(w+1) at p = 1, V = 1, D = w,
+        # R = 0; it does not run jacobi_proposal or any convergence.
         for window in range(1, 9):
             value = lg.analyze(F(1), window, F(1), F(window), F(0))
             self.assertEqual(F(value["speed_ratio"]), 1)

@@ -218,7 +218,10 @@ int main(void)
 {
     {
         /* Head widths off and on the SIMD lane count, and every history length that
-         * behaves differently: none, shorter than a sweep, and the released conv_k 4. */
+         * behaves differently: none, shorter than a sweep, and the released conv_k 4.
+         * K3's own width (D = 128, H = 96) is not among them: the bit-exactness argument
+         * does not depend on D, and the SIMD tile split at that width is covered by the
+         * oracle gates, not by this suite. */
         const int geo[][4] = { {24, 3, 8, 4}, {20, 2, 5, 4}, {16, 2, 8, 1},
                                {16, 2, 9, 2}, {40, 4, 16, 4} };
         unsigned checks = 0;

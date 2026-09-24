@@ -50,7 +50,7 @@ def main():
             print(name + " " + log, flush=True)
             logs[target] = log
         data = (directory / "logits.bin").read_bytes()
-        if not data or "24 passed, 0 failed, 0 skipped" not in logs["test_ops"]:
+        if not data or "25 passed, 0 failed, 0 skipped" not in logs["test_ops"]:
             raise ValueError("empty/missing fixture gate")
         arms[name] = {"arch_flags": flags.strip(), "oracle_bytes": len(data),
                       "oracle_sha256": hashlib.sha256(data).hexdigest(),

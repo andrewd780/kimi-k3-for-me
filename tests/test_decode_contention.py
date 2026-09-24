@@ -96,8 +96,10 @@ class BreakEvenTest(unittest.TestCase):
             self.assertLessEqual(w["speedup"], m["speedup"])
 
     def test_worst_case_bounds_every_repeat(self):
-        # However the runs pair up, the worst speedup is at or below each repeat's own
-        # speedup (its five arms together) and the worst resident slowdown at or above.
+        # The worst speedup is at or below each repeat's own speedup (its five arms
+        # paired together, the diagonal pairing) and the worst resident slowdown at or
+        # above. That the bound holds for every other pairing of runs follows from the
+        # monotonicity of break_even in each rate; it is not exercised here.
         names = ("decode_alone", "decode_concurrent", "matmul_all_threads",
                  "matmul_rest_threads", "matmul_concurrent")
         rng = random.Random(20260923)

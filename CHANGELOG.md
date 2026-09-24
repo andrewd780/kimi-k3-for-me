@@ -30,11 +30,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of 4 on AVX2, 8 when AVX-512VL gives the compiler 32 vector registers, and 2 on NEON.
   On the reference VM a block of 8 takes 7% to 13% less time than 4 with AVX-512VL (a
   tie at 16 positions on four threads) and 2% to 9% more on plain AVX2 (`bench_batch`,
-  8 to 16 positions); the block is a loop shape only and cannot move an output. Against
+  8 to 16 positions; the AVX2 differences sit inside the timing note's 10% noise
+  band, so the AVX2 default of 4 rests on the register count as much as on them); the
+  block is a loop shape only and cannot move an output. Against
   the exact one-position decode kernel, batching takes a 12288 x 7168 projection of 8
   positions from 160 to 83 ms on one thread and from 45 to 21 ms on four, and a
   16-position lm_head block from 1,319 to 581 ms on four: about 2x, not the 3x an
-  earlier timing against the older kernel showed. Every run is in
+  earlier timing against the older kernel showed (that earlier timing's raw data is
+  not in the repository). Every run is in
   [docs/notes/research-results.md](docs/notes/research-results.md#batched-kernel-timing).
   **Public API:** `K3WeightStream` (include/k3/k3.h), the streamed-matrix descriptor
   that `--trunk-rows` introduces, carries an optional `apply_batch` callback besides
@@ -61,13 +64,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   probability quotients the output rounds away, which the engine exposes through a new
   test-only hook, `k3_mla_trace` (NULL outside tests); a mutation run shows the gate
   catches reordered chains in the variants and in both engine layouts. `bench_mla
-  counts` counts kv_b applications: at a 256-token prefill L0 makes 65,792 per layer and
-  L1 256. A differs from E by ~1e-6 relative, as much as E differs from a double
-  reference, with no argmax change in 30,000 softmax rows; it is not bitwise, so it
-  cannot be a mode under the exactness contract. Timed on the idle 4-core VM with the
+  counts` counts kv_b applications: at a 256-token prefill L0 makes 32,896 per layer and
+  L1 256 (L0 applied all of kv_b on both of its passes and used only the key rows in one
+  and the value rows in the other, 65,792 applications; the row split that halves that
+  at identical bits was found in review and is now done, see Changed). A differs from E
+  by ~1e-6 relative, as much as E differs from a double reference, with no argmax change
+  in 3 x 10,000 attention-score rows of a flat synthetic softmax; it is not bitwise, so
+  it cannot be a mode under the exactness contract. Timed on the idle 4-core VM with the
   shipped kernels (one layer, four threads): E+ is 4.8-5.5x faster than E for one new
-  token and 6.6-15x for five; L1 halves L0 at decode and takes a 256-token prefill from
-  43 s to 0.53 s per layer, but rebuilding stays 34-51x slower than E+ at decode; A is
+  token and 6.6-15x for five; L1 halved the L0 of that study at decode and takes a
+  256-token prefill from its 43 s to 0.53 s per layer, but rebuilding stays 34-51x
+  slower than E+ at decode; A is
   the fastest at long contexts. The hosted macOS arm64 and Ubuntu runs pass the same
   gates and counts. See [the note](docs/notes/mla-variants.md).
 - **Fixed-width trunk dictionary gates** (benchmark-only, not in inference): a
@@ -77,8 +84,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   x86/ARM under sanitizers; the rate gate passes with every SIMD run at
   14.8–26.7 reconstructed BF16 GB/s against a 4 GB/s target. Each ISA's slowest run
   is 14.7x (x86_64) and 11.0x (arm64) the compact Huffman kernel's best run on the
-  four KDA `f_a_proj` ranges, where its ratio trails Huffman's by 7.80 points
-  (0.7503 against 0.6722), missing the six-point requirement. Follow-up gates, run in
+  four KDA `f_a_proj` ranges (different CI runs, runners and buffer sizes, so
+  indicative rather than matched), where its ratio trails Huffman's by 7.80 points
+  (0.7503 against 0.6722), missing the six-point requirement. The design has public
+  precedents (ZipServ, ASPLOS'26; dgpp and NWC on GitHub a day earlier), recorded in
+  the note's prior-art section. Follow-up gates, run in
   hosted CI (run 35845709912) except where a VM is named: a bit-width curve with
   entropy bounds (3 bits beat 4 by 4.68 points on the eight ranges and by 3.78
   byte-weighted over all 23 families); an FD3B 3-bit decoder, byte-exact under
@@ -88,7 +98,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (the pooled table covers 98.49% of `moe.router` and 98.88% of `moe.shared_down`),
   after which the plan fixed before the data gives the router its own table, keeps
   `shared_down` raw and reaches r = 0.7329 over all 108.76 GB of matrices, 5.58
-  points above per-family Huffman; and a decode-under-matmul-contention benchmark,
+  points above per-family Huffman (about 2.3 of those points are the raw fallback the
+  bound does not take: coding every family at its better width gives 0.7128, 3.57
+  points above Huffman; the STOP rule is scored in 4-bit coverage while the widths
+  chosen are 3-bit, see the note's correction); and a decode-under-matmul-contention benchmark,
   whose worst-case streamed speedup stays above 1 up to a 4 GB/s SSD in every run on a
   4-vCPU VM with the shipped kernels (5 GB/s is marginal: it passes in the idle runs and
   fell just below 1 in one run taken during background downloads; it fails at 6 GB/s for
@@ -101,11 +114,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   two 93-layer row walks with wraparound over position-dependent fixture bytes
   (`test_trunk_rows`), ThreadSanitizer and ASan/UBSan. A batch of
   positions reads each matrix once (see the batched matmul entry above); `--kv-latent`
-  still rereads `kv_b` per rebuilt position. `--trunk-gb` caps the two buffers in this
+  still rereads `kv_b` per rebuilt position, from a plain `trunk.bin` only the half each
+  pass applies (see Changed). `--trunk-gb` caps the two buffers in this
   mode and the memory plan charges the whole budget, so pass a small one; the run
   report gives the mode's binds, matrix passes, reader tile time and main-thread
-  waits. No full-model speedup is claimed. Fixes the trunk JSON ownership leak and
-  parallel read error-flag race uncovered by those gates. Every refusal of a malformed
+  waits. No full-model speedup is claimed. Fixes the trunk JSON ownership leak, which
+  ASan exposed, and a parallel read error-flag race (the sanitizer jobs build the row
+  fixture without OpenMP, so ThreadSanitizer did not exercise the parallel loop that
+  held it). Every refusal of a malformed
   `trunk.json` now names its reason (no layers, a negative or overflowing run, a tensor
   outside its layer's run, a misaligned offset).
 - **Executable research gates** for the other four proposals: a compact
@@ -116,19 +132,27 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The decoder is 2.63x/3.35x faster than the old kernel by median on the four
   sampled K3 ranges (hosted x86/ARM respectively), all KDA `f_a_proj` and together
   0.12% of trunk bytes, but fails the strict every-run throughput gate and remains
-  outside inference. No model-level gain is claimed.
+  outside inference. The comparison has two arms, so it does not separate the three
+  changes; the ARM median rests on three runs spread from 0.94 to 1.35 GB/s; and the
+  shelved note's Huff0 figure, 1724 MB/s on the same kind of bytes, is about three
+  times this prototype's high-byte symbol rate. No model-level gain is claimed.
 - **Predictive-prefetch gate correction:** routing diagnostics require declared
   source-layer lead and decode phase; zero lead is oracle-only. Removed inferred
   read counters and the 70% promotion flag. The [ordered audit](docs/notes/predictive-prefetch-gates.md)
   records all real k=1/2/4 scores as unmeasured, the equal-slot static null, and
   whole-expert byte accounting. The route is closed on its traffic arithmetic: at an
-  assumed 70% recall, uncancelled misses add about 5.76% to whole-token reads, and no
-  generation capture reopens it. The existing prefix replay is not eligible evidence.
+  assumed 70% recall with 16 guesses per layer, wrong guesses that are never cancelled
+  add about 5.76% to whole-token reads in the streamed-trunk regime, where experts are
+  19.2% of the bytes (with the trunk resident the same guesses would add about 30% to
+  disk bytes; that regime is not analysed), and no generation capture reopens it. The
+  existing prefix replay is not eligible evidence.
 
 - **Research queue**, `docs/notes/research-queue.md`: what each of the five
   checkpoint-free proposals became, the gates each still has open, and the arithmetic
-  that bounds them; a per-machine ordering drafted from the memory ladder did not hold
-  and is not kept. The status board points at it, carries the research-gate rows, and
+  that bounds them; a per-machine ordering drafted from the memory ladder was withdrawn
+  because its premises (a prefill-averaged ladder captured before the asynchronous
+  reader and the fused kernels) no longer hold, not because a measurement contradicted
+  it. The status board points at it, carries the research-gate rows, and
   lists `--kv-latent`, `--trunk-rows` and replay-free rollback under shipped with their
   evidence.
 - **`--kv-latent`**, off by default: the incremental decoder's MLA KV cache holds only
@@ -136,10 +160,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-head k and v through `kv_b` on every use, which is what MLA's own design caches.
   That is 0.055 MB per position across the 24 MLA layers instead of 2.37 MB, 42.8x less,
   and it turns a 131,072-position context from 310.04 GB of cache into 7.25 GB. It is
-  paid for in arithmetic: every cached position is re-expanded twice per decode step,
-  once to score and once to weight the values. Output is BITWISE identical, not close:
-  the latent stored is exactly the bytes the expanded path fed to `kv_b`, the rebuild
-  uses the same kernel, and every softmax reduction keeps its order, so GATE 3b of the
+  paid for in arithmetic: every cached position is re-expanded on every decode step,
+  its key rows to score and its value rows to weight the values, one `kv_b`
+  application's worth (see Changed for the row split). Output is BITWISE identical, not
+  close: the latent stored is exactly the bytes the expanded path fed to `kv_b`, the
+  rebuild computes each row with the same kernel code, and every softmax reduction
+  keeps its order, so GATE 3b of the
   oracle compares all logits of all steps rather than tokens. The memory plan, the KV
   line and `k3_run.json` report the layout actually allocated; `--save-state` records it
   in the header and a cross-layout `--load-state` is refused by name rather than read at
@@ -186,6 +212,48 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`--kv-latent` applies only the `kv_b` rows each pass reads, with the same bits.**
+  The latent branch of `k3_mla_cached` rebuilds every cached position twice per query
+  token, but the score pass reads only each head's key rows (W_uk) and the value pass
+  only its value rows (W_uv), and both used to apply all 24,576 rows of `kv_b`. Each
+  pass now applies its own 12,288 rows through the new `k3_mmw_rows` (`k3_matmul_rows`,
+  `k3_matmul_bf16_rows`, `k3_matmul_q8_rows`), still one OpenMP region and one widening
+  of x per call: one `kv_b` application's worth, 12.6M multiply-adds, per cached
+  position per query token instead of two. The matvec is row-independent and every
+  selected row runs the per-row code the full kernels run (now shared and always
+  inlined; the full kernels' outlined loops were compared on this x86 AVX-512 build
+  only, where they compile to the same instruction counts as before), so every score,
+  normaliser, quotient and logit is unchanged: `test_mla_variants` (with the engine's
+  scratch now poisoned) and GATE 3b hold it bitwise. The engine's own count is gated
+  too: its trace hook counts the `kv_b` rows each call applies (`K3MlaTrace.kvb_rows`,
+  new), and `test_mla_variants` holds the latent layout to L0's closed form and the
+  expanded one to E's in every case, so a pass that went back to applying the whole
+  matrix fails even though its bits are the same. A new `test_ops` gate, `matmul_rows`,
+  holds the three kernels and every weight tag to the full kernels, checks that no other
+  row is written, and where the platform can fork, that a selection naming rows outside
+  the matrix aborts, which the kernels now check (test_ops reports 25 checks; the CI and
+  `tools/bench_kda.py` tripwires expect 25). Under `--trunk-rows` a pass requests only
+  its half of `kv_b` from a plain `trunk.bin`, at K3 geometry 96 reads of 128 KiB
+  instead of three 8 MiB tiles. The saving is in requested bytes and appears at that
+  geometry: under O_DIRECT a run shorter than a 4 KiB page still costs a page, so on
+  `test_trunk`'s fixture, whose `kv_b` runs are 32 bytes, the key half requests at least
+  as many bytes as a full pass. `test_trunk` checks the exact requested bytes and matrix
+  calls of each selection and of a whole `--kv-latent` step of `k3_mla_cached`, against
+  the resident layer bitwise. A compressed trunk still reads whole tiles and applies
+  only the selected rows, since reading head by head would decode each 1 MiB block about
+  four times per pass; the run report's new `trunk_rows_whole_tiles` says which, and
+  `test_offline_cli.py` asserts it is true for a real compressed trunk and false for a
+  plain one. `bench_mla counts` now counts `kv_b` in whole-matrix equivalents (rows
+  applied), so L0's closed form is T(C+1) + T(T-1)/2, half the old one: 257 at C = 256,
+  T = 1 (was 514) and 32,896 at a 256-token prefill (was 65,792). An informal timing on
+  the 4-core VM, not a measurement against variance: L0 at C = 256, T = 1 on four
+  threads, three processes per binary, went from per-process medians of 325-381 ms to
+  177-210 ms per call. L1's medians moved too, from 174-194 to 147-163 ms, and since
+  this change also refactored the `k3_matmul_bf16` that L1's rebuilds run on, that shift
+  cannot be separated from noise; see [the note](docs/notes/mla-variants.md). **Public
+  API:** `K3WeightStream` gains a third optional callback, `apply_rows` (NULL falls back
+  to `apply`, every row), so a stream built on the stack must zero it too; `K3MlaTrace`
+  gains `kvb_rows`, which a caller building one must zero.
 - **Decode matmul kernels do less work per weight, with the same bits.** `k3_matmul`,
   `k3_matmul_bf16` and `k3_matmul_mxfp4` widen x to double once per call instead of once
   per row (x86 reads it in an even/odd layout that drops the bf16 zero-extend shuffles);
@@ -195,8 +263,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keeps the accumulation partition and reduction tree it had, so bf16/fp32 stay
   bit-identical across scalar, AVX2, AVX-512 and NEON, and MXFP4 keeps its per-ISA bits
   (AVX-512 reproduces AVX2). A new gate, `test_matmul_exact`, re-implements each order
-  in plain C and compares every bit on cancelling data built so that any other order
-  changes the float; it rejects reordered, rotated and lane-swapped sums in-test, and a
+  in plain C and compares every bit on cancelling data built so that a different
+  partition or tree changes the float; in-test it sums the same data in four named
+  wrong orders (sequential, the other tree, rotated lanes, lanes 0 and 1 swapped) and
+  requires each to be rejected in at least 10% of the eligible rows (39% to 92% in
+  practice: 2593, 1571, 1050 and 1087 of 2818 or 1241), so the data is shown to
+  discriminate against those orders rather than against every conceivable one; a
   CI job runs it on the AVX-512 build whenever the runner has AVX-512. Every NaN output
   of `k3_matmul` and `k3_matmul_bf16` is now the quiet NaN `0x7FC00000`: a NaN's sign
   and payload are not fixed by the summation order, and the two rows of a bf16 pair
@@ -231,7 +303,9 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   committed with `k3_kda_advance`, bit-identical to serial decode and reading no
   weights. MLA needs nothing: its KV rows are positional. The 626 MB state snapshot
   (all 93 layers at K3 size, 69 of which carry state) is gone; `--spec 4` now holds a
-  102 MB per-position log plus one 6.7 MB work layer, counted in the memory plan. The
+  102 MB log (five positions at 20.4 MB each) plus one 6.7 MB work layer, counted in
+  the memory plan. "Never replays" means no second forward and no weight re-read; the
+  commit still recomputes the KDA recurrence for the kept positions. The
   hybrid `--draft-trunk` path commits the same way and folds its catch-up into the
   next round's first call, so it runs no replay, catch-up or lockstep sweeps either.
   The run report and `--out` JSON count verify sweeps, acceptances and forward sweeps

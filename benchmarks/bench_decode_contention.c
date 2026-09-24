@@ -18,8 +18,10 @@
  *
  * Input placement brackets the pipeline. "stream" cycles through all 22 chunks of the
  * whole compressed matrix, so the decoder reads DRAM as a cold row pipeline would;
- * "hot" re-decodes one chunk, whose compressed bytes stay cache-resident, as when the
- * decoder runs right behind the read that landed them. Both write alternating buffers.
+ * "hot" re-decodes one chunk, whose compressed bytes were just touched, as when the
+ * decoder runs right behind the read that landed them (at 5.6 to 6.0 MiB, 8 MiB x r, the
+ * chunk exceeds a 1 MiB L2 and shares the L3 with the matmul's stream, so "hot" is
+ * recently touched, not verified cache-resident). Both write alternating buffers.
  *
  * Synthetic weights: high bytes drawn from the committed four-range high-byte histogram
  * (docs/measurements/research-two-symbol.json, experiments[1], 2,097,152 values), low

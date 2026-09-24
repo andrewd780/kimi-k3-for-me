@@ -4,9 +4,13 @@
 what the repository establishes, not a new K3 experiment. No checkpoint host,
 hidden-state generation capture or predictive reader exists here. Work on the
 predictive reader is **closed**, independently of any future generation capture.
-Nothing runs on Andrew's machines. At assumed 70% recall, uncancelled misses add
-about 5.76% to the stated whole-token traffic baseline; experts are only 19.2%
-of that baseline. Andrew's follow-up closes this research route and directs the
+Nothing runs on Andrew's machines. At assumed 70% recall with 16 guesses per layer,
+wrong guesses that are never cancelled add about 5.76% to the stated whole-token
+traffic baseline of the streamed-trunk regime, where experts are only 19.2% of that
+baseline; with the trunk resident the same guesses would add about 30% to disk bytes,
+a regime this audit does not analyse (wording corrected 2026-09-24: the extra bytes
+are wrong guesses, not "misses"; a missed expert is a demand read the baseline already
+pays). Andrew's follow-up closes this research route and directs the
 next experiment to the [fixed-width trunk falsifier](fixed-width-trunk.md).
 The audit below is retained as the historical gate/accounting record, not a
 request to collect a generation trajectory or reopen predictive prefetch.
@@ -146,7 +150,11 @@ At assumed recall r=0.7 this is **33.5784443904 GB**, **7.7488717824 GB extra**
 per step. Adding the approximately 108.81 GB trunk gives 142.3884443904 GB,
 about **5.76% more total traffic**. This is conditional arithmetic, not an
 upper bound with eviction, a measurement, or a speedup. Cancellation and real
-residency require a schedule; recall by itself cannot determine bytes.
+residency require a schedule; recall by itself cannot determine bytes. The `2 - r`
+form also assumes exactly k = 16 guesses per layer, so that precision equals recall;
+a thresholded predictor that fetched fewer guesses at higher precision would add
+less, and the trunk-resident regime, where experts are nearly all of the disk bytes,
+is not covered by the 5.76%.
 
 Do not evaluate this as a prefill lever. With independent uniform top-16 sets
 among 896 experts, expected coverage is `1-(1-16/896)^n`: **83.50% at n=100**,
