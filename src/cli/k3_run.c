@@ -2237,6 +2237,7 @@ int main(int argc, char **argv)
                 "\"trunk_matrix_calls\":%llu,\"trunk_rows_whole_tiles\":%s,"
                 "\"trunk_kvb_mode\":\"%s\",\"trunk_kvb_buffer_bytes\":%llu,\"trunk_kvb_fills\":%llu,"
                 "\"trunk_kvb_hits\":%llu,\"trunk_kvb_fill_bytes\":%llu,\"trunk_kvb_fallbacks\":%llu,"
+                "\"trunk_kvb_metadata_bytes\":%llu,\"trunk_kvb_fill_seconds\":%.9f,"
                 "\"stopped_at\":%d,"
                 "\"decode_steps\":%d,\"forward_sweeps\":%ld,\"spec_n\":%d,"
                 "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
@@ -2269,6 +2270,8 @@ int main(int argc, char **argv)
                 (unsigned long long)(w.trunk ? w.trunk->kvb_hits : 0),
                 (unsigned long long)(w.trunk ? w.trunk->kvb_fill_bytes : 0),
                 (unsigned long long)(w.trunk ? w.trunk->kvb_fallbacks : 0),
+                (unsigned long long)(w.trunk ? w.trunk->kvb_metadata_bytes : 0),
+                w.trunk ? w.trunk->kvb_fill_seconds : 0.0,
                 stopped_at,
                 steps, w.forwards, spec_n, spec_sweeps, spec_drafted, spec_accepted,
                 spec_full, spec_partial, spec_cut, spec_dropped,

@@ -110,7 +110,7 @@ typedef struct {
     uint64_t      row_buffer_bytes, small_buffer_bytes, matrix_calls;
     /* Row pipeline only, both on the main thread: time blocked waiting for a row tile,
      * and time spent reading the current layer's vectors synchronously in bind. The rest
-     * of load_seconds is the reader thread's, which may overlap the matmuls. */
+     * of load_seconds, less kvb_fill_seconds, is the reader thread's and may overlap matmuls. */
     double        row_wait_seconds, row_sync_seconds;
 
     /* kv_b buffer for the --kv-latent passes (row pipeline only, opt-in; the private research notes, findings
@@ -121,7 +121,9 @@ typedef struct {
      * The buffer is charged to the trunk budget; the kernels and the rows they apply are
      * unchanged, so the output is bit-identical. */
     int           kvb_mode;          /* K3_KVB_OFF, K3_KVB_ACTIVE or K3_KVB_PIN */
-    uint64_t      kvb_buffer_bytes;  /* allocated, charged to the budget */
+    uint64_t      kvb_buffer_bytes;  /* aligned slots, charged to the budget */
+    uint64_t      kvb_metadata_bytes; /* PIN's per-layer heap arrays, also charged */
+    double        kvb_fill_seconds;  /* synchronous portion of load_seconds */
     uint64_t      kvb_fills, kvb_hits, kvb_fill_bytes, kvb_fallbacks;
 
     /* stats */

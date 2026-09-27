@@ -32,6 +32,44 @@ class KvbCacheTests(unittest.TestCase):
     run_cli = toc.OfflineCliTests.run_cli
     assert_same = toc.OfflineCliTests.assert_same
     long_ids = staticmethod(toc.OfflineCliTests.long_ids)
+    run_logits = toc.OfflineCliTests.run_logits
+    assert_same_run = toc.OfflineCliTests.assert_same_run
+    assert_no_replay = toc.OfflineCliTests.assert_no_replay
+    crafted = toc.OfflineCliTests.crafted
+    SPEC = toc.OfflineCliTests.SPEC
+    _crafted = {}
+
+    def test_all_positions_and_speculative_rollback_match(self):
+        # Gate the complete trajectory against serial OFF, including each rejection
+        # length 0..3 and a later full acceptance of all four after a partial rollback.
+        for accept, second in [(0, False), (1, False), (2, True), (3, False)]:
+            prompt, _ = self.crafted(accept, second)
+            ids = ",".join(map(str, prompt))
+            gen = str(accept + self.SPEC + 3)
+            for trunk in (self.trunk, self.ztrunk):
+                base = self.run_logits(self.selective, self.args(trunk, ids=ids, gen=gen))
+                # Observer negative control: first vector and all IDs remain right;
+                # only a later vector is damaged. The old first-only gate misses it.
+                corrupted = bytearray(base[2]); corrupted[-1] ^= 1
+                with self.assertRaises(AssertionError):
+                    self.assert_same_run(base, (base[0], base[1], bytes(corrupted)))
+                for mode in ("off", "active", "pin"):
+                    with self.subTest(accept=accept, second=second, trunk=trunk.name, mode=mode):
+                        serial = self.run_logits(self.selective, self.args(trunk,
+                            "--kvb-cache", mode, ids=ids, gen=gen))
+                        self.assert_same_run(base, serial)
+                        spec = self.run_logits(self.selective, self.args(trunk,
+                            "--kvb-cache", mode, "--spec", str(self.SPEC), ids=ids, gen=gen))
+                        self.assert_same_run(base, spec)
+                        self.assert_no_replay(spec[0])
+                        self.assertEqual(spec[0]["spec_trace"][0], [self.SPEC, accept, accept + 1])
+                        if second:
+                            self.assertEqual(spec[0]["spec_trace"][1], [self.SPEC, self.SPEC, self.SPEC + 1])
+                        if mode != "off":
+                            want = MLA_LAYERS * spec[0]["forward_sweeps"] if mode == "active" else MLA_LAYERS
+                            self.assertEqual(spec[0]["trunk_kvb_fills"], want)
+                            self.assertEqual(spec[0]["trunk_kvb_fallbacks"], 0)
+
 
     def args(self, trunk, *extra, ids="3,7,11,5,2,8,1,4", gen="3"):
         return ["--ids", ids, "--gen", gen, "--trunk", trunk, "--trunk-gb", "0.0002",
@@ -48,6 +86,10 @@ class KvbCacheTests(unittest.TestCase):
                     self.assert_same(base, kvb)
                     b, k = base[0], kvb[0]
                     self.assertEqual(k["trunk_kvb_mode"], mode)
+                    import struct
+                    metadata = 13 * (3 * struct.calcsize("P") + 2 * 8) if mode == "pin" else 0
+                    self.assertEqual(k["trunk_kvb_metadata_bytes"], metadata)
+                    self.assertGreater(k["trunk_kvb_fill_seconds"], 0)
                     self.assertEqual(k["trunk_kvb_fallbacks"], 0)
                     self.assertGreater(k["trunk_kvb_hits"], 0)
                     served = k["trunk_kvb_fills"] + k["trunk_kvb_hits"]

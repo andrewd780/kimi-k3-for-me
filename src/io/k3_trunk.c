@@ -374,7 +374,12 @@ static int kvb_read(K3Rows *r, unsigned char *dst, size_t cap, int64_t off, size
     static int fault = -1;
     if (fault < 0) fault = getenv("K3_KVB_FAULT_FILL") != NULL;
     if (fault) return -1;
-    return rows_read_into(r, dst, cap, off, len);
+    /* kvb_idle has excluded worker reads. Reuse the exact interval already
+     * charged by rows_read_into, avoiding nested-clock overhead in the split. */
+    const double before = r->tr->load_seconds;
+    const int rc = rows_read_into(r, dst, cap, off, len);
+    r->tr->kvb_fill_seconds += r->tr->load_seconds - before;
+    return rc;
 }
 
 static const unsigned char *kvb_weights(K3Rows *r, const K3RowMatrix *m)
@@ -539,11 +544,14 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget, int kvb_mode)
     }
     /* The kv_b buffer is sized from the trunk's own kv_b tensors: max over layers (ACTIVE)
      * or their sum (PIN), each with two alignment pages as the row buffers have. */
-    uint64_t kvb_bytes = 0;
+    uint64_t kvb_bytes = 0, kvb_metadata = 0;
     if (kvb_mode != K3_KVB_OFF) {
         r->kvb_nlayers = tr->n_layers < c->n_layers ? tr->n_layers : c->n_layers;
         uint64_t kvb_max = 0, kvb_sum = 0; int n_kvb = 0;
         if (kvb_mode == K3_KVB_PIN) {
+            kvb_metadata = (uint64_t)r->kvb_nlayers *
+                (sizeof *r->kvb_pin + sizeof *r->kvb_pin_cap + sizeof *r->kvb_pin_prefix +
+                 sizeof *r->kvb_pin_off + sizeof *r->kvb_pin_nbytes);
             r->kvb_pin = (unsigned char **)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin);
             r->kvb_pin_cap = (size_t *)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin_cap);
             r->kvb_pin_prefix = (size_t *)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin_prefix);
@@ -571,7 +579,7 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget, int kvb_mode)
         }
         kvb_bytes = kvb_mode == K3_KVB_PIN ? kvb_sum : kvb_max;
     }
-    const uint64_t fixed = r->small_cap + sizeof *r + kvb_bytes;
+    const uint64_t fixed = r->small_cap + sizeof *r + kvb_bytes + kvb_metadata;
     if (kvb_mode != K3_KVB_OFF && (budget <= 0 || (uint64_t)budget < fixed + 6u * K3_TRUNK_ALIGN)) {
         fprintf(stderr, "k3_trunk: a %lld-byte row budget cannot pay for the %llu-byte kv_b "
                         "buffer (--kvb-cache %s) on top of the %llu bytes the row pipeline needs\n",
@@ -611,6 +619,7 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget, int kvb_mode)
                 posix_memalign((void **)&r->kvb_pin[L], K3_TRUNK_ALIGN, r->kvb_pin_cap[L])) goto no_kvb;
     }
     tr->kvb_mode = kvb_mode; tr->kvb_buffer_bytes = kvb_bytes;
+    tr->kvb_metadata_bytes = kvb_metadata;
     r->small = (unsigned char *)malloc(r->small_cap ? r->small_cap : 1);
     if (!r->small || posix_memalign((void **)&r->buf[0], K3_TRUNK_ALIGN, r->cap) ||
         posix_memalign((void **)&r->buf[1], K3_TRUNK_ALIGN, r->cap)) {
@@ -1198,7 +1207,7 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
          * and its waits for a tile are time no compute overlapped; the reader thread's
          * tile reads are the rest of load_seconds, and whatever of them the main thread
          * did not wait for ran beside a matmul. */
-        const double reader = tr->load_seconds - tr->row_sync_seconds;
+        const double reader = tr->load_seconds - tr->row_sync_seconds - tr->kvb_fill_seconds;
         printf("  row pipeline: %llu layer binds, %llu matrix passes, two %.2f MiB buffers\n",
                (unsigned long long)n, (unsigned long long)tr->matrix_calls,
                (double)tr->row_buffer_bytes / 2.0 / (1 << 20));
@@ -1208,6 +1217,8 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
         printf("  reader thread %.2f s of tile reads; main thread waited %.2f s for tiles "
                "and read layer vectors for %.2f s\n",
                reader, tr->row_wait_seconds, tr->row_sync_seconds);
+        if (tr->kvb_mode != K3_KVB_OFF)
+            printf("  kv_b fills: %.6f s on the main thread (not overlapped)\n", tr->kvb_fill_seconds);
         if (tr->kvb_mode != K3_KVB_OFF)
             printf("  kv_b buffer (%s, %.2f MiB): %llu fills (%.3f GB), %llu passes served from it, "
                    "%llu streamed instead\n", tr->kvb_mode == K3_KVB_PIN ? "pin" : "active",
