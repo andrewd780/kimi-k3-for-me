@@ -400,6 +400,10 @@ static void usage(FILE *f)
 "                        bounded buffers, no pins; a batch of positions reads each\n"
 "                        matrix once (--kv-latent still rereads kv_b per position,\n"
 "                        from a plain trunk.bin only the half each pass applies).\n"
+"  --mla-split B         with --kv-latent: rebuild each cached position's k and v once per\n"
+"                        block of B query positions (verify sweeps, prompts) instead of once\n"
+"                        per query; bit-identical; costs B x heads x context floats of\n"
+"                        scratch. 0 (default) = the per-query loop\n"
 "  --kvb-cache MODE      with --trunk-rows --kv-latent: active = hold the current layer's\n"
 "                        kv_b in one buffer, read once per layer visit; pin = keep every\n"
 "                        layer's kv_b; off (default) = reread per position. Charged to\n"
@@ -976,6 +980,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
         else if (!strcmp(argv[i], "--trunk-rows")) trunk_rows = 1;
+        else if (!strcmp(argv[i], "--mla-split") && i + 1 < argc) {
+            const int b = atoi(argv[++i]);
+            if (b < 0 || b > 4096) { fprintf(stderr, "--mla-split takes a block size from 0 (off) to 4096\n"); return 2; }
+            k3_mla_split_block = b;
+        }
         else if (!strcmp(argv[i], "--kvb-cache") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "off")) kvb_mode = K3_KVB_OFF;

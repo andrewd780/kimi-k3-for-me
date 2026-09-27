@@ -1035,6 +1035,11 @@ void k3_matmul_bf16_batch(float *Y, const float *X, const uint16_t *W, int in, i
  */
 K3MlaTrace *k3_mla_trace = NULL;
 
+/* --mla-split B (the private research notes, handoff review B1, "split L1s"): in the latent layout, queries run in blocks of up to B and
+ * each visible position's key rows, then value rows, are rebuilt ONCE per block instead of once per query. 0 = the
+ * per-query loop. Set before any scratch is sized: k3_mla_scratch_cached reads it. */
+int k3_mla_split_block = 0;
+
 /* One --kv-latent rebuild: rows r0 .. r0 + nr - 1 of every head's kvd rows of kv_b applied
  * to one cached position's latent, each written to kb where a whole application puts it
  * (k3_mmw_rows). Both passes rebuild through here, and the trace hook counts the rows here,
@@ -1089,7 +1094,9 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     /* Scores are per head in the latent layout, because the s loop moves outside the h
      * loop there and every head's row must survive until its own softmax runs. */
     float *sc   = gbuf + (size_t)T * H * vh;        /* [last+1], latent [H][last+1] */
-    const size_t scn = lat ? (size_t)H * (size_t)(last + 1) : (size_t)(last + 1);
+    /* split: one [H][last+1] score block per query of the current query block */
+    const int split = (lat && T > 1 && k3_mla_split_block > 1) ? (T < k3_mla_split_block ? T : k3_mla_split_block) : 0;
+    const size_t scn = lat ? (size_t)H * (size_t)(last + 1) * (size_t)(split ? split : 1) : (size_t)(last + 1);
     /* One rebuilt position in the latent layout, laid out as a whole kv_b application
      * lays it out. Pass one writes and reads only its key rows, pass two only its value
      * rows, so the other half is never read, whatever it holds. */
@@ -1134,7 +1141,76 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
 
     /* ---- attention, per head, causal. Position t leaves its heads' outputs in its own
      * row of acc, so the gate and o_proj below can take every position in one pass. ---- */
-    for (int t = 0; t < T; t++) {
+    /* SPLIT (latent layout, T > 1): the same arithmetic as the per-query loop below, with the rebuilds hoisted out of
+     * it. For a block of queries, pass one rebuilds each visible position's keys once and scores every query that can
+     * see it; the softmax runs per (query, head) exactly as below; pass two rebuilds each position's values once and
+     * adds them to every query that can see it, s ascending per output element. Every score, normaliser, quotient
+     * and accumulator therefore sees the same floats in the same order: only the rebuild count changes (Q -> N per
+     * block). GATE MUTANT (test builds' switch, off unless set): K3_MLA_SPLIT_MUTANT_CAUSAL=1 lets every query of a block
+     * see the whole block (no causal cut inside it), so the gates must see the change. */
+    static int split_mutant = -1;
+    if (split_mutant < 0) split_mutant = getenv("K3_MLA_SPLIT_MUTANT_CAUSAL") != NULL;
+    for (int t0 = 0; split && t0 < T; t0 += split) {
+        const int nb = T - t0 < split ? T - t0 : split;
+        const int pl = cached + t0 + nb - 1;             /* the last position any query of the block sees */
+        for (int s = 0; s <= pl; s++) {
+            k3_mla_rebuild(kb, K3_LAT_AT(s), w, c, 0, qn, tr);
+            const float *kr = K3_ROPE_AT(s);
+            for (int b = 0; b < nb; b++) {
+                const int t = t0 + b;
+                if (s > (split_mutant ? pl : cached + t)) continue;   /* causal */
+                for (int h = 0; h < H; h++) {
+                    const float *qt = q + ((size_t)t * H + h) * qh;
+                    const float *ks = kb + (size_t)h * kvd;
+                    double d = 0.0;
+                    for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)ks[i];
+                    for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
+                    sc[((size_t)b * H + h) * (last + 1) + s] = (float)d * scale;
+                }
+            }
+        }
+        for (int b = 0; b < nb; b++) {
+            const int t = t0 + b, p = split_mutant ? pl : cached + t;
+            float *acct = acc + (size_t)t * H * vh;
+            for (int h = 0; h < H; h++) {
+                float *sh = sc + ((size_t)b * H + h) * (last + 1);
+                const size_t row = (size_t)t * H + h;
+                if (tr && tr->scores)
+                    memcpy(tr->scores + row * tr->n, sh, (size_t)(p + 1) * sizeof(float));
+                float m = -INFINITY;
+                for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
+                double z = 0.0;
+                for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
+                if (tr && tr->z) tr->z[row] = z;
+                double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
+                for (int s = 0; s <= p; s++) {
+                    const double pq = sh[s] / z;
+                    if (qrow) qrow[s] = pq;
+                    sh[s] = (float)pq;
+                }
+                float *o = acct + (size_t)h * vh;
+                for (int j = 0; j < vh; j++) o[j] = 0.0f;
+            }
+        }
+        for (int s = 0; s <= pl; s++) {
+            k3_mla_rebuild(kb, K3_LAT_AT(s), w, c, qn, vh, tr);
+            for (int b = 0; b < nb; b++) {
+                const int t = t0 + b;
+                if (s > (split_mutant ? pl : cached + t)) continue;   /* causal */
+                float *acct = acc + (size_t)t * H * vh;
+                for (int h = 0; h < H; h++) {
+                    const float pr = sc[((size_t)b * H + h) * (last + 1) + s];
+                    float *o = acct + (size_t)h * vh;
+                    const float *vs = kb + (size_t)h * kvd + qn;
+                    for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+                }
+            }
+        }
+        if (tr && tr->acc)
+            for (int b = 0; b < nb; b++)
+                memcpy(tr->acc + (size_t)(t0 + b) * H * vh, acc + (size_t)(t0 + b) * H * vh, (size_t)H * vh * sizeof(float));
+    }
+    for (int t = 0; !split && t < T; t++) {
         const int p = cached + t;
         float *acct = acc + (size_t)t * H * vh;
         if (lat) {
@@ -1393,6 +1469,8 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
     /* The latent layout keeps one score row per head, and one rebuilt position. */
     size_t scores = (size_t)(cap > T ? cap : T);
     if (lat) scores *= (size_t)H;
+    /* --mla-split keeps a score block per query of a query block (k3_mla_cached) */
+    if (lat && T > 1 && k3_mla_split_block > 1) scores *= (size_t)(T < k3_mla_split_block ? T : k3_mla_split_block);
     /* ct, ql, acc and gbuf are per position so each projection is one batched pass */
     size_t n = (size_t)T * H * qh                      /* q            */
              + (size_t)T * (c->kv_lora + c->qk_rope)   /* ct           */

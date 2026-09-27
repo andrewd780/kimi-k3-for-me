@@ -217,6 +217,7 @@ size_t k3_mla_scratch(const K3Cfg *c, int T);
 /* Scratch when a KV cache supplies the keys and values. cap is the cache capacity, and
  * kv_latent must match the layout the cache was allocated for: the latent path needs a
  * score row per head and a buffer for the position it is rebuilding. */
+extern int k3_mla_split_block;   /* --mla-split: 0 = per-query rebuilds; B > 1 = blocks of B queries */
 size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
                              int kv_latent);
 
