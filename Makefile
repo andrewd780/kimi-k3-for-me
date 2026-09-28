@@ -174,6 +174,8 @@ ENGINE_HEADERS := $(wildcard include/*.h include/k3/*.h third_party/*.h src/*/*.
 
 CLI_SRC    := src/cli/k3_run.c
 CLI_BIN    := $(BIN)/k3
+# gate mutants live only in this test binary (K3_TEST_MUTANTS); the production $(CLI_BIN) refuses their switches
+MUT_BIN    := $(BIN)/k3-mut
 
 # Tests that need no checkpoint. These run in CI on every push.
 UNIT_TESTS := test_ops test_kda_exact test_quality test_cache test_st test_model_stream test_cfg test_tok scale_test k3_model test_trunk \
@@ -193,7 +195,7 @@ TOK_FILES  ?= $(HOME)/k3model
 
 # ---------------------------------------------------------------------------- targets --
 .PHONY: all test test-all bench bench-mla portable debug asan ubsan format clean install help \
-        tok cfg ops cache st oracle weights-test
+        tok cfg ops cache st oracle weights-test mutants
 
 all: $(CLI_BIN)
 
@@ -203,6 +205,11 @@ $(BUILD)/%.o: %.c $(ENGINE_HEADERS) Makefile
 
 $(CLI_BIN): $(CLI_SRC) $(ENGINE_OBJ) | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $(CLI_SRC) $(ENGINE_OBJ) -o $@ $(LDFLAGS)
+
+$(MUT_BIN): $(CLI_SRC) $(ENGINE_SRC) $(ENGINE_HEADERS) Makefile | $(BIN)
+	$(CC) $(CFLAGS) -DK3_TEST_MUTANTS $(INCLUDES) $(CLI_SRC) $(ENGINE_SRC) -o $@ $(LDFLAGS)
+
+mutants: $(MUT_BIN)
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -288,7 +295,11 @@ $(BIN)/bench_mla: benchmarks/bench_mla.c benchmarks/mla_variants.h \
 	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
-test: $(CLI_BIN) $(TEST_BINS)
+test: $(CLI_BIN) $(MUT_BIN) $(TEST_BINS)
+	@echo "== gate mutants are test-build only =="; \
+	  if K3_MLA_SPLIT_MUTANT_CAUSAL=1 ./$(CLI_BIN) fake --ids 1 >/dev/null 2>&1; then \
+	      echo "the production CLI accepted a gate mutant switch"; exit 1; \
+	  else rc=$$?; test $$rc -eq 2 || exit 1; fi
 	@echo "== ultra CLI contract =="; \
 	  if ./$(CLI_BIN) fake --ids 1 --preset ultra >/dev/null 2>&1; then \
 	      echo "ultra mode accepted a missing --trunk"; exit 1; \

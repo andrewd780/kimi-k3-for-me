@@ -885,6 +885,13 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
     }
     if (argc < 2) { usage(stderr); return 2; }
+#ifndef K3_TEST_MUTANTS
+    /* gate mutants exist only in test builds (make mutants); a production binary refuses the switch */
+    if (getenv("K3_MLA_SPLIT_MUTANT_CAUSAL")) {
+        fprintf(stderr, "K3_MLA_SPLIT_MUTANT_CAUSAL is a gate mutant for test builds (make mutants); this build refuses it\n");
+        return 2;
+    }
+#endif
 
     const char *dir = argv[1];
     if (dir[0] == '-') {
@@ -981,9 +988,14 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
         else if (!strcmp(argv[i], "--trunk-rows")) trunk_rows = 1;
         else if (!strcmp(argv[i], "--mla-split") && i + 1 < argc) {
-            const int b = atoi(argv[++i]);
-            if (b < 0 || b > 4096) { fprintf(stderr, "--mla-split takes a block size from 0 (off) to 4096\n"); return 2; }
-            k3_mla_split_block = b;
+            /* strict: digits only. atoi read "banana" as 0 and "2junk" as 2 (Astra's K1 review) */
+            const char *s = argv[++i];
+            const size_t nd = strspn(s, "0123456789");
+            if (nd == 0 || s[nd] != '\0' || nd > 4 || atoi(s) > 4096) {
+                fprintf(stderr, "--mla-split takes a block size from 0 (off) to 4096, got '%s'\n", s);
+                return 2;
+            }
+            k3_mla_split_block = atoi(s);
         }
         else if (!strcmp(argv[i], "--kvb-cache") && i + 1 < argc) {
             const char *m = argv[++i];

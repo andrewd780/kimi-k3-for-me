@@ -1039,6 +1039,10 @@ K3MlaTrace *k3_mla_trace = NULL;
  * each visible position's key rows, then value rows, are rebuilt ONCE per block instead of once per query. 0 = the
  * per-query loop. Set before any scratch is sized: k3_mla_scratch_cached reads it. */
 int k3_mla_split_block = 0;
+/* the query-block height the last latent scratch sizing reserved score rows for: k3_mla_cached refuses a larger block, so
+ * the block size cannot grow between sizing and use (Astra's K1 review; per-context ownership would be needed if concurrent
+ * callers ever vary it) */
+static int k3_mla_split_sized = 0;
 
 /* One --kv-latent rebuild: rows r0 .. r0 + nr - 1 of every head's kvd rows of kv_b applied
  * to one cached position's latent, each written to kb where a whole application puts it
@@ -1148,8 +1152,20 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * and accumulator therefore sees the same floats in the same order: only the rebuild count changes (Q -> N per
      * block). GATE MUTANT (test builds' switch, off unless set): K3_MLA_SPLIT_MUTANT_CAUSAL=1 lets every query of a block
      * see the whole block (no causal cut inside it), so the gates must see the change. */
+#ifdef K3_TEST_MUTANTS
     static int split_mutant = -1;
-    if (split_mutant < 0) split_mutant = getenv("K3_MLA_SPLIT_MUTANT_CAUSAL") != NULL;
+    if (split_mutant < 0) {
+        const char *m = getenv("K3_MLA_SPLIT_MUTANT_CAUSAL");
+        split_mutant = m != NULL && m[0] != '\0' && strcmp(m, "0") != 0;
+    }
+#else
+    const int split_mutant = 0;   /* production builds carry no mutant (the CLI refuses the switch) */
+#endif
+    if (split > k3_mla_split_sized) {
+        fprintf(stderr, "k3_mla_cached: --mla-split block of %d rows, but the scratch was sized for %d; the block size must "
+                        "not change after sizing\n", split, k3_mla_split_sized);
+        abort();
+    }
     for (int t0 = 0; split && t0 < T; t0 += split) {
         const int nb = T - t0 < split ? T - t0 : split;
         const int pl = cached + t0 + nb - 1;             /* the last position any query of the block sees */
@@ -1470,7 +1486,10 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
     size_t scores = (size_t)(cap > T ? cap : T);
     if (lat) scores *= (size_t)H;
     /* --mla-split keeps a score block per query of a query block (k3_mla_cached) */
-    if (lat && T > 1 && k3_mla_split_block > 1) scores *= (size_t)(T < k3_mla_split_block ? T : k3_mla_split_block);
+    if (lat && T > 1 && k3_mla_split_block > 1) {
+        k3_mla_split_sized = T < k3_mla_split_block ? T : k3_mla_split_block;
+        scores *= (size_t)k3_mla_split_sized;
+    }
     /* ct, ql, acc and gbuf are per position so each projection is one batched pass */
     size_t n = (size_t)T * H * qh                      /* q            */
              + (size_t)T * (c->kv_lora + c->qk_rope)   /* ct           */
