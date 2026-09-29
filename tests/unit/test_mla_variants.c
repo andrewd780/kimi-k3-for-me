@@ -549,6 +549,26 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
           "%s C=%d T=%d: the expanded engine applied %.2f kv_b applications (its trace's "
           "kvb_rows), E's closed form is %.0f", geom, C, T, eng_x.kvb,
           mla_rebuilds(MLA_E, T, C, 0));
+    /* 7b. --mla-split (the private research notes, handoff review B1): the latent engine with its rebuilds hoisted out of the query loop
+     *     in blocks of 2, 3 and T queries must give the per-query latent engine's floats everywhere the trace looks, and
+     *     rebuild each visible position once per block: sum over blocks of (C + the block's last query + 1) applications. */
+    for (int bi = 0; T > 1 && bi < 3; bi++) {
+        const int B = bi == 0 ? 2 : bi == 1 ? 3 : T;
+        Run sp;
+        k3_mla_split_block = B;
+        run_engine(&sp, &K, 1);
+        k3_mla_split_block = 0;
+        double want = 0.0;
+        for (int t0 = 0; t0 < T; t0 += B) want += (double)C + (double)(t0 + B < T ? t0 + B : T);
+        CHECK(same(sp.out, eng_l.out, outb) && same(sp.acc, eng_l.acc, accb) && same(sp.probe, eng_l.probe, prb)
+                  && same(sp.z, eng_l.z, zb) && same(sp.quot, eng_l.quot, qb)
+                  && same(sp.cache.kv + (size_t)C * c->kv_lora, eng_l.cache.kv + (size_t)C * c->kv_lora, latb)
+                  && same(sp.cache.rope + (size_t)C * c->qk_rope, eng_l.cache.rope + (size_t)C * c->qk_rope, ropb),
+              "%s C=%d T=%d: --mla-split %d differs from the per-query latent engine", geom, C, T, B);
+        CHECK(sp.kvb == want, "%s C=%d T=%d: --mla-split %d applied %.2f kv_b applications, its closed form is %.0f",
+              geom, C, T, B, sp.kvb, want);
+        run_free(&sp);
+    }
     check_count(&rE, MLA_E, C, T, 0, geom);
     check_count(&rEP, MLA_EP, C, T, 0, geom);
     check_count(&rL0, MLA_L0, C, T, 0, geom);

@@ -110,8 +110,21 @@ typedef struct {
     uint64_t      row_buffer_bytes, small_buffer_bytes, matrix_calls;
     /* Row pipeline only, both on the main thread: time blocked waiting for a row tile,
      * and time spent reading the current layer's vectors synchronously in bind. The rest
-     * of load_seconds is the reader thread's, which may overlap the matmuls. */
+     * of load_seconds, less kvb_fill_seconds, is the reader thread's and may overlap matmuls. */
     double        row_wait_seconds, row_sync_seconds;
+
+    /* kv_b buffer for the --kv-latent passes (row pipeline only, opt-in; the private research notes, findings
+     * 98-99). Under --kv-latent every cached position rebuilds its k and v from kv_b rows, so
+     * the row pipeline reread kv_b once per position per layer. ACTIVE holds the current
+     * layer's whole kv_b in one reusable buffer: filled at the layer's first kv_b pass,
+     * invalidated at the next bind. PIN keeps every layer's kv_b (the comparison arm).
+     * The buffer is charged to the trunk budget; the kernels and the rows they apply are
+     * unchanged, so the output is bit-identical. */
+    int           kvb_mode;          /* K3_KVB_OFF, K3_KVB_ACTIVE or K3_KVB_PIN */
+    uint64_t      kvb_buffer_bytes;  /* aligned slots, charged to the budget */
+    uint64_t      kvb_metadata_bytes; /* PIN's per-layer heap arrays, also charged */
+    double        kvb_fill_seconds;  /* synchronous portion of load_seconds */
+    uint64_t      kvb_fills, kvb_hits, kvb_fill_bytes, kvb_fallbacks;
 
     /* stats */
     uint64_t     hits, misses;
@@ -129,6 +142,11 @@ int  k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_
  * k3_mmw_rows (apply_rows: the --kv-latent passes over kv_b) reads only those rows from a
  * plain trunk.bin; see rows_whole_tiles. */
 int  k3_trunk_open_rows(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes);
+enum { K3_KVB_OFF = 0, K3_KVB_ACTIVE = 1, K3_KVB_PIN = 2 };
+/* As k3_trunk_open_rows, with a kv_b buffer (see kvb_mode). Refuses a budget that cannot pay
+ * for the buffer on top of the two minimal row buffers and the layer vectors. */
+int  k3_trunk_open_rows_kvb(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes,
+                            int kvb_mode);
 void k3_trunk_close(K3Trunk *tr);
 
 /* Make layer L resident and point b's weight pointers at it. b must already have been

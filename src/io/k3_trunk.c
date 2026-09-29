@@ -144,25 +144,35 @@ struct K3Rows {
     unsigned char *buf[2], *small;
     K3RowMatrix matrix[64];
     int count, layer;
+
+    /* kv_b buffer (K3Trunk.kvb_mode). ACTIVE: one slot of kvb_cap bytes holding the matrix
+     * at (kvb_layer, kvb_off, kvb_nbytes) while kvb_valid. PIN: one exact slot per layer. */
+    int kvb_mode, kvb_valid, kvb_layer, kvb_nlayers;
+    int64_t kvb_off, kvb_nbytes;
+    size_t kvb_cap, kvb_prefix;
+    unsigned char *kvb;
+    unsigned char **kvb_pin;
+    size_t *kvb_pin_cap, *kvb_pin_prefix;
+    int64_t *kvb_pin_off, *kvb_pin_nbytes;
 };
 
 /* Offset, length and destination must all be aligned for O_DIRECT. Each slot has
  * two extra pages; row starts need not be page aligned. Padding stays inside the
  * packed layer's aligned run. Count actual requested bytes, including padding. */
-static int rows_read(K3Rows *r, int slot, int64_t off, size_t len)
+static int rows_read_into(K3Rows *r, unsigned char *dst, size_t cap, int64_t off, size_t len)
 {
-    if (off < 0 || len > r->payload) return -1;
+    if (off < 0) return -1;
     const size_t prefix = r->tr->direct ? (size_t)(off % K3_TRUNK_ALIGN) : 0;
     const int64_t base = off - (int64_t)prefix;
     size_t want = len + prefix;
     if (r->tr->direct) want = (want + K3_TRUNK_ALIGN - 1) & ~(size_t)(K3_TRUNK_ALIGN - 1);
-    if (want > r->cap) return -1;
+    if (want > cap) return -1;
     size_t got = 0;
     const double start = now_s();
     while (got < want) {
         const int64_t n = r->tr->zfile
-            ? k3_zread(r->tr->zfile, r->buf[slot] + got, (int64_t)(want - got), base + (int64_t)got)
-            : pread(r->tr->fd, r->buf[slot] + got, want - got, (off_t)(base + (int64_t)got));
+            ? k3_zread(r->tr->zfile, dst + got, (int64_t)(want - got), base + (int64_t)got)
+            : pread(r->tr->fd, dst + got, want - got, (off_t)(base + (int64_t)got));
         if (n < 0 && errno == EINTR && !r->tr->zfile) continue;
         if (n <= 0) return -1;
         got += (size_t)n;
@@ -171,6 +181,12 @@ static int rows_read(K3Rows *r, int slot, int64_t off, size_t len)
     r->tr->load_seconds += now_s() - start;
     r->tr->bytes_read += got;
     return 0;
+}
+
+static int rows_read(K3Rows *r, int slot, int64_t off, size_t len)
+{
+    if (len > r->payload) return -1;
+    return rows_read_into(r, r->buf[slot], r->cap, off, len);
 }
 
 static void *rows_worker(void *arg)
@@ -338,12 +354,117 @@ static void rows_apply_batch(const K3WeightStream *stream, float *Y, int ldy,
  * weight it, each applied without the other half and, from a plain trunk.bin, read
  * without it (see rows_run). Selecting no rows reads and writes nothing, as in the
  * resident kernels. */
+/* THE kv_b BUFFER (K3Trunk.kvb_mode). The weights a pass needs are fetched once per layer
+ * visit (ACTIVE) or once per run (PIN) and every later pass of the visit applies its rows from
+ * the buffer. A pass then calls k3_mmw_batch_ld on exactly the row ranges rows_run would give
+ * it and on the same bytes, and each output row is its own dot product, so the result does not
+ * depend on where the bytes came from. The worker only ever writes the row buffers, and it is
+ * idle between passes (rows_run waits for its last tile); the fill below waits anyway. */
+static void kvb_idle(K3Rows *r)
+{
+    pthread_mutex_lock(&r->mu);
+    while (r->busy) pthread_cond_wait(&r->cv, &r->mu);
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* TEST HOOK (never in production): K3_KVB_FAULT_FILL=1 makes every kv_b fill fail as a read
+ * would, so the gates can show a failed fill is sticky and no output is emitted after it. */
+static int kvb_read(K3Rows *r, unsigned char *dst, size_t cap, int64_t off, size_t len)
+{
+    static int fault = -1;
+    if (fault < 0) fault = getenv("K3_KVB_FAULT_FILL") != NULL;
+    if (fault) return -1;
+    /* kvb_idle has excluded worker reads. Reuse the exact interval already
+     * charged by rows_read_into, avoiding nested-clock overhead in the split. */
+    const double before = r->tr->load_seconds;
+    const int rc = rows_read_into(r, dst, cap, off, len);
+    r->tr->kvb_fill_seconds += r->tr->load_seconds - before;
+    return rc;
+}
+
+static const unsigned char *kvb_weights(K3Rows *r, const K3RowMatrix *m)
+{
+    K3Trunk *tr = r->tr;
+    if (tr->read_error || m->nbytes <= 0) return NULL;
+    if (r->kvb_mode == K3_KVB_PIN) {
+        const int L = r->layer;
+        if (L < 0 || L >= r->kvb_nlayers || !r->kvb_pin[L]) return NULL;
+        if (r->kvb_pin_off[L] == m->off && r->kvb_pin_nbytes[L] == m->nbytes) {
+            tr->kvb_hits++;
+            return r->kvb_pin[L] + r->kvb_pin_prefix[L];
+        }
+        if (r->kvb_pin_off[L] >= 0) return NULL;      /* a second row matrix in this layer */
+        kvb_idle(r);
+        if (kvb_read(r, r->kvb_pin[L], r->kvb_pin_cap[L], m->off, (size_t)m->nbytes)) {
+            tr->read_error = 1;
+            return NULL;
+        }
+        r->kvb_pin_prefix[L] = tr->direct ? (size_t)(m->off % K3_TRUNK_ALIGN) : 0;
+        r->kvb_pin_off[L] = m->off; r->kvb_pin_nbytes[L] = m->nbytes;
+        tr->kvb_fills++; tr->kvb_fill_bytes += (uint64_t)m->nbytes;
+        return r->kvb_pin[L] + r->kvb_pin_prefix[L];
+    }
+    /* GATE MUTANT (never in production): K3_KVB_MUTANT_STALE=1 serves whatever the slot holds,
+     * across layers, and skips the invalidation at bind. The logits gate must see it. */
+    static int stale = -1;
+    if (stale < 0) stale = getenv("K3_KVB_MUTANT_STALE") != NULL;
+    if (r->kvb_valid && (stale || (r->kvb_layer == r->layer && r->kvb_off == m->off &&
+                                   r->kvb_nbytes == m->nbytes))) {
+        tr->kvb_hits++;
+        return r->kvb + r->kvb_prefix;
+    }
+    r->kvb_valid = 0;
+    /* a matrix larger than the slot (sized from the trunk's own kv_b tensors) streams as
+     * before; a failed read of one that fits is sticky */
+    const size_t prefix = tr->direct ? (size_t)(m->off % K3_TRUNK_ALIGN) : 0;
+    size_t want = (size_t)m->nbytes + prefix;
+    if (tr->direct) want = (want + K3_TRUNK_ALIGN - 1) & ~(size_t)(K3_TRUNK_ALIGN - 1);
+    if (want > r->kvb_cap) return NULL;
+    kvb_idle(r);
+    if (kvb_read(r, r->kvb, r->kvb_cap, m->off, (size_t)m->nbytes)) {
+        tr->read_error = 1;
+        return NULL;
+    }
+    r->kvb_prefix = tr->direct ? (size_t)(m->off % K3_TRUNK_ALIGN) : 0;
+    r->kvb_layer = r->layer; r->kvb_off = m->off; r->kvb_nbytes = m->nbytes; r->kvb_valid = 1;
+    tr->kvb_fills++; tr->kvb_fill_bytes += (uint64_t)m->nbytes;
+    return r->kvb + r->kvb_prefix;
+}
+
+/* The --kv-latent passes: kv_b's key rows to score a cached position, its value rows to
+ * weight it, each applied without the other half and, from a plain trunk.bin, read
+ * without it (see rows_run). Selecting no rows reads and writes nothing, as in the
+ * resident kernels. With a kv_b buffer the rows come from it (kvb_weights). */
 static void rows_apply_rows(const K3WeightStream *stream, float *y, const float *x, int in,
                             int out, int blk, int r0, int nr)
 {
     if (nr == 0) return;
     const K3RowSel sel = {blk, r0, nr};
-    rows_run((const K3RowMatrix *)stream, y, out, x, in, in, out, 1, sel);
+    const K3RowMatrix *m = (const K3RowMatrix *)stream;
+    K3Rows *r = m->owner;
+    if (r->kvb_mode != K3_KVB_OFF) {
+        const size_t esz = m->dtype == K3_DT_BF16 ? 2u : 4u;
+        const int wdt = m->dtype == K3_DT_BF16 ? K3_WBF16 : K3_WF32;
+        if (in <= 0 || out <= 0 || (uint64_t)in * (uint64_t)out > INT64_MAX / esz ||
+            (int64_t)((uint64_t)in * (uint64_t)out * esz) != m->nbytes ||
+            sel.blk <= 0 || out % sel.blk != 0 || sel.nr <= 0 || sel.r0 < 0 ||
+            sel.nr > sel.blk - sel.r0) {
+            r->tr->read_error = 1;
+            memset(y, 0, (size_t)out * sizeof(float));
+            return;
+        }
+        const unsigned char *w = kvb_weights(r, m);
+        if (w) {
+            rows_apply_tile(&sel, w, (size_t)in * esz, wdt, 0, out, y, out, x, in, in, 1);
+            return;
+        }
+        if (r->tr->read_error) {
+            memset(y, 0, (size_t)out * sizeof(float));
+            return;
+        }
+        r->tr->kvb_fallbacks++;
+    }
+    rows_run(m, y, out, x, in, in, out, 1, sel);
 }
 
 static int rows_acquire(void *ctx, int64_t off, int64_t nb, int dt,
@@ -396,14 +517,20 @@ static void rows_close(K3Rows *r)
         pthread_cond_destroy(&r->cv); pthread_mutex_destroy(&r->mu);
     }
     k3_aligned_free(r->buf[0]); k3_aligned_free(r->buf[1]);
+    k3_aligned_free(r->kvb);
+    if (r->kvb_pin)
+        for (int L = 0; L < r->kvb_nlayers; L++) k3_aligned_free(r->kvb_pin[L]);
+    free(r->kvb_pin); free(r->kvb_pin_cap); free(r->kvb_pin_prefix);
+    free(r->kvb_pin_off); free(r->kvb_pin_nbytes);
     free(r->small); free(r);
 }
 
-static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
+static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget, int kvb_mode)
 {
     K3Rows *r = (K3Rows *)calloc(1, sizeof *r);
     if (!r) return -1;
     r->tr = tr;
+    r->kvb_mode = kvb_mode; r->kvb_layer = -1;
     /* Only the layers the config describes are ever bound; a trunk may hold more. */
     for (int L = 0; L < tr->n_layers && L < c->n_layers; L++) {
         Finder f = { &tr->lay[L] }; K3MemSrc src = { find_in_layer, &f };
@@ -415,7 +542,52 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
         }
         if (small > r->small_cap) r->small_cap = small;
     }
-    const uint64_t fixed = r->small_cap + sizeof *r;
+    /* The kv_b buffer is sized from the trunk's own kv_b tensors: max over layers (ACTIVE)
+     * or their sum (PIN), each with two alignment pages as the row buffers have. */
+    uint64_t kvb_bytes = 0, kvb_metadata = 0;
+    if (kvb_mode != K3_KVB_OFF) {
+        r->kvb_nlayers = tr->n_layers < c->n_layers ? tr->n_layers : c->n_layers;
+        uint64_t kvb_max = 0, kvb_sum = 0; int n_kvb = 0;
+        if (kvb_mode == K3_KVB_PIN) {
+            kvb_metadata = (uint64_t)r->kvb_nlayers *
+                (sizeof *r->kvb_pin + sizeof *r->kvb_pin_cap + sizeof *r->kvb_pin_prefix +
+                 sizeof *r->kvb_pin_off + sizeof *r->kvb_pin_nbytes);
+            r->kvb_pin = (unsigned char **)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin);
+            r->kvb_pin_cap = (size_t *)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin_cap);
+            r->kvb_pin_prefix = (size_t *)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin_prefix);
+            r->kvb_pin_off = (int64_t *)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin_off);
+            r->kvb_pin_nbytes = (int64_t *)calloc((size_t)r->kvb_nlayers, sizeof *r->kvb_pin_nbytes);
+            if (!r->kvb_pin || !r->kvb_pin_cap || !r->kvb_pin_prefix || !r->kvb_pin_off ||
+                !r->kvb_pin_nbytes) goto bad;
+        }
+        for (int L = 0; L < r->kvb_nlayers; L++) {
+            for (int i = 0; i < tr->lay[L].nt; i++) {
+                const K3TrunkTensor *t = &tr->lay[L].t[i];
+                if (!t->name || !strstr(t->name, "kv_b") || t->nbytes <= 0) continue;
+                const uint64_t slot = (uint64_t)t->nbytes + 2u * K3_TRUNK_ALIGN;
+                if (slot > kvb_max) kvb_max = slot;
+                kvb_sum += slot; n_kvb++;
+                if (kvb_mode == K3_KVB_PIN) {
+                    if (r->kvb_pin_cap[L]) goto bad;      /* two kv_b tensors in one layer */
+                    r->kvb_pin_cap[L] = (size_t)slot; r->kvb_pin_off[L] = -1;
+                }
+            }
+        }
+        if (!n_kvb) {
+            fprintf(stderr, "k3_trunk: --kvb-cache: the trunk holds no kv_b tensor\n");
+            goto bad;
+        }
+        kvb_bytes = kvb_mode == K3_KVB_PIN ? kvb_sum : kvb_max;
+    }
+    const uint64_t fixed = r->small_cap + sizeof *r + kvb_bytes + kvb_metadata;
+    if (kvb_mode != K3_KVB_OFF && (budget <= 0 || (uint64_t)budget < fixed + 6u * K3_TRUNK_ALIGN)) {
+        fprintf(stderr, "k3_trunk: a %lld-byte row budget cannot pay for the %llu-byte kv_b "
+                        "buffer (--kvb-cache %s) on top of the %llu bytes the row pipeline needs\n",
+                (long long)budget, (unsigned long long)kvb_bytes,
+                kvb_mode == K3_KVB_PIN ? "pin" : "active",
+                (unsigned long long)(fixed - kvb_bytes + 6u * K3_TRUNK_ALIGN));
+        goto bad;
+    }
     if (budget <= 0 || (uint64_t)budget < fixed + 6u * K3_TRUNK_ALIGN) {
         fprintf(stderr, "k3_trunk: a %lld-byte row budget is below the %llu bytes the "
                         "largest layer's vectors and two minimal row buffers need\n",
@@ -438,6 +610,16 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
             goto bad;
         }
     }
+    if (kvb_mode == K3_KVB_ACTIVE) {
+        r->kvb_cap = (size_t)kvb_bytes;
+        if (posix_memalign((void **)&r->kvb, K3_TRUNK_ALIGN, r->kvb_cap)) goto no_kvb;
+    } else if (kvb_mode == K3_KVB_PIN) {
+        for (int L = 0; L < r->kvb_nlayers; L++)
+            if (r->kvb_pin_cap[L] &&
+                posix_memalign((void **)&r->kvb_pin[L], K3_TRUNK_ALIGN, r->kvb_pin_cap[L])) goto no_kvb;
+    }
+    tr->kvb_mode = kvb_mode; tr->kvb_buffer_bytes = kvb_bytes;
+    tr->kvb_metadata_bytes = kvb_metadata;
     r->small = (unsigned char *)malloc(r->small_cap ? r->small_cap : 1);
     if (!r->small || posix_memalign((void **)&r->buf[0], K3_TRUNK_ALIGN, r->cap) ||
         posix_memalign((void **)&r->buf[1], K3_TRUNK_ALIGN, r->cap)) {
@@ -455,7 +637,13 @@ static int rows_open(K3Trunk *tr, const K3Cfg *c, int64_t budget)
     tr->small_buffer_bytes = r->small_cap;
     printf("trunk: row pipeline, two %zu-byte buffers + %zu-byte current-layer vectors\n",
            r->cap, r->small_cap);
+    if (kvb_mode != K3_KVB_OFF)
+        printf("trunk: kv_b buffer (%s), %llu bytes charged to the budget\n",
+               kvb_mode == K3_KVB_PIN ? "every layer pinned" : "current layer", (unsigned long long)kvb_bytes);
     return 0;
+no_kvb:
+    fprintf(stderr, "k3_trunk: cannot allocate the kv_b buffer\n");
+    goto bad;
 no_thread:
     fprintf(stderr, "k3_trunk: cannot start the row pipeline's reader thread\n");
 bad:
@@ -463,7 +651,8 @@ bad:
     return -1;
 }
 
-static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes, int rows)
+static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget_bytes, int rows,
+                      int kvb_mode)
 {
     memset(tr, 0, sizeof *tr);
     /* memset leaves fd == 0, which is stdin. Every failure path below returns without
@@ -596,7 +785,7 @@ static int trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budg
     }
 
     tr->rows_whole_tiles = tr->zfile != NULL;
-    if (rows) return rows_open(tr, c, budget_bytes);
+    if (rows) return rows_open(tr, c, budget_bytes, kvb_mode);
     const size_t widen = k3_bind_widen_bytes(c);
     int64_t total = 0;
     for (int i = 0; i < tr->n_layers; i++) total += tr->lay[i].nbytes;
@@ -749,14 +938,20 @@ bad:
 
 int k3_trunk_open(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget)
 {
-    const int result = trunk_open(tr, dir, c, budget, 0);
+    const int result = trunk_open(tr, dir, c, budget, 0, K3_KVB_OFF);
     if (result) k3_trunk_close(tr);
     return result;
 }
 
 int k3_trunk_open_rows(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget)
 {
-    const int result = trunk_open(tr, dir, c, budget, 1);
+    return k3_trunk_open_rows_kvb(tr, dir, c, budget, K3_KVB_OFF);
+}
+
+int k3_trunk_open_rows_kvb(K3Trunk *tr, const char *dir, const K3Cfg *c, int64_t budget, int kvb_mode)
+{
+    if (kvb_mode < K3_KVB_OFF || kvb_mode > K3_KVB_PIN) return -1;
+    const int result = trunk_open(tr, dir, c, budget, 1, kvb_mode);
     if (result) k3_trunk_close(tr);
     return result;
 }
@@ -916,6 +1111,9 @@ int k3_trunk_bind(K3Trunk *tr, const K3Cfg *c, int L, K3LayerBind *b)
         K3Rows *r = (K3Rows *)tr->row_state;
         if (tr->read_error || rows_wait(r)) return -1;
         r->small_used = 0; r->count = 0; r->layer = L;
+        /* a new layer visit: the ACTIVE kv_b slot no longer holds this layer's matrix
+         * (K3_KVB_MUTANT_STALE skips this, and the key check, to show the gates see it) */
+        if (!getenv("K3_KVB_MUTANT_STALE")) r->kvb_valid = 0;
         Finder f = { &tr->lay[L] }; K3MemSrc src = { find_in_layer, &f };
         tr->misses++;
         return k3_bind_layer_stream(c, L, b, &src, rows_acquire, r, NULL);
@@ -1009,7 +1207,7 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
          * and its waits for a tile are time no compute overlapped; the reader thread's
          * tile reads are the rest of load_seconds, and whatever of them the main thread
          * did not wait for ran beside a matmul. */
-        const double reader = tr->load_seconds - tr->row_sync_seconds;
+        const double reader = tr->load_seconds - tr->row_sync_seconds - tr->kvb_fill_seconds;
         printf("  row pipeline: %llu layer binds, %llu matrix passes, two %.2f MiB buffers\n",
                (unsigned long long)n, (unsigned long long)tr->matrix_calls,
                (double)tr->row_buffer_bytes / 2.0 / (1 << 20));
@@ -1019,6 +1217,14 @@ void k3_trunk_report(const K3Trunk *tr, const char *label)
         printf("  reader thread %.2f s of tile reads; main thread waited %.2f s for tiles "
                "and read layer vectors for %.2f s\n",
                reader, tr->row_wait_seconds, tr->row_sync_seconds);
+        if (tr->kvb_mode != K3_KVB_OFF)
+            printf("  kv_b fills: %.6f s on the main thread (not overlapped)\n", tr->kvb_fill_seconds);
+        if (tr->kvb_mode != K3_KVB_OFF)
+            printf("  kv_b buffer (%s, %.2f MiB): %llu fills (%.3f GB), %llu passes served from it, "
+                   "%llu streamed instead\n", tr->kvb_mode == K3_KVB_PIN ? "pin" : "active",
+                   (double)tr->kvb_buffer_bytes / (1 << 20), (unsigned long long)tr->kvb_fills,
+                   (double)tr->kvb_fill_bytes / 1e9, (unsigned long long)tr->kvb_hits,
+                   (unsigned long long)tr->kvb_fallbacks);
         return;
     }
     printf("  pinned %d/%d layers, ring %d slots\n", tr->npin, tr->n_layers, tr->nslot);

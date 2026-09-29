@@ -400,6 +400,14 @@ static void usage(FILE *f)
 "                        bounded buffers, no pins; a batch of positions reads each\n"
 "                        matrix once (--kv-latent still rereads kv_b per position,\n"
 "                        from a plain trunk.bin only the half each pass applies).\n"
+"  --mla-split B         with --kv-latent: rebuild each cached position's k and v once per\n"
+"                        block of B query positions (verify sweeps, prompts) instead of once\n"
+"                        per query; bit-identical; costs B x heads x context floats of\n"
+"                        scratch. 0 (default) = the per-query loop\n"
+"  --kvb-cache MODE      with --trunk-rows --kv-latent: active = hold the current layer's\n"
+"                        kv_b in one buffer, read once per layer visit; pin = keep every\n"
+"                        layer's kv_b; off (default) = reread per position. Charged to\n"
+"                        --trunk-gb; the output is bit-identical in every mode.\n"
 "                        --trunk-gb (default 16) then caps two row buffers of at most\n"
 "                        8 MiB each plus the current layer's vectors, and the memory\n"
 "                        plan charges the whole budget; pass a small one\n"
@@ -877,6 +885,13 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--list-presets")) { k3_preset_list(stdout); return 0; }
     }
     if (argc < 2) { usage(stderr); return 2; }
+#ifndef K3_TEST_MUTANTS
+    /* gate mutants exist only in test builds (make mutants); a production binary refuses the switch */
+    if (getenv("K3_MLA_SPLIT_MUTANT_CAUSAL")) {
+        fprintf(stderr, "K3_MLA_SPLIT_MUTANT_CAUSAL is a gate mutant for test builds (make mutants); this build refuses it\n");
+        return 2;
+    }
+#endif
 
     const char *dir = argv[1];
     if (dir[0] == '-') {
@@ -914,7 +929,7 @@ int main(int argc, char **argv)
     const char *load_state = NULL, *save_state = NULL;
     const char *preset_name = NULL;
     int incremental = 0, ultra = 0, stream_lm_head = 0, expert_pipeline = 0;
-    int kv_latent = 0, trunk_rows = 0;
+    int kv_latent = 0, trunk_rows = 0, kvb_mode = K3_KVB_OFF;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -972,6 +987,23 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) outp = argv[++i];
         else if (!strcmp(argv[i], "--trunk") && i + 1 < argc) trunk_dir = argv[++i];
         else if (!strcmp(argv[i], "--trunk-rows")) trunk_rows = 1;
+        else if (!strcmp(argv[i], "--mla-split") && i + 1 < argc) {
+            /* strict: digits only. atoi read "banana" as 0 and "2junk" as 2 (Astra's K1 review) */
+            const char *s = argv[++i];
+            const size_t nd = strspn(s, "0123456789");
+            if (nd == 0 || s[nd] != '\0' || nd > 4 || atoi(s) > 4096) {
+                fprintf(stderr, "--mla-split takes a block size from 0 (off) to 4096, got '%s'\n", s);
+                return 2;
+            }
+            k3_mla_split_block = atoi(s);
+        }
+        else if (!strcmp(argv[i], "--kvb-cache") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "off")) kvb_mode = K3_KVB_OFF;
+            else if (!strcmp(m, "active")) kvb_mode = K3_KVB_ACTIVE;
+            else if (!strcmp(m, "pin")) kvb_mode = K3_KVB_PIN;
+            else { fprintf(stderr, "--kvb-cache takes off, active or pin\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
@@ -1038,6 +1070,11 @@ int main(int argc, char **argv)
     if (trunk_rows && (!trunk_dir || draft_dir || budget_auto)) {
         fprintf(stderr, "--trunk-rows needs --trunk; --trunk-gb auto, --preset auto and "
                         "draft trunks are unsupported\n");
+        return 2;
+    }
+    /* only the --kv-latent passes reread kv_b rows, and only the row pipeline streams them */
+    if (kvb_mode != K3_KVB_OFF && (!trunk_rows || !kv_latent)) {
+        fprintf(stderr, "--kvb-cache needs --trunk-rows and --kv-latent\n");
         return 2;
     }
     if (trunk_rows && (!isfinite(trunk_gb) || trunk_gb <= 0 || trunk_gb * 1e9 >= (double)INT64_MAX)) {
@@ -1542,7 +1579,7 @@ int main(int argc, char **argv)
          * matters because the K3 report (4.1.4) keeps exactly these tensors in higher
          * precision on purpose. */
         const int rc = trunk_rows
-            ? k3_trunk_open_rows(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9))
+            ? k3_trunk_open_rows_kvb(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9), kvb_mode)
             : k3_trunk_open(&trunk, trunk_dir, &c, (int64_t)(trunk_gb * 1e9));
         if (rc != 0) return 1;
         if (trunk.n_layers < NL) {
@@ -2219,6 +2256,9 @@ int main(int argc, char **argv)
                 "\"memory_plan_bytes\":%.0f,\"trunk_rows\":%s,"
                 "\"trunk_row_buffer_bytes\":%llu,\"trunk_small_buffer_bytes\":%llu,"
                 "\"trunk_matrix_calls\":%llu,\"trunk_rows_whole_tiles\":%s,"
+                "\"trunk_kvb_mode\":\"%s\",\"trunk_kvb_buffer_bytes\":%llu,\"trunk_kvb_fills\":%llu,"
+                "\"trunk_kvb_hits\":%llu,\"trunk_kvb_fill_bytes\":%llu,\"trunk_kvb_fallbacks\":%llu,"
+                "\"trunk_kvb_metadata_bytes\":%llu,\"trunk_kvb_fill_seconds\":%.9f,"
                 "\"stopped_at\":%d,"
                 "\"decode_steps\":%d,\"forward_sweeps\":%ld,\"spec_n\":%d,"
                 "\"spec_sweeps\":%ld,\"spec_drafted\":%ld,\"spec_accepted\":%ld,"
@@ -2245,6 +2285,14 @@ int main(int argc, char **argv)
                 (unsigned long long)(w.trunk ? w.trunk->small_buffer_bytes : 0),
                 (unsigned long long)(w.trunk ? w.trunk->matrix_calls : 0),
                 trunk_rows && w.trunk && w.trunk->rows_whole_tiles ? "true" : "false",
+                kvb_mode == K3_KVB_PIN ? "pin" : kvb_mode == K3_KVB_ACTIVE ? "active" : "off",
+                (unsigned long long)(w.trunk ? w.trunk->kvb_buffer_bytes : 0),
+                (unsigned long long)(w.trunk ? w.trunk->kvb_fills : 0),
+                (unsigned long long)(w.trunk ? w.trunk->kvb_hits : 0),
+                (unsigned long long)(w.trunk ? w.trunk->kvb_fill_bytes : 0),
+                (unsigned long long)(w.trunk ? w.trunk->kvb_fallbacks : 0),
+                (unsigned long long)(w.trunk ? w.trunk->kvb_metadata_bytes : 0),
+                w.trunk ? w.trunk->kvb_fill_seconds : 0.0,
                 stopped_at,
                 steps, w.forwards, spec_n, spec_sweeps, spec_drafted, spec_accepted,
                 spec_full, spec_partial, spec_cut, spec_dropped,
