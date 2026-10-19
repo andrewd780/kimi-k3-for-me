@@ -1176,7 +1176,7 @@ static void t_layer(const char *dir, const char *file)
         int din[4]={0}, dbr[4]={0};
         shape(r,"in",din,4); shape(r,"block_residual_in",dbr,4);
         const int T = din[1], nb_in = dbr[1];
-        const int maxb = c.n_layers / c.attn_res_block + 2;
+        const int maxb = k3_attn_res_stride(&c);
 
         float *h  = (float*)malloc((size_t)T*c.hidden*sizeof(float));
         float *br = (float*)calloc((size_t)T*maxb*c.hidden,sizeof(float));

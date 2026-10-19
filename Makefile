@@ -318,6 +318,24 @@ test: $(CLI_BIN) $(MUT_BIN) $(TEST_BINS)
 	             echo "  pass on the loader's error and prove nothing"; exit 1;; \
 	      esac; \
 	  done; echo "  3 malformed stop lists refused, each for the right reason"
+	@echo "== loop-layers contract =="; \
+	  out=$$(K3_LOOP_MUTANT_SHARED_STATE=1 ./$(CLI_BIN) fake --ids 1 2>&1); rc=$$?; \
+	  case "$$rc:$$out" in 2:*K3_LOOP_MUTANT_SHARED_STATE*) ;; \
+	      *) echo "  the production CLI did not refuse the loop gate mutant switch ($$rc): $$out"; \
+	         exit 1;; \
+	  esac; \
+	  for bad in "--loop-layers 3" "--loop-layers 3-5x" "--loop-layers 5-3" \
+	             "--loop-layers 3-5 --loop-count 9" "--loop-count 2" \
+	             "--loop-layers 3-5 --spec 2" "--loop-layers 3-5 --save-state s"; do \
+	      out=$$(./$(CLI_BIN) fake --ids 1 $$bad 2>&1); rc=$$?; \
+	      test $$rc -eq 2 || { echo "  $$bad returned $$rc, expected 2"; exit 1; }; \
+	      case "$$out" in \
+	          *"unknown option"*) echo "  $$bad: this build does not know --loop-layers"; exit 1;; \
+	          *--loop*) ;; \
+	          *) echo "  $$bad was refused, but not because of --loop-layers:"; \
+	             echo "      $$out"; exit 1;; \
+	      esac; \
+	  done; echo "  the mutant switch and 7 malformed or unsupported loop requests refused, each for the right reason"
 	@echo "== op kernels ==";        ./$(BIN)/test_ops $(FIXTURES)/ops
 	@echo "== matmul exactness ==";  ./$(BIN)/test_matmul_exact
 	@echo "== quality arithmetic =="; ./$(BIN)/test_quality

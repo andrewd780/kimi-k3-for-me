@@ -476,13 +476,20 @@ class K3Model(nn.Module):
         self.output_attn_res_norm = RMSNorm(c.hidden_size, c.rms_norm_eps)
         self.output_attn_res_proj = nn.Linear(c.hidden_size, 1, bias=False)
 
-    def forward(self, ids, states=None):
+    def forward(self, ids, states=None, order=None):
+        """order: the physical layer index each executed position uses, from
+        loop_order(); None is the released stack 0..N-1. Every executed position keeps
+        its own recurrent state (states is indexed by position, not by layer), and a
+        layer's AttnRes boundary still fires on its own index: loop_order() only
+        produces whole-block spans, so that index has the same phase inside its block
+        as the position it occupies."""
         B, T = ids.shape
         h = self.embed_tokens(ids)
         block_residual = h.new_zeros(B * T, 0, self.c.hidden_size)
-        states = states or [None] * len(self.layers)
-        for i, layer in enumerate(self.layers):
-            h, block_residual, states[i] = layer(h, block_residual, states[i])
+        order = list(range(len(self.layers))) if order is None else list(order)
+        states = states or [None] * len(order)
+        for v, i in enumerate(order):
+            h, block_residual, states[v] = self.layers[i](h, block_residual, states[v])
         h = apply_attn_res(h.view(-1, self.c.hidden_size), block_residual,
                            self.output_attn_res_proj.weight.squeeze(0),
                            self.output_attn_res_norm.weight,
@@ -490,14 +497,29 @@ class K3Model(nn.Module):
         return self.lm_head(self.norm(h)), states
 
     @torch.no_grad()
-    def greedy(self, ids, n_new: int):
+    def greedy(self, ids, n_new: int, order=None):
         """Full re-forward each step: slow, but it exercises the same code path as
         prefill and cannot drift from it. Correctness over speed, by design."""
         out = ids
         for _ in range(n_new):
-            logits, _ = self.forward(out)
+            logits, _ = self.forward(out, order=order)
             out = torch.cat([out, logits[:, -1].argmax(-1, keepdim=True)], dim=1)
         return out
+
+
+def loop_order(n_layers: int, block: int, a: int, b: int, count: int) -> list[int]:
+    """The executed layer order of bin/k3 --loop-layers a-b --loop-count count
+    (docs/notes/layer-loop.md): 0..b, then a..b another count-1 times, then b+1..N-1.
+    Refuses what bin/k3 refuses, a span that is not whole AttnRes blocks, because only
+    whole blocks keep each layer's boundary phase and so let forward() keep using the
+    physical index."""
+    if not (0 <= a <= b < n_layers) or a % block or ((b + 1) % block and b != n_layers - 1):
+        raise ValueError("loop span %d-%d is not whole blocks of %d in %d layers"
+                         % (a, b, block, n_layers))
+    if not 1 <= count <= 8:
+        raise ValueError("loop count %d is outside 1..8" % count)
+    return (list(range(b + 1)) + list(range(a, b + 1)) * (count - 1)
+            + list(range(b + 1, n_layers)))
 
 
 def tiny_config(**kw) -> K3Config:

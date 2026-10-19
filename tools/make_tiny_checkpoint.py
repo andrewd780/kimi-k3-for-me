@@ -36,7 +36,7 @@ import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from k3_ref import K3Model, tiny_config  # noqa: E402
+from k3_ref import K3Model, loop_order, tiny_config  # noqa: E402
 
 GROUP = 32
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -236,6 +236,11 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--prompt-ids", default="3,7,11,5,9")
+    ap.add_argument("--loop", action="append", default=[], metavar="A-B:R",
+                    help="also write ref_logits_loop_A-B_R.json: the torch reference for\n"
+                         "bin/k3 --loop-layers A-B --loop-count R (repeatable)")
+    ap.add_argument("--loop-gen", type=int, default=4,
+                    help="greedy tokens the looped reference continues for")
     a = ap.parse_args()
 
     os.makedirs(a.out_dir, exist_ok=True)
@@ -269,6 +274,24 @@ def main():
                    "logits_bits": np.asarray(logits, dtype=np.float32).view(np.uint32).tolist()},
                   f)
     print("reference: argmax %d, wrote ref_logits.json" % tok)
+
+    # ---- looped references (docs/notes/layer-loop.md), over the SAME transformed
+    # weights, so a bin/k3 --loop-layers run has a true answer of its own ----
+    for spec in a.loop:
+        span, count = spec.split(":")
+        lo, hi = (int(v) for v in span.split("-"))
+        order = loop_order(cfg.num_hidden_layers, cfg.attn_res_block_size, lo, hi, int(count))
+        with torch.no_grad():
+            lg = model.forward(torch.tensor([ids]), order=order)[0][0, -1].float().cpu().numpy()
+            cont = model.greedy(torch.tensor([ids]), a.loop_gen, order=order)[0, len(ids):]
+        name = "ref_logits_loop_%d-%d_%d.json" % (lo, hi, int(count))
+        with open(os.path.join(a.out_dir, name), "w") as f:
+            json.dump({"prompt_ids": ids, "loop": [lo, hi, int(count)], "order": order,
+                       "argmax": int(np.argmax(lg)), "greedy_ids": [int(t) for t in cont],
+                       "vocab": int(cfg.vocab_size),
+                       "logits_bits": np.asarray(lg, dtype=np.float32).view(np.uint32).tolist()},
+                      f)
+        print("looped reference %s: argmax %d, wrote %s" % (spec, int(np.argmax(lg)), name))
 
     # ---- flat config.json (aliases accepted by k3_cfg.h) ----
     config = {
