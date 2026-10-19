@@ -19,7 +19,9 @@
  *      token's hidden state must leave the outputs of the earlier new tokens unchanged
  *      bit for bit, in L1 and in A, and must change the last one.
  *   5. Thread-count independence: L1, E+ and A rerun on every available thread give the
- *      bits they gave on one, on the cases of up to 48 positions (see test_case).
+ *      bits they gave on one, on the cases of up to 48 positions (see test_case), and so
+ *      does the engine's expanded layout, which splits its heads across threads as E+
+ *      does: outputs, appended rows, scores, normalisers, quotients and accumulators.
  *   6. A is the plain formula: it matches a scalar, loop-by-loop rendering of the
  *      absorbed attention bitwise, so bench_mla's numerical study measures absorption
  *      itself, not an artefact of the vectorised loop. It is NOT equal to E, and the

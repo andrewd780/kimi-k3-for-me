@@ -16,13 +16,16 @@
  *   all; query token t sits at position C + t and sees positions 0..C+t (causal).
  *
  *   E   EXPANDED cache: per-head k_nope and v, 98,304 B per position per layer, plus
- *       the 256 B rope row. The loop in k3_mla_cached today, copied statement for
- *       statement: per query token, per head, positions ascending, on one thread.
+ *       the 256 B rope row. The loop k3_mla_cached's expanded branch ran until it took
+ *       E+'s structure, copied statement for statement and kept as the reference the
+ *       engine is held to: per query token, per head, positions ascending, one thread.
  *   E+  NOT one of the four requested variants. The same arithmetic as E, restructured:
  *       heads split across OpenMP threads, positions outer and query tokens inner so the
  *       cache is read once per call rather than once per query token, and four position
  *       chains in flight at a time. It exists so that A is not credited with a speedup
- *       that is really only a better loop. Bitwise identical to E.
+ *       that is really only a better loop. Bitwise identical to E. The engine's expanded
+ *       branch now runs this structure, with query tokens in blocks of 16 so that an
+ *       unchunked prompt's score block stays linear in its length.
  *   L0  LATENT cache: the 512-float post-norm latent plus the rope row, 2,304 B per
  *       position per layer. The loop in k3_mla_cached today: every cached position is
  *       rebuilt through kv_b TWICE PER QUERY TOKEN, its key rows to score it and its
@@ -103,7 +106,8 @@
  * THREADING
  *   kv_b goes through k3_mmw or k3_mmw_rows everywhere, which split output rows across
  *   OpenMP threads.
- *   E and L0 are otherwise single-threaded, as in the engine. E+, L1 and A split heads,
+ *   E and L0 are otherwise single-threaded, as the engine's latent loop is (and its
+ *   expanded loop was, until it took E+'s structure). E+, L1 and A split heads,
  *   positions or (query, head) pairs across threads, never a reduction. Where A calls
  *   k3_mmw inside its own parallel loop the inner region is inactive under the default
  *   max-active-levels of 1, and the kernel's result is the same either way. Every
@@ -342,8 +346,9 @@ static inline double mla_softmax_row(float *row, int p, double *qrow)
 }
 
 /* -------------------------------------------------------------------- E ---- */
-/* k3_mla_cached's expanded branch, statement for statement. acc is [T][H][v_head]
- * rather than the engine's per-token [H][v_head]; nothing else differs. */
+/* k3_mla_cached's expanded branch as it was before it took E+'s structure, statement for
+ * statement. acc is [T][H][v_head] rather than that loop's per-token [H][v_head];
+ * nothing else differs. */
 static void mla_attend_E(float *acc, const float *q, int T, int C, const MlaCache *k,
                          const K3Cfg *c, void *scratch, float *probe)
 {
