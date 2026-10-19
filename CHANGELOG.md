@@ -7,6 +7,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Experimental layer looping, `--loop-layers A-B` / `--loop-count R`** (off by default;
+  changes the model). Runs a span of whole AttnRes blocks R times per token, as if the
+  span appeared R times in the stack. Each executed position has its own KDA state slot
+  and MLA cache rows; the AttnRes block stack's stride grows by the extra snapshots
+  through one helper, `k3_attn_res_stride()`, which replaces five copies of the stride
+  formula. Without the flag, ids and every generated token's logits are byte-identical
+  to `main` in 9 modes (including `--spec`), and `make test` is unchanged. Gated by
+  `tests/test_layer_loop.py`: `--loop-count 1` is the identity; four spans match an
+  independent torch reference (`tools/k3_ref.py` `loop_order`, written by
+  `make_tiny_checkpoint.py --loop`) at 4.3e-6 to 6.8e-6 relative against a 6.8e-5
+  yardstick, while the unlooped run sits at 0.46 or more; incremental, `--kv-latent`,
+  `--mla-split`, a streamed trunk and lm_head, and `--expert-pipeline` are bit-identical
+  to looped full recompute; a shared-state mutant (`K3_LOOP_MUTANT_SHARED_STATE`, test
+  builds only) is caught for KDA and MLA-only spans. A misordered-span plant and an
+  ungrown-stride plant each fail the gates. No quality or speed result is claimed.
+
 - **Exact batched trunk matmul** for T > 1 positions (prefill, speculative
   verification, draft prefill): `k3_matmul_bf16_batch`, `k3_matmul_batch` and the
   `k3_mmw_batch` dispatcher apply a matrix to every position in one pass, widening each

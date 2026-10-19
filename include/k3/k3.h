@@ -107,6 +107,10 @@ typedef struct {
 
     /* Block Attention Residuals */
     int attn_res_block;    /* 12. Boundaries fire when layer_idx % this == 0. */
+    /* Runtime only, never read from config.json: extra block snapshots added by
+     * --loop-layers repeating whole blocks (docs/notes/layer-loop.md). Zero for every
+     * loaded config, which keeps k3_attn_res_stride() at its trained value. */
+    int attn_res_extra;
 
     /* SiTU-GLU. The sigmoid takes the UNCAPPED gate. Bound is b1*b2 = 100. */
     float situ_b1;         /* 4.0   */
@@ -122,6 +126,15 @@ typedef struct {
 int  k3_is_mla(const K3Cfg *c, int layer);   /* layer is ZERO-based */
 int  k3_is_kda(const K3Cfg *c, int layer);
 int  k3_is_dense(const K3Cfg *c, int layer);
+
+/* Rows per position in the AttnRes block stack: every snapshot the stack can take plus
+ * the running prefix, with one row of slack. The engine, the layer and the scratch sizing
+ * all lay the stack out at this stride, so it has exactly one definition; two spellings
+ * of it would let one of them read the stack at the wrong stride without a symptom. */
+static inline int k3_attn_res_stride(const K3Cfg *c)
+{
+    return c->n_layers / c->attn_res_block + 2 + c->attn_res_extra;
+}
 
 /* ------------------------------------------------------------------ ops ---- */
 

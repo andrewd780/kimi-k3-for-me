@@ -196,7 +196,7 @@ static void forward(Model *m, const K3Cfg *c, const int *ids, int T, float *logi
                     float *scratch, float *h, float *br, float *kstate, int reuse_state)
 {
     const int E = c->hidden;
-    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const int maxb = k3_attn_res_stride(c);
     const int P = c->kda_heads * c->kda_head_dim;
     const size_t kper = (size_t)P * (size_t)c->kda_head_dim
                       + (size_t)3 * (size_t)P * (size_t)(c->conv_k - 1);
@@ -258,7 +258,7 @@ static int incremental_decode(const Model *m, const K3Cfg *c, int T, int np,
                               int latent, int *gi, float *lgs, int trace)
 {
     const int H = c->n_heads, kvd = c->qk_nope + c->v_head;
-    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const int maxb = k3_attn_res_stride(c);
     const int P = c->kda_heads * c->kda_head_dim;
     const size_t kper = (size_t)P * (size_t)c->kda_head_dim
                       + (size_t)3 * (size_t)P * (size_t)(c->conv_k - 1);
@@ -361,7 +361,7 @@ static int spec_decode(const Model *m, const K3Cfg *c, int T, int np, int latent
                        float *ks, float *kvc, float *rpc, int *hist)
 {
     const int E = c->hidden, V = c->vocab, H = c->n_heads, kvd = c->qk_nope + c->v_head;
-    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const int maxb = k3_attn_res_stride(c);
     const size_t kper = k3_kda_state_floats(c), lrow = k3_kda_log_row(c);
     const size_t kvper = (size_t)T * (latent ? (size_t)c->kv_lora : (size_t)H * kvd);
     const size_t rpper = (size_t)T * (size_t)c->qk_rope;
@@ -527,7 +527,7 @@ int main(int argc, char **argv)
     int *full = (int *)malloc((size_t)T * sizeof(int));
     for (int i = 0; i < T; i++) full[i] = (int)jf->kids[i]->num;
 
-    const int maxb = c.n_layers / c.attn_res_block + 2;
+    const int maxb = k3_attn_res_stride(&c);
     const int P = c.kda_heads * c.kda_head_dim;
     const size_t kper = (size_t)P * (size_t)c.kda_head_dim
                       + (size_t)3 * (size_t)P * (size_t)(c.conv_k - 1);

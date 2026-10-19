@@ -2158,7 +2158,7 @@ size_t k3_layer_scratch(const K3Cfg *c, int T)
     /* prefix_sum, tmp, hin, fold vectors, one attn_res source stack, plus the region */
     return (size_t)3 * T * c->hidden
          + (size_t)2 * c->hidden
-         + (size_t)(c->n_layers / c->attn_res_block + 2) * c->hidden
+         + (size_t)k3_attn_res_stride(c) * c->hidden
          + layer_region(c, T);
 }
 
@@ -2190,7 +2190,7 @@ void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
                               const K3KdaLog *kda_log)
 {
     const int E = c->hidden;
-    const int maxb = c->n_layers / c->attn_res_block + 2;
+    const int maxb = k3_attn_res_stride(c);
 
     float *pref   = scratch;                    /* [T][E] the running residual   */
     float *tmp    = pref + (size_t)T * E;       /* [T][E] module output          */

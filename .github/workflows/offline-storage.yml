@@ -75,6 +75,12 @@ jobs:
           K3_CGROUP_TEST: '1'
           K3_HEAD_REPORT: lm-head-mechanism.json
         run: python3 -m unittest discover -s tests -p test_offline_cli.py -v
+      - name: Check --loop-layers against the torch reference, mode parity and its mutant
+        if: runner.os == 'Linux'
+        env:
+          K3_TEST_BIN: bin/zstd/k3
+          K3_TEST_MUT_BIN: bin/zstd/k3-mut
+        run: python3 -m unittest discover -s tests -p test_layer_loop.py -v
       - name: Preserve CI fixture measurements
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4

@@ -466,6 +466,19 @@ entire prefix, which is *O(T²)*; with it, step 0 pays for the prompt and every 
 costs the same fixed amount. Both paths are gated on producing identical tokens, so this
 is a pure speed choice.
 
+### Experimental options (these change the model)
+
+| flag | argument | default | |
+|---|---|---|---|
+| `--loop-layers` | `A-B` | off | run layers A..B (zero-based, whole 12-layer AttnRes blocks) more than once per token, as if the span appeared again in the stack; each pass keeps its own recurrent state and KV rows, weights are shared. **K3 was not trained for this: expect worse output and more time per token.** Refuses `--spec`, `--draft-trunk`, saved states, `--trunk-rows`, `--ultra-low-memory`, `--dump-cache-trace` and `--tf-check`. [Design and gates](docs/notes/layer-loop.md) |
+| `--loop-count` | `R` | 2 | total passes over the `--loop-layers` span, 1 to 8; 1 is bit-identical to running without `--loop-layers` |
+
+These are the only flags whose output is not the released model's. The engine is gated
+on computing the looped stack it claims to (an independent torch reference on the tiny
+model, and bit-identical results across every supported mode); nothing here says whether
+the looped stack is any good. `--score-prompt` works with them, which is how a machine
+holding the full checkpoint would measure that.
+
 ### Diagnostic options
 
 | flag | argument | |

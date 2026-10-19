@@ -119,6 +119,12 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 | Speculative decoding on resident hardware | A cheap draft proposes tokens, the exact model verifies; ~1.7x fewer weight bytes per accepted token at the measured 66.7% acceptance ([note](notes/int8-draft-container.md)) | proposal | Only pays off once the model is resident in RAM; nothing on 8 GB, where both draft and exact stream from disk | Needs a large-memory host to pay for |
 | Chunked prefill, sampling, chat template, vision, HTTP serving | Usability features from the upstream roadmap | not started | n/a | Do not change size or speed |
 
+### Experimental, changes the model
+
+| Technique | What it does | Status | How deep the evidence goes | What is left |
+|---|---|---|---|---|
+| Layer looping, `--loop-layers` / `--loop-count` | Re-runs a span of whole AttnRes blocks per token, as if it appeared again in the stack; the only "looped K3" that exists without training | built, opt-in, **not exact by design** | Tiny model: matches an independent torch reference on four spans; bit-identical across seven supported modes; flag off byte-identical to `main` in nine modes; shared-state mutant and two plants caught ([note](notes/layer-loop.md)) | Whether looping helps or hurts K3 is unmeasured; it needs `--score-prompt` on a machine holding the checkpoint. Expected: it hurts |
+
 ### Blocked on a machine that holds the checkpoint
 
 Full-model seconds per token on a laptop-like core count, a thread-count sweep, real
