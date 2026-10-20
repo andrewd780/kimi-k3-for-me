@@ -16,5 +16,8 @@ TRUNK="${2:?}"
 FILE="${3:?}"
 
 wc -c "$FILE"
+# --checkpoint saves the read-in after every chunk: if the run is interrupted (or paused
+# with Ctrl-C), the same command continues where it stopped.
 ./bin/k3 "$MODEL" --trunk "$TRUNK" --preset server \
-    --tok "$MODEL" --prompt-file "$FILE" --gen 16 --incremental
+    --tok "$MODEL" --prompt-file "$FILE" --gen 16 --incremental \
+    --checkpoint "$FILE.k3state"

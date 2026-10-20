@@ -13,6 +13,12 @@ tests/unit/k3_model.c), so every mode must give the bits of one pass over the wh
   - a prompt past the old 32,768-id ceiling reads in, and two chunkings of it agree;
   - refusals name their reason (chunk range, --prefill-chunk without --incremental, the one-pass ceiling of full
     recompute, --ids-file problems, an inconsistent state file).
+--checkpoint PATH saves the read-in's progress after every chunk but the last, and the same command run again resumes
+from it; --pause-after N and Ctrl-C stop after a saved chunk with exit status 3:
+  - a read-in paused twice and resumed is the uninterrupted run (ids, logits, saved state), and the checkpoint is byte
+    for byte the state a run over the ids it holds saves with --gen 0;
+  - Ctrl-C mid read-in pauses at the next chunk boundary, and the resumed run is the uninterrupted one;
+  - a checkpoint of another prompt, another loop or another cache layout is refused.
 
 Build first (`make all mutants`).
 K3_TEST_BIN=bin/k3 K3_TEST_MUT_BIN=bin/k3-mut python3 -m unittest discover -s tests -p test_prefill_chunk.py -v
@@ -23,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
 import struct
 import subprocess
 import sys
@@ -78,6 +85,7 @@ class PrefillChunkTests(unittest.TestCase):
                                  *(["--dump-all-logits", str(logits)] if dump else []), *map(str, args)],
                                 text=True, errors="replace", capture_output=True,
                                 env={**self.env, **(env or {})}, timeout=timeout)
+        self.last_stdout = result.stdout
         if not ok:
             self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
             self.assertFalse(out.exists(), "a refused run must not write a report")
@@ -257,6 +265,82 @@ class PrefillChunkTests(unittest.TestCase):
                 path.write_bytes(bytes(bad))
                 err = self.run_cli(["--incremental", "--load-state", path], ids=[7], gen=1, ok=False, rc=1)
                 self.assertIn("at most one pending id", err)
+
+    # ------------------------------------------------------------------ pause and resume (--checkpoint)
+    def test_a_paused_and_resumed_read_in_is_the_uninterrupted_run(self):
+        for mode in (["--incremental"], ["--incremental", "--kv-latent", "--loop"],
+                     ["--incremental", "--kv-latent", "--mla-split", "3", "--spec", "2"]):
+            with self.subTest(mode=mode):
+                ck = self.path / "ck.state"
+                ck.unlink(missing_ok=True)
+                base = [*mode, "--prefill-chunk", 4]
+                whole_state, done_state = self.path / "whole.state", self.path / "done.state"
+                whole = self.run_cli([*base, "--save-state", whole_state])
+                self.run_cli([*base, "--checkpoint", ck, "--pause-after", 2], ok=False, rc=3)
+                self.assertIn("paused: 8 of 21 positions", self.last_stdout)
+                # the checkpoint is the state a run over its 8 ids saves with nothing generated
+                prefix = self.path / "prefix.state"
+                self.run_cli([*mode, "--save-state", prefix], ids=PROMPT[:8], gen=0)
+                self.assertEqual(ck.read_bytes(), prefix.read_bytes())
+                self.run_cli([*base, "--checkpoint", ck, "--pause-after", 1], ok=False, rc=3)
+                done = self.run_cli([*base, "--checkpoint", ck, "--save-state", done_state])
+                self.assertEqual(done[0]["checkpoint_resumed_ids"], 12)
+                self.assert_same(whole, done)
+                self.assertEqual(whole_state.read_bytes(), done_state.read_bytes())
+                # the checkpoint is kept, at the last chunk boundary before the end: the same command resumes from it
+                again = self.run_cli([*base, "--checkpoint", ck])
+                self.assertEqual(again[0]["checkpoint_resumed_ids"], 20)
+                self.assert_same(whole, again)
+
+    def test_ctrl_c_pauses_after_the_chunk_and_the_resumed_run_is_the_uninterrupted_one(self):
+        rnd = random.Random(3)
+        ids = self.path / "ctrl_c.ids"
+        ids.write_text(",".join(str(rnd.randrange(VOCAB)) for _ in range(4000)))
+        ck = self.path / "ck.state"
+        base = [str(self.binary), str(self.model), "--ids-file", str(ids), "--gen", "2", "--cache-gb", "0.0001",
+                "--incremental", "--prefill-chunk", "16"]
+        p = subprocess.Popen([*base, "--checkpoint", str(ck), "--out", str(self.path / "paused.json")],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env)
+        for line in p.stdout:
+            if "prompt read in" in line:        # the read-in has begun: Ctrl-C now pauses rather than stops
+                p.send_signal(signal.SIGINT)
+                break
+        out, err = p.communicate(timeout=600)
+        self.assertEqual(p.returncode, 3, out + err)
+        self.assertIn("Ctrl-C: pausing", err)
+        self.assertIn("Run the same command again", out)
+        self.assertFalse((self.path / "paused.json").exists())
+        resumed = self.run_cli(["--incremental", "--prefill-chunk", 16, "--checkpoint", ck], ids=ids, gen=2)
+        self.assertGreater(resumed[0]["checkpoint_resumed_ids"], 0)
+        self.assertLess(resumed[0]["checkpoint_resumed_ids"], 4000)
+        self.assertEqual(resumed[0]["checkpoint_resumed_ids"] % 16, 0)
+        self.assert_same(self.run_cli(["--incremental", "--prefill-chunk", 16], ids=ids, gen=2), resumed)
+
+    def test_a_checkpoint_of_another_prompt_loop_or_layout_is_refused(self):
+        ck = self.path / "ck.state"
+        self.run_cli(["--incremental", "--prefill-chunk", 4, "--checkpoint", ck, "--pause-after", 1], ok=False, rc=3)
+        other = PROMPT[:2] + [99] + PROMPT[3:]
+        err = self.run_cli(["--incremental", "--prefill-chunk", 4, "--checkpoint", ck], ids=other, ok=False)
+        self.assertIn("different prompt", err)
+        self.assertIn("position 2", err)
+        err = self.run_cli(["--incremental", "--checkpoint", ck], ids=PROMPT[:4], ok=False)
+        self.assertIn("not a read-in of this prompt", err)
+        self.assertIn("loop", self.run_cli(["--incremental", "--loop", "--checkpoint", ck], ok=False, rc=1))
+        self.assertIn("--kv-latent", self.run_cli(["--incremental", "--kv-latent", "--checkpoint", ck], ok=False, rc=1))
+        # nothing above touched it
+        self.assertEqual(self.run_cli(["--incremental", "--checkpoint", ck])[0]["checkpoint_resumed_ids"], 4)
+
+    def test_checkpoint_refusals_name_the_reason(self):
+        ck = self.path / "ck.state"
+        cases = [(["--checkpoint", ck], "--checkpoint needs --incremental"),
+                 (["--incremental", "--pause-after", 2], "--pause-after needs --checkpoint"),
+                 (["--incremental", "--checkpoint", ck, "--pause-after", 0], "--pause-after takes"),
+                 (["--incremental", "--checkpoint", ck, "--pause-after", "x"], "--pause-after takes"),
+                 (["--incremental", "--checkpoint", ck, "--load-state", ck], "give one of them")]
+        for args, reason in cases:
+            with self.subTest(args=args):
+                self.assertIn(reason, self.run_cli(args, ok=False))
+        self.assertFalse(ck.exists())
 
 
 if __name__ == "__main__":
