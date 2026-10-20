@@ -184,8 +184,9 @@ answer or guarantee instruction following. It doubles input context and adds pre
 work; a long prompt can be substantially slower. It is opt-in so existing prompts
 and oracle tests retain their original semantics.
 
-The original prompt must fit within 16,384 tokens when rereading, given this build's
-32,768-token input ceiling. The repeated input, generation allowance and any saved
+The original prompt must fit within 524,288 tokens when rereading, given this build's
+1,048,576-token input ceiling under `--incremental` (16,384 without it, where full
+recompute is one pass of at most 32,768). The repeated input, generation allowance and any saved
 history are checked together before weights are loaded. On `--load-state`, only the
 new request is repeated; saved history is not duplicated.
 

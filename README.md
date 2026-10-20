@@ -413,6 +413,7 @@ Exactly one of these is required. Passing none, or more than one, is a usage err
 | `--prompt` | `TEXT` | tokenize TEXT and run it. **Requires `--tok`.** |
 | `--prompt-file` | `PATH` | tokenize the file's bytes. **Requires `--tok`.** Preferred for anything non-ASCII: the shell re-encodes `argv`, whereas a file is read verbatim |
 | `--ids` | `1,2,3` | token ids directly. No tokenizer is loaded at all, so this works on a machine with no tokenizer files. The reproducible channel the tests use |
+| `--ids-file` | `PATH` | the same ids read from a file: one command-line argument carries at most 128 KiB on Linux, about 30,000 ids |
 
 ```bash
 # text in
@@ -455,8 +456,9 @@ shorthand. Order matters if you mix them: a later flag wins, so
 
 | flag | argument | default | |
 |---|---|---|---|
-| `--gen` | `N` | 8 | tokens to generate. Ceiling 4096; prompts may be up to 32768 tokens |
-| `--incremental` | none | off | carry the KV cache and the recurrent state between tokens instead of re-running the whole prefix |
+| `--gen` | `N` | 8 | tokens to generate. Ceiling 4096; prompts may be up to 1,048,576 ids under `--incremental`, 32,768 without it (full recompute is one pass over the whole sequence) |
+| `--incremental` | none | off | carry the KV cache and the recurrent state between tokens instead of re-running the whole prefix. The only mode for prompts over 32,768 ids |
+| `--prefill-chunk` | `N` | 4096 | with `--incremental`: read the prompt in at most N positions per pass (1 to 32768). Bit-identical to one pass; the per-position buffers (about 0.67 MB per row at K3's shapes) are sized for N rather than for the prompt, and a read-in of several chunks prints its progress and an estimate of the time to go after each one. A streamed trunk and the routed experts are read once per chunk |
 | `--kv-latent` | none | off | cache MLA's compressed latent instead of the expanded k and v and rebuild them on use: 0.055 MB per position instead of 2.37, paid for with one `kv_b` matmul's worth per cached position per query token, in two halves (its key rows to score it, its value rows to weight its value). Logits are bitwise identical. Needs `--incremental`. See [the note](docs/notes/kv-latent.md) |
 | `--spec` | `N` | off | speculative decode: draft up to N tokens (at most 8) by n-gram lookup and verify them in one batched sweep. Output is identical to serial decode. A sweep reads the trunk and lm_head once for all its positions, though `--kv-latent` under `--trunk-rows` still reads `kv_b` (from a plain `trunk.bin` only the half each pass applies) for every cached position it rebuilds; each extra position costs its own experts and arithmetic. A rejected draft costs no second sweep: only the accepted positions are committed, from a per-position log of the recurrent layers' inputs that the memory plan counts. Needs `--incremental`; not with `--ultra-low-memory`. No full-checkpoint speedup measured. [Drafting study](docs/notes/spec-replay.md) |
 | `--tok` | `DIR` | none | directory holding `tiktoken.model` and `tokenizer_config.json` |
@@ -466,7 +468,7 @@ entire prefix, which is *O(T²)*; with it, step 0 pays for the prompt and every 
 costs the same fixed amount. Both paths are gated on producing identical tokens, so this
 is a pure speed choice.
 
-### The layer loop (ON by default; it changes the model)
+### The layer loop (off by default; it changes the model)
 
 | flag | argument | default | |
 |---|---|---|---|
@@ -3407,8 +3409,11 @@ Raw data: [`docs/data/trunk-quantisation.txt`](docs/data/trunk-quantisation.txt)
 - **No chat template.** Base model continuations, not replies.
 - **Greedy decoding only.** No temperature, no top-p, no top-k. Greedy is what keeps the
   output identical across budgets.
-- **No chunked prefill.** The ceiling is 32,768 tokens, but a 21,000 token prompt is one
-  quadratic pass.
+- **A long prompt is slow to read in, not refused.** Under `--incremental` the ceiling is
+  1,048,576 ids, read in passes of `--prefill-chunk` positions (default 4096) with the same
+  bits as one pass. Every prompt position runs the whole model: about 3.6 s per position
+  on a 4-vCPU AVX-512 box before MLA attention, so 32K positions take about a day and a
+  half and 1M several weeks there. `--kv-latent` keeps the 1M cache at 58 GB.
 - **Context is bounded by memory, not by the engine.**
 
 ![The advertised million-token context is a memory fact, not an engine limit](docs/images/eq_context_ceiling.png)

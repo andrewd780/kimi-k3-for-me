@@ -601,11 +601,18 @@ extern long k3_expert_drops;
  * figures side by side, when it will not fit in available memory. Reaching the model's
  * full 1M context is a hardware question, not an engine limit.
  *
- * Note that long prompts are also bounded in practice by prefill cost: attention in the
- * MLA layers is quadratic in sequence length, and prefill is not yet chunked. See
- * docs/ROADMAP.md. */
-#define K3_MAX_PROMPT 32768
-#define K3_MAX_GEN     4096
+ * Long prompts are bounded in practice by reading-in cost, not by this ceiling: every
+ * prompt position runs the whole model (about 3.6 s per position on a 4-vCPU AVX-512
+ * box, before the MLA layers' attention, which grows with the context).
+ *
+ * K3_MAX_PASS is the most positions ONE forward pass takes: the whole sequence under full
+ * recompute, --score-prompt and --tf-check, and one chunk of an --incremental read-in
+ * (--prefill-chunk). It is the old 32,768-id prompt ceiling, so no pass sees more rows
+ * than one could before; a longer prompt is read in chunks under --incremental, the only
+ * mode that carries a cache from one pass to the next. */
+#define K3_MAX_PROMPT 1048576
+#define K3_MAX_PASS     32768
+#define K3_MAX_GEN       4096
 
 /* Bytes of MLA KV cache per position, measured on the released checkpoint: 24 MLA
  * layers x (96 heads x 256 floats + 64 shared rope floats) x 4 bytes. */
@@ -774,6 +781,11 @@ typedef struct {
 } K3LayerW;
 
 size_t k3_layer_scratch(const K3Cfg *c, int T);
+/* The same for the incremental form (k3_decoder_layer_inc) over T positions with a KV
+ * cache of capacity cap: the cached MLA path sizes its score rows by cap, not by T, and
+ * gets the region after the layer's own buffers, so a buffer of
+ * max(k3_layer_scratch, k3_mla_scratch_cached) is short by those buffers. */
+size_t k3_layer_scratch_cached(const K3Cfg *c, int T, int cap, int kv_latent);
 void   k3_decoder_layer(float *h, float *block_residual, int *n_blocks,
                         const K3LayerW *w, const K3Cfg *c, int layer_idx,
                         int T, float *state, float *scratch);

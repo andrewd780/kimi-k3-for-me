@@ -5,6 +5,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Long prompts: `--prefill-chunk N`, `--ids-file PATH`, and a 1,048,576-id ceiling under `--incremental`.** The
+  prompt is read in passes of at most N positions (default 4096, 1 to 32768), each carrying the KV cache and the
+  recurrent state to the next, with the bits of one pass: ids, every generated token's logits and the saved state
+  file are byte-identical at any chunking, in every incremental mode (`tests/test_prefill_chunk.py`, with two
+  test-build mutants that one pass never exercises, `K3_PREFILL_MUTANT_RESET` and `K3_PREFILL_MUTANT_RELATIVE`).
+  `h`, the AttnRes block stack, the scratch and the adaptive loop's buffers hold one pass's rows instead of the whole
+  context; only the KV cache and the per-position records span it. A read-in of several chunks prints its progress
+  and an estimate of the time to go. Full recompute, `--score-prompt` and `--tf-check` remain one pass of at most
+  32,768 ids (`K3_MAX_PASS`). The run report adds `prefill_chunk`, `prefill_passes` and `buffer_rows`.
+
+### Fixed
+
+- **Scratch overrun with `--kv-latent --mla-split`.** The incremental scratch was sized as the larger of the layer's
+  and the cached MLA path's needs, but the MLA path gets the region after the layer's own buffers, so it was short
+  by those whenever its score rows (heads x block x context) won: `--mla-split 300` over a 300-id prompt wrote past
+  the end on the tiny model under AddressSanitizer. `k3_layer_scratch_cached()` sizes the sum.
+- **The early KV-cache check used K3's 2.37 MB per position for every model**; it now reads the figure from the
+  config (the same number for K3), so the tiny model's long-context gates are not refused 78 GB.
+- **A tokenized prompt past the ceiling was cut short silently** (`tok_encode` stops at its buffer); it is refused.
+- **A state file is checked for at most one pending id** beyond its cached positions before anything is read.
+
 ### Changed
 
 - **The layer loop is opt-in again: `--loop`.** With no loop flag the CLI runs the released model, as before 2026-10-19.

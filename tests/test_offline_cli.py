@@ -732,7 +732,15 @@ class OfflineCliTests(unittest.TestCase):
             with self.subTest(ids=ids[:24]):
                 result = self.run_cli(self.plain, ["--ids", ids], ok=False)
                 self.assertIn("--ids" if len(ids) < 100 else "ceiling", result.stderr)
+        # full recompute is one forward pass of at most 32,768 ids, and --reread-prompt
+        # doubles the prompt before that ceiling is checked
         result = self.run_cli(self.plain, ["--ids", ",".join(["1"] * 16385),
+                                          "--reread-prompt"], ok=False)
+        self.assertIn("ceiling of one forward pass", result.stderr)
+        # under --incremental the ceiling is 1,048,576 ids, and a reread takes half of it
+        half = self.path / "half.ids"
+        half.write_text(",".join(["1"] * (524_288 + 1)))
+        result = self.run_cli(self.plain, ["--ids-file", half, "--incremental",
                                           "--reread-prompt"], ok=False)
         self.assertIn("reread limit", result.stderr)
 
@@ -740,7 +748,11 @@ class OfflineCliTests(unittest.TestCase):
         state = self.path / "saved.bin"
         self.run_cli(self.plain, ["--ids", ",".join(["1"] * 12), "--incremental",
                                  "--save-state", state])
-        result = self.run_cli(self.plain, ["--ids", ",".join(["1"] * 16380),
+        # 2 x 524,287 reread ids + 4,096 to generate + 1 fill the 1,052,672-position
+        # ceiling but for one position, so the 13 saved ones do not fit
+        ids = self.path / "long.ids"
+        ids.write_text(",".join(["1"] * 524_287))
+        result = self.run_cli(self.plain, ["--ids-file", ids,
                                           "--gen", "4096", "--reread-prompt",
                                           "--incremental", "--load-state", state], ok=False)
         self.assertIn("history", result.stderr)

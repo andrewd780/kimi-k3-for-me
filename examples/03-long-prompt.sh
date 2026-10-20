@@ -6,8 +6,10 @@
 # Use --prompt-file rather than --prompt for anything non-ASCII: argv is re-encoded by
 # the shell, so a UTF-8 string can reach the engine as different bytes than you typed.
 #
-# Be aware that prefill is not chunked and MLA attention is quadratic in sequence length,
-# so a long file is slow. See docs/ROADMAP.md.
+# The prompt is read in passes of --prefill-chunk positions (default 4096, bit-identical to
+# one pass), with progress and an estimate of the time to go after each. Every prompt
+# position still runs the whole model, so a long file is slow: about 3.6 s per position on
+# a 4-vCPU AVX-512 box. --kv-latent keeps the cache at 0.055 MB per position.
 set -euo pipefail
 MODEL="${1:?usage: 03-long-prompt.sh <model_dir> <trunk_dir> <file>}"
 TRUNK="${2:?}"
