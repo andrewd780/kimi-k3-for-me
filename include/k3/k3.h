@@ -213,7 +213,7 @@ void k3_matmul(float *y, const float *x, const float *W, int in, int out);
  *   + T*(kv_lora+qk_rope)        kv_a output: compressed latent plus rope slot
  *   + T*q_lora                   q_a output
  *   + 2*T*H*v_head               attention accumulator and gate buffer
- *   + T                          scores
+ *   + H*min(T,16)*T              scores: a row per head per query of a 16-query block
  * floats; the per-position rows let every projection take all T positions in one pass
  * (k3_mmw_batch). Use k3_mla_scratch() rather than recomputing this.
  */

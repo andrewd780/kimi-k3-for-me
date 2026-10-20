@@ -44,6 +44,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -1059,6 +1062,46 @@ static void k3_mla_rebuild(float *kb, const float *lat, const K3MlaW *w, const K
     if (tr) tr->kvb_rows += (unsigned long long)H * (unsigned long long)nr;
 }
 
+/* Query tokens per block of the expanded layout's attention: its score rows are
+ * [H][block][positions], so a whole unchunked prompt never needs a T x T score matrix per
+ * head. Any block size gives the same floats; this one keeps the score block to
+ * 6 KB per cached position at K3 geometry (0.26% of that position's expanded cache). */
+enum { K3_MLA_QBLOCK = 16 };
+
+/* One score chain of the expanded layout, query qt against cached key ks and the shared
+ * rope slot kr: the qk_nope terms in order, then the qk_rope terms, in one double, which
+ * the caller rounds to float and scales. The rope slot is UNROTATED but still scored, and
+ * the SAME 64 values serve every head. Dropping its term is the silent bug. */
+static inline double k3_mla_dot(const float *qt, const float *ks, const float *kr, int qn,
+                                int qr)
+{
+    double d = 0.0;
+    for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)ks[i];
+    for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
+    return d;
+}
+
+/* Four of those chains in flight, one query against four positions: four separate
+ * doubles, each fed only its own position's terms in k3_mla_dot's order, so each is
+ * k3_mla_dot's double bit for bit. The point is four independent add-latency chains,
+ * not any sharing of arithmetic between them. */
+static inline void k3_mla_dot4(double *d, const float *qt, const float *const *ks,
+                               const float *const *kr, int qn, int qr)
+{
+    double d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;
+    for (int i = 0; i < qn; i++) {
+        const double qi = (double)qt[i];
+        d0 += qi * (double)ks[0][i]; d1 += qi * (double)ks[1][i];
+        d2 += qi * (double)ks[2][i]; d3 += qi * (double)ks[3][i];
+    }
+    for (int i = 0; i < qr; i++) {
+        const double qi = (double)qt[qn + i];
+        d0 += qi * (double)kr[0][i]; d1 += qi * (double)kr[1][i];
+        d2 += qi * (double)kr[2][i]; d3 += qi * (double)kr[3][i];
+    }
+    d[0] = d0; d[1] = d1; d[2] = d2; d[3] = d3;
+}
+
 void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                    int T, float *scratch,
                    float *kvc, float *ropec, int cached, int cap, int kv_latent)
@@ -1095,12 +1138,15 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *ql   = ct   + (size_t)T * kvw;           /* [T][q_lora]    */
     float *acc  = ql   + (size_t)T * c->q_lora;     /* [T][H][vh]     */
     float *gbuf = acc  + (size_t)T * H * vh;        /* [T][H][vh] gate */
-    /* Scores are per head in the latent layout, because the s loop moves outside the h
-     * loop there and every head's row must survive until its own softmax runs. */
-    float *sc   = gbuf + (size_t)T * H * vh;        /* [last+1], latent [H][last+1] */
+    /* Scores are per head in both layouts, because the s loop moves outside the h loop
+     * in the latent layout, and the expanded layout runs its heads on separate threads
+     * with a block of query rows each. Every row must survive until its own softmax. */
+    float *sc   = gbuf + (size_t)T * H * vh;        /* latent [H][last+1], expanded [H][qb][last+1] */
     /* split: one [H][last+1] score block per query of the current query block */
     const int split = (lat && T > 1 && k3_mla_split_block > 1) ? (T < k3_mla_split_block ? T : k3_mla_split_block) : 0;
-    const size_t scn = lat ? (size_t)H * (size_t)(last + 1) * (size_t)(split ? split : 1) : (size_t)(last + 1);
+    /* the expanded layout's query block (K3_MLA_QBLOCK) */
+    const int qb = T < K3_MLA_QBLOCK ? T : K3_MLA_QBLOCK;
+    const size_t scn = (size_t)H * (size_t)(last + 1) * (size_t)(lat ? (split ? split : 1) : qb);
     /* One rebuilt position in the latent layout, laid out as a whole kv_b application
      * lays it out. Pass one writes and reads only its key rows, pass two only its value
      * rows, so the other half is never read, whatever it holds. */
@@ -1226,10 +1272,113 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             for (int b = 0; b < nb; b++)
                 memcpy(tr->acc + (size_t)(t0 + b) * H * vh, acc + (size_t)(t0 + b) * H * vh, (size_t)H * vh * sizeof(float));
     }
-    for (int t = 0; !split && t < T; t++) {
+    /* EXPANDED LAYOUT (and the cache-less path, whose keys and values sit in kvs): the
+     * per-(query, head) loop that held one score row, threaded over heads and with
+     * positions outside queries, as benchmarks/mla_variants.h's E+ is. Each head is one
+     * thread's from first score to last value and writes only its own score block and its
+     * own slice of every acc row, so the floats do not depend on the thread count. Per
+     * (query, head) nothing is reordered: each score is the same double chain rounded the
+     * same way (k3_mla_dot, or a lane of k3_mla_dot4); the max, z and quotient run s
+     * ascending over the finished row exactly as before; each o[j] still receives its
+     * terms s ascending. What changes is how often a cached row is read: once per head per
+     * query block instead of once per head per query token, and from every core instead of
+     * one. test_mla_variants holds this loop to E (the loop it replaced, kept in the
+     * benchmark header statement for statement) on scores, normalisers, quotients and
+     * accumulators, on one thread and on all of them. */
+    if (!lat) {
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+        {
+            /* Each thread owns a contiguous range of heads, as schedule(static) would give it,
+             * and walks positions OUTSIDE its heads: one position's rows for those heads are one
+             * contiguous run of the cache, read front to back, rather than one row per position
+             * stride per head. */
+            int nth = 1, tid = 0;
+    #ifdef _OPENMP
+            nth = omp_get_num_threads();
+            tid = omp_get_thread_num();
+    #endif
+            const int hq = H / nth, hr = H % nth;
+            const int hlo = tid * hq + (tid < hr ? tid : hr), hhi = hlo + hq + (tid < hr ? 1 : 0);
+            for (int t0 = 0; t0 < T; t0 += qb) {
+                const int nb = T - t0 < qb ? T - t0 : qb;
+                const int pl = cached + t0 + nb - 1;         /* the last position the block sees */
+                /* Scores, positions in groups of four; query t sees position s iff
+                 * s <= cached + t. A group's missing lanes point at its first position and
+                 * are never stored. */
+                for (int s0 = 0; s0 <= pl; s0 += 4) {
+                    const int g = pl + 1 - s0 < 4 ? pl + 1 - s0 : 4;
+                    for (int h = hlo; h < hhi; h++) {
+                        float *const scb = sc + (size_t)h * qb * (last + 1);
+                        const float *ks[4], *kr[4];
+                        for (int b = 0; b < 4; b++) {
+                            const int s = s0 + (b < g ? b : 0);
+                            ks[b] = K3_KV_AT(s) + (size_t)h * kvd;
+                            kr[b] = K3_ROPE_AT(s);           /* shared slot */
+                        }
+                        for (int t = (s0 - cached > t0 ? s0 - cached : t0); t < t0 + nb; t++) {
+                            const float *qt = q + ((size_t)t * H + h) * qh;
+                            const int vis = cached + t + 1 - s0;   /* >= 1 here */
+                            float *r = scb + (size_t)(t - t0) * (last + 1) + s0;
+                            if (g == 4 && vis >= 4) {
+                                double d[4];
+                                k3_mla_dot4(d, qt, ks, kr, qn, qr);
+                                for (int b = 0; b < 4; b++) r[b] = (float)d[b] * scale;
+                            } else {
+                                const int e = g < vis ? g : vis;
+                                for (int b = 0; b < e; b++)
+                                    r[b] = (float)k3_mla_dot(qt, ks[b], kr[b], qn, qr) * scale;
+                            }
+                        }
+                    }
+                }
+                /* Softmax per (query, head) row, s ascending in every sweep. */
+                for (int h = hlo; h < hhi; h++) {
+                    float *const scb = sc + (size_t)h * qb * (last + 1);
+                    for (int t = t0; t < t0 + nb; t++) {
+                        const int p = cached + t;
+                        float *sh = scb + (size_t)(t - t0) * (last + 1);
+                        const size_t row = (size_t)t * H + h;      /* trace row (t, h) */
+                        if (tr && tr->scores)
+                            memcpy(tr->scores + row * tr->n, sh, (size_t)(p + 1) * sizeof(float));
+                        float m = -INFINITY;
+                        for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
+                        double z = 0.0;
+                        for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
+                        if (tr && tr->z) tr->z[row] = z;
+                        double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
+                        for (int s = 0; s <= p; s++) {
+                            const double pq = sh[s] / z;
+                            if (qrow) qrow[s] = pq;
+                            sh[s] = (float)pq;
+                        }
+                        float *o = acc + row * vh;
+                        for (int j = 0; j < vh; j++) o[j] = 0.0f;
+                    }
+                }
+                /* Values, positions ascending, each value row read once for the block; per
+                 * (query, head, j) the terms still arrive s ascending. */
+                for (int s = 0; s <= pl; s++) {
+                    for (int h = hlo; h < hhi; h++) {
+                        const float *scb = sc + (size_t)h * qb * (last + 1);
+                        const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
+                        for (int t = (s - cached > t0 ? s - cached : t0); t < t0 + nb; t++) {
+                            const float pr = scb[(size_t)(t - t0) * (last + 1) + s];
+                            float *o = acc + ((size_t)t * H + h) * vh;
+                            for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+                        }
+                    }
+                }
+            }
+        }
+        if (tr && tr->acc)
+            memcpy(tr->acc, acc, (size_t)T * H * vh * sizeof(float));
+    }
+    for (int t = 0; lat && !split && t < T; t++) {
         const int p = cached + t;
         float *acct = acc + (size_t)t * H * vh;
-        if (lat) {
+        {   /* the latent layout, one query token at a time (the split above takes blocks) */
             /* Pass one: rebuild each cached position's KEYS once and score it against
              * every head. Only kv_b's key rows (W_uk: rows h*kvd .. h*kvd + qn - 1 of
              * head h) are applied, which is all this pass reads; each lands in kb where
@@ -1282,37 +1431,6 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
                     const float *vs = kb + (size_t)h * kvd + qn;
                     for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
                 }
-            }
-        } else for (int h = 0; h < H; h++) {
-            const float *qt = q + ((size_t)t * H + h) * qh;
-            float m = -INFINITY;
-            for (int s = 0; s <= p; s++) {                 /* causal: s <= p */
-                const float *ks = K3_KV_AT(s) + (size_t)h * kvd;
-                const float *kr = K3_ROPE_AT(s);           /* shared slot */
-                double d = 0.0;
-                for (int i = 0; i < qn; i++) d += (double)qt[i] * (double)ks[i];
-                /* the rope slot is UNROTATED but still scored, and the SAME 64
-                 * values serve every head. Dropping this term is the silent bug. */
-                for (int i = 0; i < qr; i++) d += (double)qt[qn + i] * (double)kr[i];
-                sc[s] = (float)d * scale;
-                if (sc[s] > m) m = sc[s];
-            }
-            const size_t row = (size_t)t * H + h;              /* trace row (t, h) */
-            if (tr && tr->scores)
-                memcpy(tr->scores + row * tr->n, sc, (size_t)(p + 1) * sizeof(float));
-            double z = 0.0;
-            for (int s = 0; s <= p; s++) { sc[s] = expf(sc[s] - m); z += sc[s]; }
-            if (tr && tr->z) tr->z[row] = z;
-            double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
-
-            float *o = acct + (size_t)h * vh;
-            for (int j = 0; j < vh; j++) o[j] = 0.0f;
-            for (int s = 0; s <= p; s++) {
-                const double pq = sc[s] / z;
-                if (qrow) qrow[s] = pq;
-                const float pr = (float)pq;
-                const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
-                for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
             }
         }
 
@@ -1482,9 +1600,10 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
     const int H = c->n_heads, qh = c->qk_nope + c->qk_rope, vh = c->v_head;
     const size_t kvd = (size_t)(c->qk_nope + vh);
     const int lat = (cached_mode && kv_latent) ? 1 : 0;
-    /* The latent layout keeps one score row per head, and one rebuilt position. */
-    size_t scores = (size_t)(cap > T ? cap : T);
-    if (lat) scores *= (size_t)H;
+    /* One score row per head in the latent layout, plus one rebuilt position; one per
+     * head per query of a K3_MLA_QBLOCK block in the expanded layout and without a cache. */
+    size_t scores = (size_t)(cap > T ? cap : T) * (size_t)H;
+    if (!lat) scores *= (size_t)(T < K3_MLA_QBLOCK ? T : K3_MLA_QBLOCK);
     /* --mla-split keeps a score block per query of a query block (k3_mla_cached) */
     if (lat && T > 1 && k3_mla_split_block > 1) {
         k3_mla_split_sized = T < k3_mla_split_block ? T : k3_mla_split_block;
@@ -2402,16 +2521,25 @@ static inline double k3_bf16_row_c(const uint16_t *row, const float *x, int n16)
  * per token. With compute between the loads, the hardware prefetcher may not run far
  * enough ahead of a row's read pointer to keep enough misses in flight, and the loop
  * then reads below the machine's streaming bandwidth. One prefetcht0 per 64-byte line,
- * 1 KB ahead of each row's read pointer (512 B for MXFP4, whose 16-byte groups are
- * consumed faster per byte), asks for the lines early. The distances come from
- * exploratory runs on a shared x86 VM that are not recorded, so no speed figure is
- * claimed for them: bench_kernels prints the bf16 kernel's weight traffic beside the
- * machine's read bandwidth, which is the measurement to take on a quiet machine before
- * tuning them. A prefetch is only a hint -- it reads nothing into a register, cannot
- * fault, and changes no arithmetic -- so the one thing it can change is speed. The NEON
- * loops are left without one. */
+ * 1 KB ahead of each row's read pointer, asks for the lines early. The bf16 distance
+ * comes from exploratory runs on a shared x86 VM that are not recorded, so no speed
+ * figure is claimed for it: bench_kernels prints the bf16 kernel's weight traffic beside
+ * the machine's read bandwidth, which is the measurement to take on a quiet machine
+ * before tuning it. A prefetch is only a hint -- it reads nothing into a register,
+ * cannot fault, and changes no arithmetic -- so the one thing it can change is speed.
+ * The NEON loops are left without one.
+ *
+ * MXFP4 PREFETCHES PAST THE NEXT ROW PAIR. The AVX-512 MXFP4 loop reads two adjacent
+ * rows at once (k3_mxfp4_rows2_avx512); an expert row is 1,536 or 1,792 bytes at K3's
+ * shapes. With a distance under one row, the prefetch past a row's end lands in its
+ * partner, which the loop is already reading, so only the next pair's first row is
+ * asked for: its second row starts cold, and the lead at 512 B is only about 500 cycles
+ * at this loop's rate. At 8 KB the two rows' prefetches together cover the thread's bytes
+ * contiguously, 2.3 to 2.7 pairs ahead at K3's shapes. Measured against 512 B
+ * in-process on the cloud VM of docs/notes/decode-kernels.md (see the pull request for
+ * the protocol and every round). */
 #define K3_PF_BF16  1024
-#define K3_PF_MXFP4 512
+#define K3_PF_MXFP4 8192
 
 /* x widened to double in the EVEN/ODD CHUNK LAYOUT the x86 vector loops read: within the
  * chunk starting at c, xd[c + k] = x[c + 2k] and xd[c + 8 + k] = x[c + 2k + 1] for
