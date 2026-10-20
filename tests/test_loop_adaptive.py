@@ -1,9 +1,9 @@
-"""Adaptive loop depth and the default loop (docs/notes/layer-loop.md), on the tiny K3.
+"""Adaptive loop depth and the --loop preset (docs/notes/layer-loop.md), on the tiny K3.
 
 --loop-exit EPS makes the loop's depth per token: every token runs the span twice, then keeps going while a pass moves
 its span output by EPS or more (relative L2), up to --loop-count passes. Pass p's layers see only the tokens that reached
-pass p. The CLI runs this by default on the AttnRes block holding the middle layer, at most 2 passes, at EPS 0.05;
---no-loop is the released model. Like tests/test_layer_loop.py, these gates ask whether the engine computes the stack it
+pass p. --loop runs it on the AttnRes block holding the middle layer, up to 4 passes, at EPS 0.05; with no loop flag
+(or --no-loop) the CLI runs the released model. Like tests/test_layer_loop.py, these gates ask whether the engine computes the stack it
 claims to, never whether that stack is any good:
   - identities: EPS 0 never stops early, so it is bit-identical to the fixed loop at the same count; an EPS no change can
     reach stops every token after pass 2, so it is bit-identical to the fixed loop at count 2;
@@ -15,8 +15,7 @@ claims to, never whether that stack is any good:
     --expert-pipeline are bit-identical to full recompute;
   - the no-compaction mutant (K3_LOOP_MUTANT_NO_COMPACT, test builds only: stopped tokens leak into later passes' state)
     is caught by the reference;
-  - the default is the middle-block loop at most 2 passes (so the fixed loop at count 2), and --no-loop is the released
-    model;
+  - the default (and --no-loop) is the released model, and --loop is the adaptive middle-block loop;
   - refusals name their reason.
 
 Needs numpy and torch. Build first (`make all mutants`).
@@ -270,24 +269,25 @@ class LoopAdaptiveTests(unittest.TestCase):
         self.assertIn("K3_LOOP_MUTANT_NO_COMPACT", err)
 
     # ---------------------------------------------------------------------- default
-    def test_the_default_is_the_middle_block_at_two_passes(self):
+    def test_the_default_is_the_released_model_and_loop_is_the_adaptive_middle_block(self):
         for mode in ([], ["--incremental"]):
             with self.subTest(mode=mode):
                 default = self.run_cli(mode)
-                explicit = self.run_cli([*mode, *self.loop("6-8", 2, "0.05")])
-                self.assert_same(default, explicit)
-                # pass 2 always runs, so at a cap of 2 the exit never fires: the fixed loop at count 2
-                self.assert_same(default, self.run_cli([*mode, *self.loop("6-8", 2)]))
-                self.assertEqual(default[0]["loop"], {"layers": [6, 8], "count": 2, "executed_layers": LAYERS + 3,
-                                                      "exit": 0.05, "default": True})
-                released = self.run_cli([*mode, "--no-loop"])
-                self.assertIsNone(released[0]["loop"])
-                self.assertIsNone(released[0]["loop_adaptive"])
-                self.assertEqual(released[0]["layers_completed"], LAYERS)
-                self.assert_same(released, self.run_cli([*mode, *self.loop("6-8", 1)]))
-                self.assertNotEqual(default[1].tobytes(), released[1].tobytes(), "the default changes the model")
-        # with --layers, the default is the block holding the middle of the bound stack
-        part = self.run_cli(["--layers", "7"], gen=1)
+                self.assertIsNone(default[0]["loop"])
+                self.assertIsNone(default[0]["loop_adaptive"])
+                self.assertEqual(default[0]["layers_completed"], LAYERS)
+                self.assert_same(default, self.run_cli([*mode, "--no-loop"]))
+                self.assert_same(default, self.run_cli([*mode, *self.loop("6-8", 1)]))
+                looped = self.run_cli([*mode, "--loop"])
+                self.assert_same(looped, self.run_cli([*mode, *self.loop("6-8", 4, "0.05")]))
+                self.assertEqual(looped[0]["loop"], {"layers": [6, 8], "count": 4, "executed_layers": LAYERS + 9,
+                                                     "exit": 0.05, "preset": True})
+                self.assertNotEqual(looped[1].tobytes(), default[1].tobytes(), "--loop changes the model")
+        # --loop-count and --loop-exit change the preset's cap and threshold, not its span
+        self.assert_same(self.run_cli(["--loop", "--loop-count", "3", "--loop-exit", "0"]),
+                         self.run_cli(self.loop("6-8", 3, "0")))
+        # with --layers, --loop is the block holding the middle of the bound stack
+        part = self.run_cli(["--layers", "7", "--loop"], gen=1)
         self.assertEqual(part[0]["loop"]["layers"], [3, 5])
 
     # ---------------------------------------------------------------------- refusals
@@ -299,6 +299,9 @@ class LoopAdaptiveTests(unittest.TestCase):
             (["--loop-layers", "3-5", "--loop-exit", "nan"], "--loop-exit takes"),
             (["--loop-layers", "3-5", "--loop-exit", "inf"], "--loop-exit takes"),
             (["--no-loop", "--loop-layers", "3-5"], "--no-loop"),
+            (["--no-loop", "--loop"], "--no-loop"),
+            (["--loop", "--loop-layers", "3-5"], "--loop loops the AttnRes block holding the middle layer"),
+            (["--loop-count", "3"], "--loop-count needs --loop-layers or --loop"),
         ]
         for args, reason in cases:
             with self.subTest(args=args):
@@ -398,15 +401,15 @@ class LoopAdaptiveTests(unittest.TestCase):
 
     def test_score_prompt_reports_the_adaptive_loop(self):
         out = self.path / "score.json"
-        result = subprocess.run([str(self.binary), str(self.model), "--ids", PROMPT, "--score-prompt",
+        result = subprocess.run([str(self.binary), str(self.model), "--ids", PROMPT, "--score-prompt", "--loop",
                                  "--cache-gb", "0.0001", "--out", str(out)],
                                 text=True, capture_output=True, env=self.env, timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         report = json.loads(out.read_text())
-        self.assertTrue(report["loop"]["default"])
+        self.assertTrue(report["loop"]["preset"])
         passes = report["loop_adaptive"]["passes"]
         self.assertEqual(len(passes), len(PROMPT.split(",")))
-        self.assertTrue(all(p == 2 for p in passes[:-1]), passes)   # the default's cap is 2
+        self.assertTrue(all(2 <= p <= 4 for p in passes[:-1]), passes)
         self.assertEqual(passes[-1], 0, "the last position has no target and is not forwarded")
         self.assertEqual(sum(report["loop_adaptive"]["passes_histogram"]), len(passes))
         self.assertTrue(math.isfinite(report["mean_nll"]))

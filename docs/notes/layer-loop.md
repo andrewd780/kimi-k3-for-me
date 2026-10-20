@@ -1,4 +1,4 @@
-# Layer looping, `--loop-layers` and adaptive depth (ON BY DEFAULT; changes the model)
+# Layer looping, `--loop`, `--loop-layers` and adaptive depth (opt-in; changes the model)
 
 **Status:** plan and design written 2026-10-19 before any code; the status table at the end is updated as work lands.
 
@@ -13,9 +13,10 @@ off-by-default flag that re-runs a span of K3's existing layers per token, with 
 - **It is not** a looped model in the trained sense. Ouro and Huginn are trained so that every loop is meaningful; K3 was
   trained as one 93-layer stack. **The expected effect on quality is a loss**, and the size of that loss is unmeasured. This
   repository has no full checkpoint to measure it on.
-- **It is the default** since Andrew's word of 2026-10-19 (below): the middle block loops adaptively unless a run passes
-  `--no-loop`. With `--no-loop` every code path is byte-identical to the released model; the existing gates prove that, and
-  a `--loop-count 1` gate proves the flag's own identity path. (Until that word it was off by default.)
+- **It is opt-in:** `--loop` runs the middle block adaptively, and with no loop flag every code path is byte-identical to
+  the released model; the existing gates prove that, and a `--loop-count 1` gate proves the flag's own identity path. It
+  was the default from Andrew's word of 2026-10-19 until 2026-10-20, when he left the call to Claude and it went back to
+  opt-in (below).
 - **It is not faster.** Each extra pass over a span costs that span's trunk and expert bytes again.
 
 ## Semantics
@@ -71,15 +72,23 @@ token after pass 2, the fixed loop at count 2. Batched prompts work: a pass gath
 scatters them back. Full recompute, incremental decode and every supported mode make the same decisions on the same
 floats, so they stay bit-identical to each other.
 
-**The default.** With no loop flag the CLI runs `--loop-layers` on the AttnRes block holding layer `N/2` of the bound
-stack (36-47 on K3; 6-8 on the 13-layer tiny model), `--loop-count 2 --loop-exit 0.05`, which is `--loop-count 2` bit
-for bit. `--no-loop` is the released
-model. The default refuses the modes the loop's gates do not yet cover and says to pass `--no-loop`. Every gate that
-holds the released model to its reference now passes `--no-loop`; `tests/test_loop_adaptive.py` gates the default.
+**`--loop`, and the default.** `--loop` runs `--loop-layers` on the AttnRes block holding layer `N/2` of the bound
+stack (36-47 on K3; 6-8 on the 13-layer tiny model) at `--loop-count 4 --loop-exit 0.05`, bit for bit; `--loop-count` and
+`--loop-exit` change its cap and threshold. With no loop flag the CLI runs the released model; `--no-loop` says so
+explicitly. `tests/test_loop_adaptive.py` gates both.
 
-**Cost.** The default's 2 passes of a 12-layer block: 13% more layers per token (2 to 4 passes at `--loop-count 4`: 13% to
-39%), with their trunk and expert bytes. No
-quality measurement exists; K3 was not trained to repeat layers.
+**Why it is opt-in (2026-10-20).** The loop was the default for a day, first at up to 4 passes, then at Andrew's "On, R
+max 2". At a cap of 2 no token can exit early (the exit compares two passes), so the default was a fixed one-extra-pass
+loop. Andrew then wrote *"Lowkey I’m kinda not literate in ai research so whatever you think is good do it"*, and Claude
+made it opt-in, for three reasons:
+- K3 was not trained to repeat layers;
+- no quality measurement exists, and j-research's toy test of training-free looping (`findings/106`) lost accuracy;
+- it costs layers per token.
+
+With the loop off by default, the speed work of the same week (j-research `findings/114`) is what a default run gets.
+
+**Cost.** `--loop`'s 2 to 4 passes of a 12-layer block: 13% to 39% more layers per token, with their trunk and
+expert bytes. No quality measurement exists; K3 was not trained to repeat layers.
 
 ## Modes
 
@@ -122,7 +131,7 @@ it says nothing about whether the looped stack is any good.
 | engine (`src/cli/k3_run.c`, `k3_attn_res_stride()` in `include/k3/k3.h`) | built |
 | reference (`tools/k3_ref.py` `loop_order`, `tools/make_tiny_checkpoint.py --loop`) | built |
 | gates (`tests/test_layer_loop.py`, 7 tests; `make test` loop-layers contract; CI step in `offline-storage.yml`) | passing |
-| adaptive depth, the default loop, every mode (`--loop-exit`, `--no-loop`, `k3_decoder_layer_inc_logv`, `forward_adaptive`, state version 2, per-executed-position `--spec` logs) | built; `tests/test_loop_adaptive.py`, 15 tests, passing, and under ASan + UBSan |
+| adaptive depth, the `--loop` preset (the default for a day, then opt-in), every mode (`--loop-exit`, `--no-loop`, `k3_decoder_layer_inc_logv`, `forward_adaptive`, state version 2, per-executed-position `--spec` logs) | built; `tests/test_loop_adaptive.py`, 15 tests, passing, and under ASan + UBSan |
 
 Adaptive depth and the default, measured on the tiny model, 2026-10-20, Linux x86-64, gcc 13.3:
 
@@ -138,9 +147,9 @@ Adaptive depth and the default, measured on the tiny model, 2026-10-20, Linux x8
   recompute; `--spec 3` and `--draft-trunk` are serial decode bit for bit, with drafts proposed and accepted; a state
   saved after `--spec` is the serial state byte for byte and resumes as one uninterrupted run; a state is refused under
   another loop; `--tf-check` counts the torch reference's agreement; the cache trace lists layers in executed order.
-- **Default:** no flag is `--loop-layers 6-8 --loop-count 2 --loop-exit 0.05` and `--loop-count 2` on the tiny model, bit
-  for bit; `--no-loop`
-  is `--loop-count 1`; the offline CLI, kv_b cache, MLA split, quality and expert-profile suites pass with `--no-loop`.
+- **Default and `--loop`:** no flag and `--no-loop` are `--loop-count 1`, bit for bit; `--loop` is `--loop-layers 6-8
+  --loop-count 4 --loop-exit 0.05` on the tiny model, bit for bit; putting the loop back on by default fails 2 tests; the
+  offline CLI, kv_b cache, MLA split, quality and expert-profile suites pass.
 - **Plants, each reverted:** stopped tokens run in later passes (`K3_LOOP_MUTANT_NO_COMPACT`): caught by the reference;
   every post-span token reading token 0's block count: 12 parity failures; a sweep committing every position to every
   pass: `--spec` and state gates; a state that drops each pass's cached count: state gates; a stale change reference:
