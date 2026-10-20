@@ -175,7 +175,7 @@ static void json_string(FILE *f, const char *s)
  * would produce fluent, wrong output with nothing to indicate it, which is the one
  * failure mode this engine refuses to have. */
 #define K3_STATE_MAGIC "K3ST"
-#define K3_STATE_VER   1
+#define K3_STATE_VER   2      /* 2 adds the layer-loop record; 1 is read as "no loop" */
 
 typedef struct {
     char    magic[4];
@@ -185,6 +185,16 @@ typedef struct {
     int64_t kper;          /* KDA+conv floats per layer */
     int64_t kvpp, ropepp;  /* KV / rope floats per position, per MLA layer */
 } K3StateHdr;
+
+/* Version 2: the layer loop the state was computed under, right after the header. A loop
+ * gives every executed position its own KDA slot and MLA rows (nv slots, not n_bound),
+ * and adaptive depth carries how many positions each pass has cached and how many passes
+ * each position ran; restoring under another loop would read the slots at the wrong
+ * meaning. count == 0 is no loop (and what a version-1 file holds). */
+typedef struct {
+    int32_t a, b, count, nv;
+    double  eps;             /* < 0: fixed loop or none */
+} K3StateLoop;
 
 static void k3_state_fp(const K3Cfg *c, int32_t *fp)
 {
@@ -212,18 +222,22 @@ static void k3_state_fp(const K3Cfg *c, int32_t *fp)
  * the model itself would have emitted, so the output stream is identical to serial
  * decode by construction, and the A/B gate checks it. */
 /* Reads only the header, so the caller can size buffers before committing to a load. */
-static int k3_state_peek(const char *path, K3StateHdr *hd)
+static int k3_state_peek(const char *path, K3StateHdr *hd, K3StateLoop *lp)
 {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
     const size_t got = fread(hd, 1, sizeof *hd, f);
+    size_t gotl = sizeof *lp;
+    memset(lp, 0, sizeof *lp);
+    lp->a = lp->b = -1; lp->nv = got == sizeof *hd ? hd->n_bound : 0; lp->eps = -1.0;
+    if (got == sizeof *hd && hd->version == 2) gotl = fread(lp, 1, sizeof *lp, f);
     fclose(f);
-    if (got != sizeof *hd || memcmp(hd->magic, K3_STATE_MAGIC, 4) != 0) {
+    if (got != sizeof *hd || memcmp(hd->magic, K3_STATE_MAGIC, 4) != 0 || gotl != sizeof *lp) {
         fprintf(stderr, "%s is not a k3 state file\n", path);
         return -1;
     }
-    if (hd->version != K3_STATE_VER) {
-        fprintf(stderr, "%s is state version %d, this build writes %d\n",
+    if (hd->version != 1 && hd->version != K3_STATE_VER) {
+        fprintf(stderr, "%s is state version %d, this build reads 1 and %d\n",
                 path, hd->version, K3_STATE_VER);
         return -1;
     }
@@ -231,10 +245,26 @@ static int k3_state_peek(const char *path, K3StateHdr *hd)
 }
 
 static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
+                         const K3StateLoop *lp, const K3StateLoop *run,
                          int *seq, float *ks, float *kvc, float *ropec,
                          int n_bound, int n_mla, int kv_cap,
-                         int64_t kvpp, int64_t ropepp)
+                         int64_t kvpp, int64_t ropepp, int *pcached, int *passes)
 {
+    if (lp->count != run->count || (run->count &&
+        (lp->a != run->a || lp->b != run->b || lp->nv != run->nv ||
+         memcmp(&lp->eps, &run->eps, sizeof lp->eps) != 0))) {
+        char sl[96] = "no layer loop (--no-loop)", rl[96] = "no layer loop (--no-loop)";
+        if (lp->count) snprintf(sl, sizeof sl, "--loop-layers %d-%d --loop-count %d%s%.9g",
+                                lp->a, lp->b, lp->count, lp->eps >= 0 ? " --loop-exit " : "",
+                                lp->eps >= 0 ? lp->eps : 0.0);
+        if (run->count) snprintf(rl, sizeof rl, "--loop-layers %d-%d --loop-count %d%s%.9g",
+                                 run->a, run->b, run->count, run->eps >= 0 ? " --loop-exit " : "",
+                                 run->eps >= 0 ? run->eps : 0.0);
+        fprintf(stderr, "REFUSING: %s was computed under %s, this run uses %s.\n"
+                        "  Its per-layer state would be read at the wrong meaning; run with the "
+                        "loop it was saved under.\n", path, sl, rl);
+        return -1;
+    }
     int32_t fp[12];
     k3_state_fp(c, fp);
     if (memcmp(fp, hd->fp, sizeof fp) != 0) {
@@ -268,12 +298,25 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
     }
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
-    if (fseek(f, (long)sizeof *hd, SEEK_SET) != 0) { fclose(f); return -1; }
+    const long off = (long)sizeof *hd + (hd->version >= 2 ? (long)sizeof *lp : 0L);
+    if (fseek(f, off, SEEK_SET) != 0) { fclose(f); return -1; }
 
     int rc = 0;
     if (fread(seq, sizeof(int), (size_t)hd->nseq, f) != (size_t)hd->nseq) rc = -1;
-    if (!rc && fread(ks, sizeof(float), (size_t)hd->kper * n_bound, f)
-               != (size_t)hd->kper * (size_t)n_bound) rc = -1;
+    if (!rc && lp->count) {
+        /* a fixed loop's run keeps neither array; the file's are zeros then */
+        int scratch_pc[9];
+        const size_t np = (size_t)lp->count + 1;
+        if (fread(pcached ? pcached : scratch_pc, sizeof(int), np, f) != np) rc = -1;
+        for (int i = 0; !rc && i < hd->nseq; i++) {
+            int v;
+            if (fread(&v, sizeof v, 1, f) != 1) rc = -1;
+            else if (passes) passes[i] = v;
+        }
+    }
+    const size_t slots = (size_t)(lp->count ? lp->nv : n_bound);
+    if (!rc && fread(ks, sizeof(float), (size_t)hd->kper * slots, f)
+               != (size_t)hd->kper * slots) rc = -1;
     /* Position-major inside each layer slice, so a differently-sized destination cache
      * is written slice by slice rather than as one block. */
     for (int mi = 0; !rc && mi < n_mla; mi++) {
@@ -294,7 +337,8 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
 static int k3_state_save(const char *path, const K3Cfg *c, const int *seq, int nseq,
                          const float *ks, const float *kvc, const float *ropec,
                          int n_bound, int n_mla, int kv_cap, int cached,
-                         int64_t kper, int64_t kvpp, int64_t ropepp)
+                         int64_t kper, int64_t kvpp, int64_t ropepp,
+                         const K3StateLoop *lp, const int *pcached, const int *passes)
 {
     FILE *f = fopen(path, "wb");
     if (!f) { perror(path); return -1; }
@@ -308,9 +352,21 @@ static int k3_state_save(const char *path, const K3Cfg *c, const int *seq, int n
 
     int rc = 0;
     if (fwrite(&hd, sizeof hd, 1, f) != 1) rc = -1;
+    if (!rc && fwrite(lp, sizeof *lp, 1, f) != 1) rc = -1;
     if (!rc && fwrite(seq, sizeof(int), (size_t)nseq, f) != (size_t)nseq) rc = -1;
-    if (!rc && fwrite(ks, sizeof(float), (size_t)kper * n_bound, f)
-               != (size_t)kper * (size_t)n_bound) rc = -1;
+    if (!rc && lp->count) {
+        /* a fixed loop carries zeros here: its passes all cache every position */
+        static const int zero[9] = {0};
+        const int *pc = pcached ? pcached : zero;
+        if (fwrite(pc, sizeof(int), (size_t)lp->count + 1, f) != (size_t)lp->count + 1) rc = -1;
+        for (int i = 0; !rc && i < nseq; i++) {
+            const int v = passes ? passes[i] : 0;
+            if (fwrite(&v, sizeof v, 1, f) != 1) rc = -1;
+        }
+    }
+    const size_t slots = (size_t)(lp->count ? lp->nv : n_bound);
+    if (!rc && fwrite(ks, sizeof(float), (size_t)kper * slots, f)
+               != (size_t)kper * slots) rc = -1;
     for (int mi = 0; !rc && mi < n_mla; mi++) {
         const float *src = kvc + (size_t)mi * kv_cap * kvpp;
         const size_t n = (size_t)cached * kvpp;
@@ -462,14 +518,21 @@ static void usage(FILE *f)
 "                        and only the accepted positions are committed\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
-"experimental, CHANGES THE MODEL (docs/notes/layer-loop.md):\n"
-"  --loop-layers A-B     run layers A..B (zero-based, whole AttnRes blocks) more than\n"
-"                        once per token, as if the span appeared again in the stack.\n"
-"                        Each pass keeps its own recurrent state and KV rows; weights\n"
-"                        are shared. K3 was not trained for this: expect worse output,\n"
-"                        and more time per token. Off by default\n"
-"  --loop-count R        total passes over the --loop-layers span, 1 to 8 (default 2);\n"
-"                        1 is bit-identical to running without --loop-layers\n"
+"layer loop, CHANGES THE MODEL (docs/notes/layer-loop.md):\n"
+"  DEFAULT               the AttnRes block holding the middle layer (36-47 on K3) runs\n"
+"                        twice per token (at most 2 passes, exit 0.05; the exit needs\n"
+"                        two passes to compare, so every token runs both). K3 was not\n"
+"                        trained for this; its effect on quality is unmeasured\n"
+"  --no-loop             the released model: every layer once, no loop\n"
+"  --loop-layers A-B     loop layers A..B instead (zero-based, whole AttnRes blocks), as\n"
+"                        if the span appeared again in the stack. Each pass keeps its own\n"
+"                        recurrent state and KV rows; weights are shared\n"
+"  --loop-count R        passes over the --loop-layers span, 1 to 8 (default 2); with\n"
+"                        --loop-exit, the most a token runs. 1 is the released model\n"
+"  --loop-exit EPS       adaptive depth: a token stops after pass p >= 2 once the span's\n"
+"                        output moved by less than EPS (relative L2) from pass p - 1.\n"
+"                        Pass p's layers see only the tokens that reached it. 0 never\n"
+"                        stops early (the fixed loop)\n"
 "\n"
 "diagnostics:\n"
 "  --score-prompt       teacher-force the prompt; write per-token NLL to --out.\n"
@@ -629,6 +692,23 @@ typedef struct {
     int          n_virt;
     int         *vmap;
     int         *vslot;
+    /* --loop-exit (adaptive depth, docs/notes/layer-loop.md): loop_eps < 0 is the fixed
+     * loop. Otherwise passes 2..loop_rmax of the span loop_a..loop_b run only on the
+     * tokens still active; a token stops after pass p >= 2 once its span output moved by
+     * less than loop_eps (relative L2) from pass p - 1, or at loop_rmax. Pass p's layers
+     * see exactly the tokens that reached pass p, in order, so their KDA state advances
+     * only on those and their MLA cache holds only those rows: loop_pcached[p] of them
+     * (incremental decode; pass 1 is the stack's own and uses `cached`). */
+    int          loop_a, loop_b, loop_span, loop_rmax;
+    double       loop_eps;
+    int         *loop_pcached;   /* [loop_rmax + 1] */
+    int         *loop_act, *loop_idx, *loop_nbt;   /* [Tmax] per token of a forward */
+    float       *loop_hprev;     /* [Tmax][E] each token's span output after its last pass */
+    float       *loop_hc, *loop_brc;   /* [Tmax][E], [Tmax][maxb][E]: a pass's active rows */
+    int         *loop_passes;    /* [Tmax] passes each absolute position ran */
+    int         *loop_sweep_pcached;   /* loop_pcached when a tentative sweep began */
+    int          loop_sweep_base;      /* the absolute position a tentative sweep began at */
+    double      *loop_d;         /* [Tmax][loop_rmax + 1] the change after each pass */
     int          ultra;
     int          stream_lm_head;
     K3Trunk     *trunk;      /* non-NULL when the trunk is streamed rather than resident */
@@ -653,7 +733,7 @@ typedef struct {
      * on, until spec_commit applies the ones kept. */
     float       *kda_log;
     float       *kda_work;     /* one KDA layer's state; every layer, both models, share it */
-    int         *kda_slot;     /* [n_layers] -> dense KDA index, or -1 */
+    int         *kda_slot;     /* [executed position] -> dense KDA index, or -1 */
     int          n_kda, log_cap, log_row0;
     size_t       log_floats;   /* floats of log rows per KDA layer */
     /* --dump-all-logits: the logit vector behind every position of a verify sweep. */
@@ -709,9 +789,64 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     }
     w->layers_completed = 0;
     int nb = 0;
+    /* --loop-exit: executed positions rep0 .. repN-1 are passes 2..loop_rmax of the span.
+     * A pass runs on its active tokens only; when some token has stopped, their rows are
+     * gathered in order into loop_hc / loop_brc and scattered back after the pass. Every
+     * active token has run the same passes, so the pass shares one block count (nbp);
+     * after the span the counts differ and the layers take one per token (loop_nbt). */
+    const int adapt = w->vmap && w->loop_eps >= 0.0;
+    const int rep0 = adapt ? w->loop_b + 1 : nv;
+    const int repN = adapt ? rep0 + (w->loop_rmax - 1) * w->loop_span : nv;
+    const int pos0 = w->kvc ? w->cached : 0;      /* absolute position of row 0 */
+    int Tp = T, nbp = 0, pass = 0;
+    /* GATE MUTANT (test builds only): K3_LOOP_MUTANT_NO_COMPACT runs every pass on EVERY
+     * token, stopped ones included, keeping only the active tokens' results. Outputs of
+     * stopped tokens are untouched, but the pass's KDA state and MLA rows absorb tokens
+     * that never reached it, which the reference must see. */
+    int no_compact = 0;
+#ifdef K3_TEST_MUTANTS
+    no_compact = getenv("K3_LOOP_MUTANT_NO_COMPACT") != NULL;
+#endif
+    float *hp = h, *bp = br;
     for (int v = 0; v < nv; v++) {
         const int L = w->vmap ? w->vmap[v] : v;    /* whose weights */
         const int sv = w->vslot ? w->vslot[v] : v; /* whose state and cache rows */
+        const int in_rep = v >= rep0 && v < repN;
+        if (in_rep && (v - rep0) % w->loop_span == 0) {      /* a pass begins */
+            pass = 2 + (v - rep0) / w->loop_span;
+            Tp = 0;
+            for (int t = 0; t < T; t++) if (w->loop_act[t]) w->loop_idx[Tp++] = t;
+            if (Tp == 0) {                                   /* every token has stopped */
+                v += w->loop_span - 1;
+                w->layers_completed = v + 1;
+                continue;
+            }
+            nbp = w->loop_nbt[w->loop_idx[0]];
+            if (no_compact && Tp < T) {
+                Tp = 0;
+                for (int t = 0; t < T; t++) w->loop_idx[Tp++] = t;
+                Tp = -T;     /* below: gather all T, as if compacting */
+            }
+            if (Tp < 0) {
+                Tp = T;
+                for (int i = 0; i < Tp; i++) {
+                    memcpy(w->loop_hc + (size_t)i * E, h + (size_t)i * E, (size_t)E * sizeof(float));
+                    memcpy(w->loop_brc + (size_t)i * maxb * E, br + (size_t)i * maxb * E,
+                           (size_t)maxb * E * sizeof(float));
+                }
+                hp = w->loop_hc; bp = w->loop_brc;
+            } else if (Tp < T) {
+                for (int i = 0; i < Tp; i++) {
+                    const int t = w->loop_idx[i];
+                    memcpy(w->loop_hc + (size_t)i * E, h + (size_t)t * E, (size_t)E * sizeof(float));
+                    memcpy(w->loop_brc + (size_t)i * maxb * E, br + (size_t)t * maxb * E,
+                           (size_t)maxb * E * sizeof(float));
+                }
+                hp = w->loop_hc; bp = w->loop_brc;
+            } else {
+                hp = h; bp = br;
+            }
+        }
         /* Streaming: bring this layer in, and hint the next one so its read overlaps
          * this layer's arithmetic. The order is fixed every token (0..92, or the
          * --loop-layers order), so the hint is never wrong. */
@@ -741,7 +876,36 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         if (w->ultra && !w->kvc)
             memset(layer_state, 0, kper * sizeof(float));
         const long drops_before = k3_expert_drops;
-        if (w->kvc && w->mla_slot[v] >= 0) {
+        /* In a tentative sweep a KDA layer leaves its state alone and records its
+         * recurrence inputs instead; see the speculative step in main(). The log belongs
+         * to the executed position, so each pass of a looped KDA layer has its own. */
+        K3KdaLog rlog, *rl = NULL;
+        if (w->kda_log && w->log_row0 >= 0 && w->kda_slot[v] >= 0) {
+            rlog.rows = w->kda_log + w->log_floats * (size_t)w->kda_slot[v];
+            rlog.work = w->kda_work;
+            rlog.cap  = w->log_cap;
+            rlog.row0 = w->log_row0;
+            rl = &rlog;
+        }
+        if (adapt && (in_rep || v >= repN)) {
+            /* a pass of the span (its active rows, one shared count), or a layer after
+             * it (every row, a count per token); MLA in a pass reads and extends that
+             * pass's own cache rows */
+            const int mi = w->kvc ? w->mla_slot[v] : -1;
+            const size_t kvper = (size_t)w->kv_cap * kv_floats_per_pos(c, w->kv_latent);
+            const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
+            float *kv = mi >= 0 ? w->kvc + kvper * (size_t)mi : NULL;
+            float *rp = mi >= 0 ? w->ropec + rpper * (size_t)mi : NULL;
+            const int cch = in_rep ? w->loop_pcached[pass] : w->cached;
+            if (in_rep)
+                k3_decoder_layer_inc_log(hp, bp, &nbp, &w->lay[L].lay, c, L, Tp, layer_state,
+                                         scratch, kv, rp, kv ? cch : 0, w->kv_cap, w->kv_latent,
+                                         rl);
+            else
+                k3_decoder_layer_inc_logv(h, br, w->loop_nbt, &w->lay[L].lay, c, L, T,
+                                          layer_state, scratch, kv, rp, kv ? cch : 0,
+                                          w->kv_cap, w->kv_latent, rl);
+        } else if (w->kvc && w->mla_slot[v] >= 0) {
             const size_t kvper = (size_t)w->kv_cap * kv_floats_per_pos(c, w->kv_latent);
             const size_t rpper = (size_t)w->kv_cap * c->qk_rope;
             const int mi = w->mla_slot[v];
@@ -751,16 +915,6 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
                                  w->ropec + rpper * (size_t)mi,
                                  w->cached, w->kv_cap, w->kv_latent);
         } else {
-            /* In a tentative sweep a KDA layer leaves its state alone and records its
-             * recurrence inputs instead; see the speculative step in main(). */
-            K3KdaLog rlog, *rl = NULL;
-            if (w->kda_log && w->log_row0 >= 0 && w->kda_slot[L] >= 0) {
-                rlog.rows = w->kda_log + w->log_floats * (size_t)w->kda_slot[L];
-                rlog.work = w->kda_work;
-                rlog.cap  = w->log_cap;
-                rlog.row0 = w->log_row0;
-                rl = &rlog;
-            }
             k3_decoder_layer_inc_log(h, br, &nb, &w->lay[L].lay, c, L, T,
                                      layer_state, scratch,
                                      NULL, NULL, 0, 0, 0, rl);
@@ -774,6 +928,44 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
                             "MoE output\n", L);
             return -1;
         }
+        if (adapt && v == rep0 - 1) {
+            /* pass 1 is done for every token: its span output is the reference for pass 2 */
+            memcpy(w->loop_hprev, h, (size_t)T * E * sizeof(float));
+            for (int t = 0; t < T; t++) {
+                w->loop_act[t] = w->loop_rmax > 1;
+                w->loop_nbt[t] = nb;
+                w->loop_passes[pos0 + t] = 1;
+            }
+        }
+        if (in_rep && (v - rep0) % w->loop_span == w->loop_span - 1) {   /* a pass ends */
+            const int moved = hp != h;                       /* rows were gathered */
+            for (int i = 0; i < Tp; i++) {
+                const int t = moved ? w->loop_idx[i] : i;
+                if (!w->loop_act[t]) continue;               /* only the mutant runs these */
+                const float *hn = hp + (size_t)i * E;
+                float *ho = w->loop_hprev + (size_t)t * E;
+                /* relative L2 change, one double sum each over the row in index order */
+                double dd = 0.0, oo = 0.0;
+                for (int j = 0; j < E; j++) {
+                    const double df = (double)hn[j] - (double)ho[j];
+                    dd += df * df;
+                    oo += (double)ho[j] * (double)ho[j];
+                }
+                const double d = oo > 0.0 ? sqrt(dd / oo) : (dd > 0.0 ? INFINITY : 0.0);
+                memcpy(ho, hn, (size_t)E * sizeof(float));
+                w->loop_d[(size_t)(pos0 + t) * (w->loop_rmax + 1) + pass] = d;
+                w->loop_passes[pos0 + t] = pass;
+                if (d < w->loop_eps || pass == w->loop_rmax) w->loop_act[t] = 0;
+                w->loop_nbt[t] = nbp;
+                if (moved) {
+                    memcpy(h + (size_t)t * E, hn, (size_t)E * sizeof(float));
+                    memcpy(br + (size_t)t * maxb * E, bp + (size_t)i * maxb * E,
+                           (size_t)maxb * E * sizeof(float));
+                }
+            }
+            if (w->kvc) w->loop_pcached[pass] += Tp;
+            hp = h; bp = br;
+        }
         w->layers_completed = v + 1;
     }
 
@@ -784,11 +976,12 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
         float *src  = fold + E;
         for (int i = 0; i < E; i++) fold[i] = w->mb.out_res_norm[i] * w->mb.out_res_proj[i];
         for (int t = 0; t < T; t++) {
-            for (int b = 0; b < nb; b++)
+            const int nbt = adapt ? w->loop_nbt[t] : nb;
+            for (int b = 0; b < nbt; b++)
                 memcpy(src + (size_t)b * E, br + ((size_t)t * maxb + b) * E,
                        (size_t)E * sizeof(float));
-            memcpy(src + (size_t)nb * E, h + (size_t)t * E, (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, fold, nb + 1, E, c->rms_eps);
+            memcpy(src + (size_t)nbt * E, h + (size_t)t * E, (size_t)E * sizeof(float));
+            k3_attn_res(h + (size_t)t * E, src, fold, nbt + 1, E, c->rms_eps);
         }
     }
 
@@ -843,22 +1036,65 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     return 0;
 }
 
+/* The adaptive loop's record for the report: per absolute position, the passes it ran
+ * (0 = never forwarded) and the relative change after each pass from the second on.
+ * Writes null when the loop is fixed or off. */
+static void write_loop_adaptive(FILE *f, const Weights *w, int npos)
+{
+    if (w->loop_eps < 0.0 || !w->loop_passes) { fputs("null", f); return; }
+    long hist[9] = {0};
+    for (int i = 0; i < npos; i++)
+        if (w->loop_passes[i] >= 0 && w->loop_passes[i] <= 8) hist[w->loop_passes[i]]++;
+    fprintf(f, "{\"eps\":%.17g,\"max_passes\":%d,\"passes_histogram\":[", w->loop_eps,
+            w->loop_rmax);
+    for (int r = 0; r <= w->loop_rmax; r++) fprintf(f, "%s%ld", r ? "," : "", hist[r]);
+    fputs("],\"passes\":[", f);
+    for (int i = 0; i < npos; i++) fprintf(f, "%s%d", i ? "," : "", w->loop_passes[i]);
+    fputs("],\"change\":[", f);
+    for (int i = 0; i < npos; i++) {
+        fputs(i ? ",[" : "[", f);
+        for (int r = 2; r <= w->loop_passes[i]; r++)
+            fprintf(f, "%s%.17g", r > 2 ? "," : "",
+                    w->loop_d[(size_t)i * (w->loop_rmax + 1) + r]);
+        fputc(']', f);
+    }
+    fputs("]}", f);
+}
+
 /* Commit the first n positions of a tentative sweep (or of a run of tentative draft
  * calls) to every KDA layer's carried state. No weights are read and no forward runs: see
  * k3_kda_advance for why the result is the state serial decode holds after those
  * positions, to the bit. MLA layers need nothing, because their KV rows are positional
  * and the caller sets `cached`. */
-static void spec_commit(const Weights *w, const K3Cfg *c, float *kstate, int n)
+static void spec_commit(Weights *w, const K3Cfg *c, float *kstate, int n)
 {
     const size_t kper = k3_kda_state_floats(c);
-    for (int L = 0; L < w->n_bound; L++) {
-        if (w->kda_slot[L] < 0) continue;
+    /* Adaptive depth (--loop-exit): pass p's layers logged only the sweep positions that
+     * reached pass p, compacted in order, so the first n positions own the first n_p rows
+     * of those logs, n_p = how many of them reached pass p. The MLA rows of pass p are
+     * cut back the same way (loop_pcached was advanced by the whole sweep). */
+    int np_[9] = {0};
+    const int adapt = w->vmap && w->loop_eps >= 0.0;
+    const int rep0 = adapt ? w->loop_b + 1 : 0;
+    if (adapt) {
+        const int base = w->loop_sweep_base;
+        for (int p = 2; p <= w->loop_rmax; p++) {
+            for (int t = 0; t < n; t++) np_[p] += w->loop_passes[base + t] >= p;
+            w->loop_pcached[p] = w->loop_sweep_pcached[p] + np_[p];
+        }
+    }
+    const int nv = w->vmap ? w->n_virt : w->n_bound;
+    for (int v = 0; v < nv; v++) {
+        if (w->kda_slot[v] < 0) continue;
+        const int in_rep = adapt && v >= rep0 && v < rep0 + (w->loop_rmax - 1) * w->loop_span;
         K3KdaLog rl;
-        rl.rows = w->kda_log + w->log_floats * (size_t)w->kda_slot[L];
+        rl.rows = w->kda_log + w->log_floats * (size_t)w->kda_slot[v];
         rl.work = NULL;
         rl.cap  = w->log_cap;
         rl.row0 = 0;
-        k3_kda_advance(kstate + kper * (size_t)L, &rl, n, c);
+        const int sv = w->vslot ? w->vslot[v] : v;
+        k3_kda_advance(kstate + kper * (size_t)sv, &rl,
+                       in_rep ? np_[2 + (v - rep0) / w->loop_span] : n, c);
     }
 }
 
@@ -885,10 +1121,13 @@ static int emit_keep(const int *emit, int emitn, int nout, int gen, int T, int T
  * -1 when out of memory. */
 static int spec_log_alloc(Weights *w, const K3Cfg *c, int nl, int cap, float *work)
 {
-    w->kda_slot = (int *)malloc((size_t)nl * sizeof(int));
+    /* one log per EXECUTED KDA position: each pass of a looped layer has its own */
+    const int nv = w->vmap ? w->n_virt : nl;
+    w->kda_slot = (int *)malloc((size_t)nv * sizeof(int));
     if (!w->kda_slot) return -1;
     w->n_kda = 0;
-    for (int L = 0; L < nl; L++) w->kda_slot[L] = k3_is_mla(c, L) ? -1 : w->n_kda++;
+    for (int v = 0; v < nv; v++)
+        w->kda_slot[v] = k3_is_mla(c, w->vmap ? w->vmap[v] : v) ? -1 : w->n_kda++;
     w->log_cap = cap;
     w->log_row0 = -1;
     w->log_floats = (size_t)cap * k3_kda_log_row(c);
@@ -917,6 +1156,10 @@ int main(int argc, char **argv)
     }
     if (getenv("K3_LOOP_MUTANT_SHARED_STATE")) {
         fprintf(stderr, "K3_LOOP_MUTANT_SHARED_STATE is a gate mutant for test builds (make mutants); this build refuses it\n");
+        return 2;
+    }
+    if (getenv("K3_LOOP_MUTANT_NO_COMPACT")) {
+        fprintf(stderr, "K3_LOOP_MUTANT_NO_COMPACT is a gate mutant for test builds (make mutants); this build refuses it\n");
         return 2;
     }
 #endif
@@ -959,6 +1202,8 @@ int main(int argc, char **argv)
     int incremental = 0, ultra = 0, stream_lm_head = 0, expert_pipeline = 0;
     int kv_latent = 0, trunk_rows = 0, kvb_mode = K3_KVB_OFF;
     int loop_a = -1, loop_b = -1, loop_count = 0;   /* --loop-layers A-B, --loop-count R */
+    double loop_eps = -1.0;                         /* --loop-exit EPS; < 0 is the fixed loop */
+    int no_loop = 0, loop_default = 0;              /* --no-loop; the default loop in force */
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -1061,6 +1306,18 @@ int main(int argc, char **argv)
             }
             loop_count = atoi(s);
         }
+        else if (!strcmp(argv[i], "--loop-exit") && i + 1 < argc) {
+            const char *s = argv[++i];
+            char *end = NULL;
+            const double e = strtod(s, &end);
+            if (end == s || *end != '\0' || !(e >= 0.0) || !isfinite(e)) {
+                fprintf(stderr, "--loop-exit takes a relative change >= 0 (0 never exits "
+                                "early), got '%s'\n", s);
+                return 2;
+            }
+            loop_eps = e;
+        }
+        else if (!strcmp(argv[i], "--no-loop")) no_loop = 1;
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
@@ -1149,18 +1406,31 @@ int main(int argc, char **argv)
         fprintf(stderr, "--loop-count needs --loop-layers\n");
         return 2;
     }
-    if (loop_a >= 0) {
+    if (loop_eps >= 0.0 && loop_a < 0) {
+        fprintf(stderr, "--loop-exit needs --loop-layers\n");
+        return 2;
+    }
+    if (no_loop && loop_a >= 0) {
+        fprintf(stderr, "--no-loop runs the released stack; it cannot be combined with "
+                        "--loop-layers\n");
+        return 2;
+    }
+    /* THE DEFAULT (Andrew, 2026-10-19: looping on by default, adaptive per-token depth,
+     * unmeasured; 2026-10-20: "On, R max 2"; docs/notes/layer-loop.md): the AttnRes block
+     * holding the middle layer, at most 2 passes, exit 0.05. Pass 2 always runs (the exit
+     * compares two passes), so at this cap every token runs both and the default is the
+     * fixed loop at count 2, bit for bit. Its span is settled once the layer count is
+     * known. --no-loop is the released model. */
+    loop_default = loop_a < 0 && !no_loop;
+    if (loop_a >= 0 || loop_default) {
         if (!loop_count) loop_count = 2;
-        const char *clash = spec_n > 0 ? "--spec" : draft_dir ? "--draft-trunk"
-            : load_state ? "--load-state" : save_state ? "--save-state"
-            : trunk_rows ? "--trunk-rows" : kvb_mode != K3_KVB_OFF ? "--kvb-cache"
-            : ultra ? "--ultra-low-memory (or --preset ultra)"
-            : trace_dir ? "--dump-cache-trace" : tf_check ? "--tf-check" : NULL;
-        if (clash) {
-            fprintf(stderr, "--loop-layers does not support %s: the per-layer state that "
-                            "mode keeps is not covered by the loop's gates\n", clash);
-            return 2;
-        }
+        if (loop_default) loop_eps = 0.05;
+        /* Every mode runs the loop: each keeps its per-layer state per EXECUTED position
+         * (KDA slots, MLA rows, --spec logs, the state file's slots), the trunk binds and
+         * the expert cache take any layer order, and --dump-cache-trace records requests
+         * in executed order (tools/expert_profile.py's prefix parser accepts only
+         * unlooped traces and says so). tests/test_loop_adaptive.py holds each to the
+         * looped full recompute. */
     }
     if (score_prompt) {
         if (incremental || load_state || save_state || spec_n || draft_dir || tf_check ||
@@ -1415,13 +1685,14 @@ int main(int argc, char **argv)
         return 2;
     }
     K3StateHdr shd;
+    K3StateLoop sloop;
     int prior = 0;
     if (load_state) {
         if (!incremental) {
             fprintf(stderr, "--load-state needs --incremental\n");
             return 2;
         }
-        if (k3_state_peek(load_state, &shd) != 0) return 1;
+        if (k3_state_peek(load_state, &shd, &sloop) != 0) return 1;
         prior = shd.nseq;
     }
     if (prior < 0 || prior > K3_MAX_PROMPT + K3_MAX_GEN - np - gen - 1) {
@@ -1494,7 +1765,12 @@ int main(int argc, char **argv)
      * adds one snapshot. A span that cut a block would shift every later boundary. */
     int NV = NL, n_mla_rep = 0;
     int *vmap = NULL, *vslot = NULL;
-    char loop_json[96] = "null";
+    char loop_json[192] = "null";
+    if (loop_default) {
+        const int blk = c.attn_res_block, mid = NL / 2;
+        loop_a = mid - mid % blk;
+        loop_b = loop_a + blk - 1 < NL - 1 ? loop_a + blk - 1 : NL - 1;
+    }
     if (loop_a >= 0) {
         const int blk = c.attn_res_block;
         if (loop_b >= NL || loop_a % blk != 0 || ((loop_b + 1) % blk != 0 && loop_b != NL - 1)) {
@@ -1525,13 +1801,25 @@ int main(int argc, char **argv)
         c.attn_res_extra = (loop_count - 1) * ((span + blk - 1) / blk);
         for (int L = loop_a; L <= loop_b; L++) n_mla_rep += k3_is_mla(&c, L);
         n_mla_rep *= loop_count - 1;
+        char ej[32] = "null";
+        if (loop_eps >= 0.0) snprintf(ej, sizeof ej, "%.9g", loop_eps);
         snprintf(loop_json, sizeof loop_json,
-                 "{\"layers\":[%d,%d],\"count\":%d,\"executed_layers\":%d}",
-                 loop_a, loop_b, loop_count, NV);
-        printf("EXPERIMENTAL: --loop-layers %d-%d x %d runs %d layers per token over %d "
-               "bound. This is NOT the released model: K3 was not trained to repeat "
-               "layers, and no quality result attaches to the output.\n\n",
-               loop_a, loop_b, loop_count, NV, NL);
+                 "{\"layers\":[%d,%d],\"count\":%d,\"executed_layers\":%d,\"exit\":%s,"
+                 "\"default\":%s}",
+                 loop_a, loop_b, loop_count, NV, ej, loop_default ? "true" : "false");
+        if (loop_eps >= 0.0)
+            printf("%s: layers %d-%d loop adaptively, 2 to %d passes per token (a token "
+                   "stops once a pass moves its span output by under %g relative), up to %d "
+                   "layers per token over %d bound. This is NOT the released model: K3 was "
+                   "not trained to repeat layers, and no quality result attaches to the "
+                   "output.%s\n\n", loop_default ? "DEFAULT LAYER LOOP" : "EXPERIMENTAL",
+                   loop_a, loop_b, loop_count, loop_eps, NV, NL,
+                   loop_default ? " --no-loop runs the released model." : "");
+        else
+            printf("EXPERIMENTAL: --loop-layers %d-%d x %d runs %d layers per token over %d "
+                   "bound. This is NOT the released model: K3 was not trained to repeat "
+                   "layers, and no quality result attaches to the output.\n\n",
+                   loop_a, loop_b, loop_count, NV, NL);
     }
     int64_t total = 0; int missing = 0;
     for (int L = 0; L < NL; L++) {
@@ -1589,7 +1877,10 @@ int main(int argc, char **argv)
         }
         const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
                               + (double)scratch + (double)c.vocab
-                              + (logit_rows > 1 ? (double)logit_rows * c.vocab : 0.0)) * 4;
+                              + (logit_rows > 1 ? (double)logit_rows * c.vocab : 0.0)
+                              /* adaptive loop: last span outputs, a pass's compacted rows */
+                              + (loop_eps >= 0.0 && loop_a >= 0
+                                 ? 2.0 * Tm * E64 + (double)Tm * mb * E64 : 0.0)) * 4;
         /* The KV cache MUST be in this total: it is the only term that grows with
          * context, so a guard that omits it is blind to the one thing it exists to
          * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
@@ -1695,6 +1986,9 @@ int main(int argc, char **argv)
     w.lay = (K3LayerBind *)calloc((size_t)NL, sizeof(K3LayerBind));
     if (!w.lay) return 1;
     w.vmap = vmap;      /* NULL without --loop-layers */
+    w.loop_a = loop_a; w.loop_b = loop_b; w.loop_rmax = loop_count;
+    w.loop_span = loop_a >= 0 ? loop_b - loop_a + 1 : 0;
+    w.loop_eps = vmap ? loop_eps : -1.0;
     w.vslot = vslot;
     w.n_virt = NV;
 
@@ -1801,6 +2095,25 @@ int main(int argc, char **argv)
     float *sc = (float *)malloc(sc_need * sizeof(float));
     float *lg = (float *)malloc((size_t)c.vocab * sizeof(float));
     if (!h || !br || !ks || !sc || !lg) { fprintf(stderr, "buffer allocation failed\n"); return 1; }
+    if (w.loop_eps >= 0.0) {
+        /* adaptive depth: per-token flags and counts, each token's last span output, the
+         * compacted rows of a pass, and what every absolute position did (the report) */
+        w.loop_pcached = (int *)calloc((size_t)w.loop_rmax + 1, sizeof(int));
+        w.loop_sweep_pcached = (int *)calloc((size_t)w.loop_rmax + 1, sizeof(int));
+        w.loop_act     = (int *)calloc((size_t)Tmax, sizeof(int));
+        w.loop_idx     = (int *)calloc((size_t)Tmax, sizeof(int));
+        w.loop_nbt     = (int *)calloc((size_t)Tmax, sizeof(int));
+        w.loop_passes  = (int *)calloc((size_t)Tmax, sizeof(int));
+        w.loop_d       = (double *)calloc((size_t)Tmax * (w.loop_rmax + 1), sizeof(double));
+        w.loop_hprev   = (float *)malloc((size_t)Tmax * E * sizeof(float));
+        w.loop_hc      = (float *)malloc((size_t)Tmax * E * sizeof(float));
+        w.loop_brc     = (float *)malloc((size_t)Tmax * maxb * E * sizeof(float));
+        if (!w.loop_pcached || !w.loop_sweep_pcached || !w.loop_act || !w.loop_idx || !w.loop_nbt || !w.loop_passes ||
+            !w.loop_d || !w.loop_hprev || !w.loop_hc || !w.loop_brc) {
+            fprintf(stderr, "adaptive loop buffer allocation failed\n");
+            return 1;
+        }
+    }
     if (logit_rows > 1) {
         w.logit_block = (float *)malloc((size_t)logit_rows * c.vocab * sizeof(float));
         if (!w.logit_block) { fprintf(stderr, "logit block allocation failed\n"); return 1; }
@@ -1863,10 +2176,13 @@ int main(int argc, char **argv)
 
         if (load_state) {
             const double tl = now_s();
-            if (k3_state_load(load_state, &c, &shd, seq, ks, w.kvc, w.ropec,
+            K3StateLoop rl = {-1, -1, 0, w.n_bound, -1.0};
+            if (vmap) { rl.a = loop_a; rl.b = loop_b; rl.count = loop_count; rl.nv = NV;
+                        rl.eps = w.loop_eps; }
+            if (k3_state_load(load_state, &c, &shd, &sloop, &rl, seq, ks, w.kvc, w.ropec,
                               w.n_bound, w.n_mla, w.kv_cap,
                               (int64_t)kv_floats_per_pos(&c, w.kv_latent),
-                              (int64_t)c.qk_rope) != 0)
+                              (int64_t)c.qk_rope, w.loop_pcached, w.loop_passes) != 0)
                 return 1;
             w.cached = shd.cached;
             printf("restored %d positions in %.2f s: decode continues without "
@@ -1990,7 +2306,9 @@ int main(int argc, char **argv)
         else {
             fprintf(sf, "{\"schema\":1,\"task\":\"perplexity\",\"input_ids\":[");
             for (int i = 0; i < np; i++) fprintf(sf, "%s%d", i ? "," : "", seq[i]);
-            fprintf(sf, "],\"score_start\":%d,\"scored_tokens\":%d,"
+            fputs("],\"loop_adaptive\":", sf);
+            write_loop_adaptive(sf, &w, np);
+            fprintf(sf, ",\"score_start\":%d,\"scored_tokens\":%d,"
                         "\"layers\":%d,\"layers_completed\":%d,\"loop\":%s,\"expert_drops\":0,"
                         "\"nll_sum\":%.17g,\"mean_nll\":%.17g,\"perplexity\":",
                     score_start, count, c.n_layers, w.layers_completed, loop_json, sum, mean);
@@ -2163,6 +2481,11 @@ int main(int argc, char **argv)
                  * its recurrence inputs instead. */
                 int arg[K3_SPEC_MAX + 1];
                 for (int i = 0; i < nd; i++) seq[T + i] = d[i];
+                if (w.loop_sweep_pcached) {      /* adaptive depth: where the sweep began */
+                    memcpy(w.loop_sweep_pcached, w.loop_pcached,
+                           ((size_t)w.loop_rmax + 1) * sizeof(int));
+                    w.loop_sweep_base = base;
+                }
                 w.log_row0 = 0;
                 frc = forward(&w, &c, &cache, seq + base, nd + 1, lg, sc, h, br, ks, arg);
                 w.log_row0 = -1;
@@ -2297,11 +2620,35 @@ int main(int argc, char **argv)
             const double tsv = now_s();
             const int64_t kvpp   = (int64_t)kv_floats_per_pos(&c, w.kv_latent);
             const int64_t ropepp = (int64_t)c.qk_rope;
+            if (w.loop_pcached) {
+                /* Adaptive depth: rows of a pass's MLA cache past what it committed, and the
+                 * pass counts of positions past `cached`, are what a rejected --spec sweep
+                 * left behind. Nothing reads them; clear them so the file is the one serial
+                 * decode writes, byte for byte. */
+                const int rep0 = w.loop_b + 1;
+                const size_t kvp = kv_floats_per_pos(&c, w.kv_latent);
+                for (int v = rep0; v < rep0 + (w.loop_rmax - 1) * w.loop_span; v++) {
+                    const int mi = w.mla_slot[v];
+                    if (mi < 0) continue;
+                    const int pc = w.loop_pcached[2 + (v - rep0) / w.loop_span];
+                    if (pc >= w.cached) continue;
+                    memset(w.kvc + ((size_t)mi * w.kv_cap + pc) * kvp, 0,
+                           (size_t)(w.cached - pc) * kvp * sizeof(float));
+                    memset(w.ropec + ((size_t)mi * w.kv_cap + pc) * c.qk_rope, 0,
+                           (size_t)(w.cached - pc) * c.qk_rope * sizeof(float));
+                }
+                for (int i = w.cached; i < T; i++) w.loop_passes[i] = 0;
+            }
+            K3StateLoop sl = {-1, -1, 0, w.n_bound, -1.0};
+            if (vmap) { sl.a = loop_a; sl.b = loop_b; sl.count = loop_count; sl.nv = NV;
+                        sl.eps = w.loop_eps; }
             if (k3_state_save(save_state, &c, seq, T, ks, w.kvc, w.ropec,
                               w.n_bound, w.n_mla, w.kv_cap, w.cached,
-                              (int64_t)kper, kvpp, ropepp) == 0) {
-                const double bytes = (double)sizeof(K3StateHdr) + (double)T * sizeof(int)
-                    + (double)kper * w.n_bound * sizeof(float)
+                              (int64_t)kper, kvpp, ropepp, &sl, w.loop_pcached,
+                              w.loop_passes) == 0) {
+                const double bytes = (double)sizeof(K3StateHdr) + sizeof sl
+                    + (double)T * sizeof(int) * (sl.count ? 2 : 1)
+                    + (double)kper * (sl.count ? NV : w.n_bound) * sizeof(float)
                     + (double)w.cached * (kvpp + ropepp) * w.n_mla * sizeof(float);
                 char sb[32]; human(bytes, sb, sizeof sb);
                 printf("wrote %s (%s, %d positions) in %.2f s\n",
@@ -2376,8 +2723,10 @@ int main(int argc, char **argv)
         for (int i = 0; i < nout; i++) fprintf(f, "%s%d", i ? "," : "", outtok[i]);
         fprintf(f, "],\"full_ids\":[");
         for (int i = 0; i < T; i++) fprintf(f, "%s%d", i ? "," : "", seq[i]);
+        fputs("],\"loop_adaptive\":", f);
+        write_loop_adaptive(f, &w, T);
         fprintf(f,
-                "],\"loop\":%s,\"layers\":%d,\"layers_requested\":%d,\"layers_completed\":%d,"
+                ",\"loop\":%s,\"layers\":%d,\"layers_requested\":%d,\"layers_completed\":%d,"
                 "\"expert_drops\":%ld,\"peak_rss_bytes\":%.0f,\"wall_seconds\":%.4f,"
                 "\"seconds_per_token\":%.4f,\"expert_bytes_read\":%llu,"
                 "\"expert_requests\":%llu,\"expert_resident_reuses\":%llu,"
@@ -2492,6 +2841,8 @@ int main(int argc, char **argv)
     }
 cleanup:
     free(w.kvc); free(w.ropec); free(w.mla_slot); free(w.vmap); free(w.vslot);
+    free(w.loop_pcached); free(w.loop_sweep_pcached); free(w.loop_act); free(w.loop_idx); free(w.loop_nbt);
+    free(w.loop_passes); free(w.loop_d); free(w.loop_hprev); free(w.loop_hc); free(w.loop_brc);
     free(w.kda_log); free(w.kda_slot); free(w.kda_work); free(w.all_logits);
     if (w.trunk) { k3_trunk_report(w.trunk, "final"); k3_trunk_close(w.trunk); }
     k3_cache_free(&cache);

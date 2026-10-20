@@ -55,6 +55,20 @@ class QualityTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_result(broken, [3, 7, 5], 1, 13)
 
+    def test_a_looped_window_completes_its_executed_layers(self):
+        response = {"schema": 1, "task": "perplexity", "input_ids": [3, 7, 5],
+                    "score_start": 1, "scored_tokens": 2, "layers": 13,
+                    "layers_completed": 22, "expert_drops": 0,
+                    "loop": {"layers": [6, 8], "count": 4, "executed_layers": 22},
+                    "token_nll": [1, 3], "nll_sum": 4, "mean_nll": 2}
+        self.assertEqual(validate_result(response, [3, 7, 5], 1, 13), [1, 3])
+        for changes in ({"layers_completed": 13}, {"layers_completed": 21},
+                        {"loop": {"executed_layers": 12}, "layers_completed": 12}):
+            broken = copy.deepcopy(response)
+            broken.update(changes)
+            with self.assertRaises(ValueError):
+                validate_result(broken, [3, 7, 5], 1, 13)
+
     def test_prompt_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "prompts.jsonl"

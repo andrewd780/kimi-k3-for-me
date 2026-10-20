@@ -336,7 +336,7 @@ test: $(CLI_BIN) $(MUT_BIN) $(TEST_BINS)
 	  esac; \
 	  for bad in "--loop-layers 3" "--loop-layers 3-5x" "--loop-layers 5-3" \
 	             "--loop-layers 3-5 --loop-count 9" "--loop-count 2" \
-	             "--loop-layers 3-5 --spec 2" "--loop-layers 3-5 --save-state s"; do \
+	             "--loop-layers 3-5 --loop-exit -1" "--no-loop --loop-layers 3-5"; do \
 	      out=$$(./$(CLI_BIN) fake --ids 1 $$bad 2>&1); rc=$$?; \
 	      test $$rc -eq 2 || { echo "  $$bad returned $$rc, expected 2"; exit 1; }; \
 	      case "$$out" in \

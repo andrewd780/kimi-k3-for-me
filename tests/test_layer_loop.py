@@ -69,9 +69,11 @@ class LayerLoopTests(unittest.TestCase):
         self.counter += 1
         out = self.path / ("%d.json" % self.counter)
         logits = self.path / ("%d.f32" % self.counter)
+        # no loop flag asks for the released model: the CLI's default is the adaptive loop
+        released = [] if any(str(a).startswith("--loop") or a == "--no-loop" for a in args) else ["--no-loop"]
         result = subprocess.run([str(binary or self.binary), str(self.model), "--ids", PROMPT, "--gen", str(gen),
                                  "--cache-gb", "0.0001", "--out", str(out), "--dump-all-logits", str(logits),
-                                 *map(str, args)],
+                                 *released, *map(str, args)],
                                 text=True, errors="replace", capture_output=True,
                                 env={**self.env, **(env or {})}, timeout=120)
         if not ok:
@@ -128,7 +130,8 @@ class LayerLoopTests(unittest.TestCase):
                 executed = LAYERS + (int(count) - 1) * (hi - lo + 1)
                 self.assertEqual(looped[0]["layers_completed"], executed)
                 self.assertEqual(looped[0]["loop"], {"layers": [lo, hi], "count": int(count),
-                                                     "executed_layers": executed})
+                                                     "executed_layers": executed, "exit": None,
+                                                     "default": False})
                 self.assertLessEqual(self.rel(looped[1], r), BUDGET, "looped engine vs looped reference")
                 self.assertEqual(int(np.argmax(looped[1])), ref["argmax"])
                 # the plant: the unlooped engine must NOT pass against the looped reference
@@ -185,13 +188,6 @@ class LayerLoopTests(unittest.TestCase):
             (["--loop-layers", "3-5", "--loop-count", "9"], "1 to 8"),
             (["--loop-layers", "3-5", "--loop-count", "2x"], "1 to 8"),
             (["--loop-count", "2"], "needs --loop-layers"),
-            (["--loop-layers", "3-5", "--incremental", "--spec", "2"], "--spec"),
-            (["--loop-layers", "3-5", "--save-state", self.root / "s.bin"], "--save-state"),
-            (["--loop-layers", "3-5", "--incremental", "--load-state", self.root / "s.bin"], "--load-state"),
-            (["--loop-layers", "3-5", "--trunk", self.trunk, "--trunk-gb", "0.0002", "--trunk-rows"], "--trunk-rows"),
-            (["--loop-layers", "3-5", "--trunk", self.trunk, "--preset", "ultra"], "--ultra-low-memory"),
-            (["--loop-layers", "3-5", "--dump-cache-trace", self.root], "--dump-cache-trace"),
-            (["--loop-layers", "3-5", "--tf-check"], "--tf-check"),
         ]
         for args, reason in cases:
             with self.subTest(args=args):
