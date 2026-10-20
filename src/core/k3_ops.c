@@ -2492,16 +2492,25 @@ static inline double k3_bf16_row_c(const uint16_t *row, const float *x, int n16)
  * per token. With compute between the loads, the hardware prefetcher may not run far
  * enough ahead of a row's read pointer to keep enough misses in flight, and the loop
  * then reads below the machine's streaming bandwidth. One prefetcht0 per 64-byte line,
- * 1 KB ahead of each row's read pointer (512 B for MXFP4, whose 16-byte groups are
- * consumed faster per byte), asks for the lines early. The distances come from
- * exploratory runs on a shared x86 VM that are not recorded, so no speed figure is
- * claimed for them: bench_kernels prints the bf16 kernel's weight traffic beside the
- * machine's read bandwidth, which is the measurement to take on a quiet machine before
- * tuning them. A prefetch is only a hint -- it reads nothing into a register, cannot
- * fault, and changes no arithmetic -- so the one thing it can change is speed. The NEON
- * loops are left without one. */
+ * 1 KB ahead of each row's read pointer, asks for the lines early. The bf16 distance
+ * comes from exploratory runs on a shared x86 VM that are not recorded, so no speed
+ * figure is claimed for it: bench_kernels prints the bf16 kernel's weight traffic beside
+ * the machine's read bandwidth, which is the measurement to take on a quiet machine
+ * before tuning it. A prefetch is only a hint -- it reads nothing into a register,
+ * cannot fault, and changes no arithmetic -- so the one thing it can change is speed.
+ * The NEON loops are left without one.
+ *
+ * MXFP4 PREFETCHES PAST THE NEXT ROW PAIR. The AVX-512 MXFP4 loop reads two adjacent
+ * rows at once (k3_mxfp4_rows2_avx512); an expert row is 1,536 or 1,792 bytes at K3's
+ * shapes. With a distance under one row, the prefetch past a row's end lands in its
+ * partner, which the loop is already reading, so only the next pair's first row is
+ * asked for: its second row starts cold, and the lead at 512 B is only about 500 cycles
+ * at this loop's rate. At 8 KB the two rows' prefetches together cover the thread's bytes
+ * contiguously, 2.3 to 2.7 pairs ahead at K3's shapes. Measured against 512 B
+ * in-process on the cloud VM of docs/notes/decode-kernels.md (see the pull request for
+ * the protocol and every round). */
 #define K3_PF_BF16  1024
-#define K3_PF_MXFP4 512
+#define K3_PF_MXFP4 8192
 
 /* x widened to double in the EVEN/ODD CHUNK LAYOUT the x86 vector loops read: within the
  * chunk starting at c, xd[c + k] = x[c + 2k] and xd[c + 8 + k] = x[c + 2k + 1] for
