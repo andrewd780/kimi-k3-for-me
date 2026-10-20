@@ -7,6 +7,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Pause and resume a long read-in: `--checkpoint PATH`, `--pause-after N`, exit status 3.** While the prompt is read
+  in, the state is saved to PATH after every chunk but the last (via `PATH.tmp` and a rename). The same command run
+  again resumes from it, once the saved ids are checked to begin the prompt. `--pause-after N` and Ctrl-C stop after
+  a saved chunk with exit status 3; a second Ctrl-C stops at once. A read-in paused twice and resumed is the
+  uninterrupted run (ids, every generated token's logits, the saved state), and a checkpoint is byte for byte the
+  state `--gen 0 --save-state` leaves after the same ids; a checkpoint written before `cached` advanced (a planted
+  ordering bug) fails both gates. The run report adds `checkpoint_resumed_ids` and `checkpoints_written`.
+
 - **Long prompts: `--prefill-chunk N`, `--ids-file PATH`, and a 1,048,576-id ceiling under `--incremental`.** The
   prompt is read in passes of at most N positions (default 4096, 1 to 32768), each carrying the KV cache and the
   recurrent state to the next, with the bits of one pass: ids, every generated token's logits and the saved state
