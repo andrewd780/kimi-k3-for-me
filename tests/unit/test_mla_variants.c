@@ -19,7 +19,9 @@
  *      token's hidden state must leave the outputs of the earlier new tokens unchanged
  *      bit for bit, in L1 and in A, and must change the last one.
  *   5. Thread-count independence: L1, E+ and A rerun on every available thread give the
- *      bits they gave on one, on the cases of up to 48 positions (see test_case).
+ *      bits they gave on one, on the cases of up to 48 positions (see test_case), and so
+ *      does the engine's expanded layout, which splits its heads across threads as E+
+ *      does: outputs, appended rows, scores, normalisers, quotients and accumulators.
  *   6. A is the plain formula: it matches a scalar, loop-by-loop rendering of the
  *      absorbed attention bitwise, so bench_mla's numerical study measures absorption
  *      itself, not an artefact of the vectorised loop. It is NOT equal to E, and the
@@ -662,6 +664,18 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
             run_free(&r);
         }
         g_attend_threads = 1;
+        /* the engine's expanded layout splits its heads across threads (E+'s structure),
+         * so it too must give the bits it gave on one thread, everywhere the trace looks */
+        Run ex;
+        set_threads(g_threads);
+        run_engine(&ex, &K, 0);
+        set_threads(1);
+        CHECK(same(ex.out, eng_x.out, outb) && same(ex.acc, eng_x.acc, accb)
+                  && same(ex.probe, eng_x.probe, prb) && same(ex.z, eng_x.z, zb)
+                  && same(ex.quot, eng_x.quot, qb)
+                  && same(ex.cache.kv + (size_t)C * H * kvd, eng_x.cache.kv + (size_t)C * H * kvd, expb),
+              "%s C=%d T=%d: the expanded engine changes with the thread count", geom, C, T);
+        run_free(&ex);
     }
 
     run_free(&eng_x); run_free(&eng_l); run_free(&rE); run_free(&rEP); run_free(&rL0);

@@ -294,6 +294,16 @@ $(BIN)/bench_mla: benchmarks/bench_mla.c benchmarks/mla_variants.h \
                   $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
 
+# One call of the engine's own k3_mla_cached at the released geometry, timed and hashed,
+# so two builds of the engine can be compared by the same harness.
+$(BIN)/bench_mla_engine: benchmarks/bench_mla_engine.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
+# One decode token's compute at the released shapes, by layer kind, through the engine's
+# own layer functions on synthetic weights (no checkpoint): which piece costs what.
+$(BIN)/bench_token: benchmarks/bench_token.c $(BUILD)/src/core/k3_ops.o | $(BIN)
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
+
 ## test: everything that needs no model weights
 test: $(CLI_BIN) $(MUT_BIN) $(TEST_BINS)
 	@echo "== gate mutants are test-build only =="; \
