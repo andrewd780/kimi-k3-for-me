@@ -519,10 +519,10 @@ static void usage(FILE *f)
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
 "layer loop, CHANGES THE MODEL (docs/notes/layer-loop.md):\n"
-"  DEFAULT               the AttnRes block holding the middle layer (36-47 on K3) loops\n"
-"                        adaptively: 2 to 4 passes per token, a token stopping once a\n"
-"                        pass moves its span output by under 5%% (relative L2). K3 was\n"
-"                        not trained for this; its effect on quality is unmeasured\n"
+"  DEFAULT               the AttnRes block holding the middle layer (36-47 on K3) runs\n"
+"                        twice per token (at most 2 passes, exit 0.05; the exit needs\n"
+"                        two passes to compare, so every token runs both). K3 was not\n"
+"                        trained for this; its effect on quality is unmeasured\n"
 "  --no-loop             the released model: every layer once, no loop\n"
 "  --loop-layers A-B     loop layers A..B instead (zero-based, whole AttnRes blocks), as\n"
 "                        if the span appeared again in the stack. Each pass keeps its own\n"
@@ -1416,12 +1416,14 @@ int main(int argc, char **argv)
         return 2;
     }
     /* THE DEFAULT (Andrew, 2026-10-19: looping on by default, adaptive per-token depth,
-     * unmeasured; docs/notes/layer-loop.md): the AttnRes block holding the middle layer,
-     * up to 4 passes, a token stopping once a pass moves its span output by under 5%.
-     * Its span is settled once the layer count is known. --no-loop is the released model. */
+     * unmeasured; 2026-10-20: "On, R max 2"; docs/notes/layer-loop.md): the AttnRes block
+     * holding the middle layer, at most 2 passes, exit 0.05. Pass 2 always runs (the exit
+     * compares two passes), so at this cap every token runs both and the default is the
+     * fixed loop at count 2, bit for bit. Its span is settled once the layer count is
+     * known. --no-loop is the released model. */
     loop_default = loop_a < 0 && !no_loop;
     if (loop_a >= 0 || loop_default) {
-        if (!loop_count) loop_count = loop_default ? 4 : 2;
+        if (!loop_count) loop_count = 2;
         if (loop_default) loop_eps = 0.05;
         /* Every mode runs the loop: each keeps its per-layer state per EXECUTED position
          * (KDA slots, MLA rows, --spec logs, the state file's slots), the trunk binds and

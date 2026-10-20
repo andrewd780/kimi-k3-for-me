@@ -470,7 +470,7 @@ is a pure speed choice.
 
 | flag | argument | default | |
 |---|---|---|---|
-| (none) | | **on** | **the default adaptive layer loop**: the AttnRes block holding the middle layer (36-47 on K3) runs 2 to 4 times per token, a token stopping once a pass moves its span output by under 5% (relative L2). Andrew's call, 2026-10-19; **K3 was not trained for this, and its effect on quality is unmeasured**. It costs 13% to 39% more layers per token |
+| (none) | | **on** | **the default adaptive layer loop**: the AttnRes block holding the middle layer (36-47 on K3) runs twice per token (at most 2 passes, exit 0.05; the exit compares two passes, so every token runs both). Andrew's calls, 2026-10-19 (on by default) and 2026-10-20 ("R max 2"); **K3 was not trained for this, and its effect on quality is unmeasured**. It costs 13% more layers per token. `--loop-layers 36-47 --loop-count 4 --loop-exit 0.05` gives per-token depth (2 to 4 passes) |
 | `--no-loop` | | | **the released model**: every layer once. Byte-identical to builds before the default loop |
 | `--loop-layers` | `A-B` | 36-47 | loop layers A..B instead (zero-based, whole 12-layer AttnRes blocks), as if the span appeared again in the stack; each pass keeps its own recurrent state and KV rows, weights are shared. Every mode supports it. [Design and gates](docs/notes/layer-loop.md) |
 | `--loop-count` | `R` | 2 (4 for the default) | passes over the span, 1 to 8; with `--loop-exit`, the most any token runs. 1 is the released model |

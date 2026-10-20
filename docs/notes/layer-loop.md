@@ -45,7 +45,10 @@ Execution order per token: layers `0..B`, then `A..B` another `R-1` times, then 
 Andrew, 2026-10-19, verbatim: *"Also find a way in the looped layers to make it like recursive depth or something. Also
 make all the changes default in Kimi k3"*. Asked what he meant, he chose **"Adaptive per-token depth"** and **"Default on
 now, unmeasured"** (over keeping it opt-in, and over defaulting only after a quality gate), with span **"One middle block,
-36-47"**, cap **"R max 4"** and exit **"Threshold 0.05"**. Recorded in j-research `workspace/loopcd/PLAN.md`.
+36-47"**, cap **"R max 4"** and exit **"Threshold 0.05"**. Recorded in j-research `workspace/loopcd/PLAN.md`. On
+2026-10-20, shown the cost (1 to 3 extra passes, short-context tokens slower than the original engine), he chose **"On, R
+max 2"**: the default's cap is 2. Pass 2 always runs, so at that cap no token exits early and the default is the fixed loop
+at count 2; per-token depth is `--loop-count 3` or more with `--loop-exit`.
 
 **Semantics.** With `--loop-layers A-B --loop-count R --loop-exit EPS`:
 
@@ -69,11 +72,13 @@ scatters them back. Full recompute, incremental decode and every supported mode 
 floats, so they stay bit-identical to each other.
 
 **The default.** With no loop flag the CLI runs `--loop-layers` on the AttnRes block holding layer `N/2` of the bound
-stack (36-47 on K3; 6-8 on the 13-layer tiny model), `--loop-count 4 --loop-exit 0.05`. `--no-loop` is the released
+stack (36-47 on K3; 6-8 on the 13-layer tiny model), `--loop-count 2 --loop-exit 0.05`, which is `--loop-count 2` bit
+for bit. `--no-loop` is the released
 model. The default refuses the modes the loop's gates do not yet cover and says to pass `--no-loop`. Every gate that
 holds the released model to its reference now passes `--no-loop`; `tests/test_loop_adaptive.py` gates the default.
 
-**Cost.** 2 to 4 passes of a 12-layer block: 13% to 39% more layers per token, with their trunk and expert bytes. No
+**Cost.** The default's 2 passes of a 12-layer block: 13% more layers per token (2 to 4 passes at `--loop-count 4`: 13% to
+39%), with their trunk and expert bytes. No
 quality measurement exists; K3 was not trained to repeat layers.
 
 ## Modes
@@ -133,7 +138,8 @@ Adaptive depth and the default, measured on the tiny model, 2026-10-20, Linux x8
   recompute; `--spec 3` and `--draft-trunk` are serial decode bit for bit, with drafts proposed and accepted; a state
   saved after `--spec` is the serial state byte for byte and resumes as one uninterrupted run; a state is refused under
   another loop; `--tf-check` counts the torch reference's agreement; the cache trace lists layers in executed order.
-- **Default:** no flag is `--loop-layers 6-8 --loop-count 4 --loop-exit 0.05` on the tiny model, bit for bit; `--no-loop`
+- **Default:** no flag is `--loop-layers 6-8 --loop-count 2 --loop-exit 0.05` and `--loop-count 2` on the tiny model, bit
+  for bit; `--no-loop`
   is `--loop-count 1`; the offline CLI, kv_b cache, MLA split, quality and expert-profile suites pass with `--no-loop`.
 - **Plants, each reverted:** stopped tokens run in later passes (`K3_LOOP_MUTANT_NO_COMPACT`): caught by the reference;
   every post-span token reading token 0's block count: 12 parity failures; a sweep committing every position to every

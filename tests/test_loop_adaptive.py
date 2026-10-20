@@ -2,7 +2,7 @@
 
 --loop-exit EPS makes the loop's depth per token: every token runs the span twice, then keeps going while a pass moves
 its span output by EPS or more (relative L2), up to --loop-count passes. Pass p's layers see only the tokens that reached
-pass p. The CLI runs this by default on the AttnRes block holding the middle layer, up to 4 passes, at EPS 0.05;
+pass p. The CLI runs this by default on the AttnRes block holding the middle layer, at most 2 passes, at EPS 0.05;
 --no-loop is the released model. Like tests/test_layer_loop.py, these gates ask whether the engine computes the stack it
 claims to, never whether that stack is any good:
   - identities: EPS 0 never stops early, so it is bit-identical to the fixed loop at the same count; an EPS no change can
@@ -15,7 +15,8 @@ claims to, never whether that stack is any good:
     --expert-pipeline are bit-identical to full recompute;
   - the no-compaction mutant (K3_LOOP_MUTANT_NO_COMPACT, test builds only: stopped tokens leak into later passes' state)
     is caught by the reference;
-  - the default is the adaptive middle-block loop, and --no-loop is the released model;
+  - the default is the middle-block loop at most 2 passes (so the fixed loop at count 2), and --no-loop is the released
+    model;
   - refusals name their reason.
 
 Needs numpy and torch. Build first (`make all mutants`).
@@ -269,13 +270,15 @@ class LoopAdaptiveTests(unittest.TestCase):
         self.assertIn("K3_LOOP_MUTANT_NO_COMPACT", err)
 
     # ---------------------------------------------------------------------- default
-    def test_the_default_is_the_adaptive_middle_block(self):
+    def test_the_default_is_the_middle_block_at_two_passes(self):
         for mode in ([], ["--incremental"]):
             with self.subTest(mode=mode):
                 default = self.run_cli(mode)
-                explicit = self.run_cli([*mode, *self.loop("6-8", 4, "0.05")])
+                explicit = self.run_cli([*mode, *self.loop("6-8", 2, "0.05")])
                 self.assert_same(default, explicit)
-                self.assertEqual(default[0]["loop"], {"layers": [6, 8], "count": 4, "executed_layers": LAYERS + 9,
+                # pass 2 always runs, so at a cap of 2 the exit never fires: the fixed loop at count 2
+                self.assert_same(default, self.run_cli([*mode, *self.loop("6-8", 2)]))
+                self.assertEqual(default[0]["loop"], {"layers": [6, 8], "count": 2, "executed_layers": LAYERS + 3,
                                                       "exit": 0.05, "default": True})
                 released = self.run_cli([*mode, "--no-loop"])
                 self.assertIsNone(released[0]["loop"])
@@ -403,7 +406,7 @@ class LoopAdaptiveTests(unittest.TestCase):
         self.assertTrue(report["loop"]["default"])
         passes = report["loop_adaptive"]["passes"]
         self.assertEqual(len(passes), len(PROMPT.split(",")))
-        self.assertTrue(all(2 <= p <= 4 for p in passes[:-1]), passes)
+        self.assertTrue(all(p == 2 for p in passes[:-1]), passes)   # the default's cap is 2
         self.assertEqual(passes[-1], 0, "the last position has no target and is not forwarded")
         self.assertEqual(sum(report["loop_adaptive"]["passes_histogram"]), len(passes))
         self.assertTrue(math.isfinite(report["mean_nll"]))
