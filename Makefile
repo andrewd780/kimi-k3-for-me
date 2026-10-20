@@ -290,6 +290,12 @@ $(BIN)/test_mla_variants: tests/unit/test_mla_variants.c benchmarks/mla_variants
                           $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
 
+# the same test against an engine built with its gate mutants, so `make test` can show the
+# --mla-absorb gate (its check 10) failing on a planted bug
+$(BIN)/test_mla_variants-mut: tests/unit/test_mla_variants.c benchmarks/mla_variants.h \
+                              src/core/k3_ops.c $(ENGINE_HEADERS) | $(BIN)
+	$(CC) $(CFLAGS) -DK3_TEST_MUTANTS $(INCLUDES) $< src/core/k3_ops.c -o $@ $(LDFLAGS)
+
 $(BIN)/bench_mla: benchmarks/bench_mla.c benchmarks/mla_variants.h \
                   $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $< $(BUILD)/src/core/k3_ops.o -o $@ $(LDFLAGS)
@@ -305,7 +311,7 @@ $(BIN)/bench_token: benchmarks/bench_token.c $(BUILD)/src/core/k3_ops.o | $(BIN)
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS)
 
 ## test: everything that needs no model weights
-test: $(CLI_BIN) $(MUT_BIN) $(TEST_BINS)
+test: $(CLI_BIN) $(MUT_BIN) $(TEST_BINS) $(BIN)/test_mla_variants-mut
 	@echo "== gate mutants are test-build only =="; \
 	  if K3_MLA_SPLIT_MUTANT_CAUSAL=1 ./$(CLI_BIN) fake --ids 1 >/dev/null 2>&1; then \
 	      echo "the production CLI accepted a gate mutant switch"; exit 1; \
@@ -351,6 +357,12 @@ test: $(CLI_BIN) $(MUT_BIN) $(TEST_BINS)
 	@echo "== quality arithmetic =="; ./$(BIN)/test_quality
 	@echo "== KDA bitwise recurrence =="; ./$(BIN)/test_kda_exact
 	@echo "== MLA cache variants ==";  ./$(BIN)/test_mla_variants
+	@echo "== MLA cache variants: the --mla-absorb gate fails on a dropped rope term =="; \
+	  out=$$(K3_ABSORB_MUTANT_NO_ROPE=1 ./$(BIN)/test_mla_variants-mut 2>&1); rc=$$?; \
+	  case "$$rc:$$out" in 0:*) echo "  the planted bug passed"; exit 1;; \
+	      *"is not A"*) echo "  caught: $$(echo "$$out" | grep -c 'is not A') cases report the engine's absorbed form is not A";; \
+	      *) echo "  the mutant run failed, but not at check 10 ($$rc)"; exit 1;; \
+	  esac
 	@echo "== streaming cache ==";   ./$(BIN)/test_cache $(FIXTURES)/cache
 	@echo "== safetensors ==";       ./$(BIN)/test_st $(FIXTURES)/st $(BUILD)/st_index.json \
 	    plain.f32.2d plain.bf16.1d tricky.f16.1d packed.u8.2d scalar.f32 second.shard.f32

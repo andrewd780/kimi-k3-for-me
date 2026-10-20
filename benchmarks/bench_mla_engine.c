@@ -1,7 +1,12 @@
 /* bench_mla_engine.c - wall time of ONE call of the engine's own k3_mla_cached.
  *
  *   bench_mla_engine --C <cached> --T <new> [--threads N] [--calls N] [--latent]
- *                    [--label s] [--quiet-wait s]
+ *                    [--absorb] [--dump PATH] [--label s] [--quiet-wait s]
+ *
+ * --absorb (implies --latent) times the engine's --mla-absorb path over the same latent
+ * cache; its hash differs from the latent layout's by design (rounding-level output).
+ * --dump PATH writes the last call's output rows ([T][7168] float32), so two layouts'
+ * outputs can be compared numerically.
  *
  * One MLA layer at the released geometry (hidden 7168, 96 heads, qk_nope 128, qk_rope 64,
  * v_head 128, kv_lora 512, q_lora 1536, output gate on), synthetic bf16 weights and a
@@ -156,25 +161,28 @@ static uint64_t fnv1a(uint64_t h, const void *p, size_t n)
 
 int main(int argc, char **argv)
 {
-    int C = -1, T = 1, threads = 0, calls = 3, latent = 0;
+    int C = -1, T = 1, threads = 0, calls = 3, latent = 0, absorb = 0;
     double quiet_wait = 120.0;
-    const char *label = "";
+    const char *label = "", *dump = NULL;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(a, "--latent")) { latent = 1; continue; }
+        if (!strcmp(a, "--absorb")) { latent = absorb = 1; continue; }
         if (!v) { fprintf(stderr, "%s needs a value\n", a); return 2; }
         if (!strcmp(a, "--C")) C = atoi(v);
         else if (!strcmp(a, "--T")) T = atoi(v);
         else if (!strcmp(a, "--threads")) threads = atoi(v);
         else if (!strcmp(a, "--calls")) calls = atoi(v);
         else if (!strcmp(a, "--label")) label = v;
+        else if (!strcmp(a, "--dump")) dump = v;
         else if (!strcmp(a, "--quiet-wait")) quiet_wait = atof(v);
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
         i++;
     }
     if (C < 0 || T < 1 || calls < 1 || calls > MAX_CALLS) {
         fprintf(stderr, "usage: bench_mla_engine --C <cached> --T <new> [--threads N] "
-                        "[--calls 1..%d] [--latent] [--label s] [--quiet-wait s]\n", MAX_CALLS);
+                        "[--calls 1..%d] [--latent] [--absorb] [--label s] [--quiet-wait s]\n",
+                MAX_CALLS);
         return 2;
     }
 #ifdef _OPENMP
@@ -219,6 +227,7 @@ int main(int argc, char **argv)
     float *x = (float *)xmalloc((size_t)T * E * sizeof(float));
     fill_fast(x, (size_t)T * E, 1.7f, 23);
     float *out = (float *)xmalloc((size_t)T * E * sizeof(float));
+    k3_mla_absorb = absorb;   /* before sizing: the absorbed scratch differs */
     const size_t ns = k3_mla_scratch_cached(&c, T, cap, 1, latent);
     float *scr = (float *)xmalloc(ns * sizeof(float));
 
@@ -243,7 +252,7 @@ int main(int argc, char **argv)
 
     printf("{\"bench\":\"mla_engine\",\"label\":\"%s\",\"C\":%d,\"T\":%d,\"threads\":%d,"
            "\"layout\":\"%s\",\"scratch_floats\":%zu,\"times_s\":[", label, C, T, threads,
-           latent ? "latent" : "expanded", ns);
+           absorb ? "latent-absorbed" : latent ? "latent" : "expanded", ns);
     for (int k = 0; k < calls; k++) printf("%s%.6f", k ? "," : "", t[k]);
     printf("],\"idle_before\":[");
     for (int k = 0; k < calls; k++) printf("%s%.3f", k ? "," : "", idle[k]);
@@ -253,6 +262,13 @@ int main(int argc, char **argv)
     for (int k = 0; k < calls; k++) printf("%s\"%016llx\"", k ? "," : "", (unsigned long long)hash[k]);
     printf("]}\n");
 
+    if (dump) {
+        FILE *f = fopen(dump, "wb");
+        if (!f || fwrite(out, sizeof(float), (size_t)T * E, f) != (size_t)T * E || fclose(f)) {
+            perror(dump);
+            return 1;
+        }
+    }
     free(scr); free(out); free(x); free(kvc); free(ropec); free(norm);
     free((void *)w.q_a); free((void *)w.q_b); free((void *)w.kv_a); free((void *)w.kv_b);
     free((void *)w.o); free((void *)w.g);
