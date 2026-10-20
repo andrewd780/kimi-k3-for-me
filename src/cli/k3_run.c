@@ -518,12 +518,14 @@ static void usage(FILE *f)
 "                        and only the accepted positions are committed\n"
 "  --tok DIR             directory with tiktoken.model and tokenizer_config.json\n"
 "\n"
-"layer loop, CHANGES THE MODEL (docs/notes/layer-loop.md):\n"
-"  DEFAULT               the AttnRes block holding the middle layer (36-47 on K3) runs\n"
-"                        twice per token (at most 2 passes, exit 0.05; the exit needs\n"
-"                        two passes to compare, so every token runs both). K3 was not\n"
-"                        trained for this; its effect on quality is unmeasured\n"
-"  --no-loop             the released model: every layer once, no loop\n"
+"layer loop, CHANGES THE MODEL (docs/notes/layer-loop.md); off by default:\n"
+"  --loop                the AttnRes block holding the middle layer (36-47 on K3) loops\n"
+"                        adaptively: 2 to 4 passes per token, a token stopping once a\n"
+"                        pass moves its span output by under 5%% (relative L2).\n"
+"                        --loop-count and --loop-exit change the cap and threshold. K3\n"
+"                        was not trained for this; its effect on quality is unmeasured\n"
+"  --no-loop             the released model, every layer once: the default, accepted\n"
+"                        so that scripts written while the loop was on still work\n"
 "  --loop-layers A-B     loop layers A..B instead (zero-based, whole AttnRes blocks), as\n"
 "                        if the span appeared again in the stack. Each pass keeps its own\n"
 "                        recurrent state and KV rows; weights are shared\n"
@@ -1203,7 +1205,7 @@ int main(int argc, char **argv)
     int kv_latent = 0, trunk_rows = 0, kvb_mode = K3_KVB_OFF;
     int loop_a = -1, loop_b = -1, loop_count = 0;   /* --loop-layers A-B, --loop-count R */
     double loop_eps = -1.0;                         /* --loop-exit EPS; < 0 is the fixed loop */
-    int no_loop = 0, loop_default = 0;              /* --no-loop; the default loop in force */
+    int no_loop = 0, want_loop = 0, loop_preset = 0; /* --no-loop; --loop; its span in force */
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
@@ -1318,6 +1320,7 @@ int main(int argc, char **argv)
             loop_eps = e;
         }
         else if (!strcmp(argv[i], "--no-loop")) no_loop = 1;
+        else if (!strcmp(argv[i], "--loop")) want_loop = 1;
         else if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tf-check")) tf_check = 1;
         else if (!strcmp(argv[i], "--load-state") && i + 1 < argc) load_state = argv[++i];
@@ -1402,29 +1405,35 @@ int main(int argc, char **argv)
     /* --loop-layers changes the model, so every mode it is combined with must have been
      * shown to compute the looped stack; the ones not covered by its gates refuse rather
      * than run something unverified (docs/notes/layer-loop.md, Modes). */
-    if (loop_count && loop_a < 0) {
-        fprintf(stderr, "--loop-count needs --loop-layers\n");
+    if (loop_count && loop_a < 0 && !want_loop) {
+        fprintf(stderr, "--loop-count needs --loop-layers or --loop\n");
         return 2;
     }
-    if (loop_eps >= 0.0 && loop_a < 0) {
-        fprintf(stderr, "--loop-exit needs --loop-layers\n");
+    if (loop_eps >= 0.0 && loop_a < 0 && !want_loop) {
+        fprintf(stderr, "--loop-exit needs --loop-layers or --loop\n");
         return 2;
     }
-    if (no_loop && loop_a >= 0) {
+    if (no_loop && (loop_a >= 0 || want_loop)) {
         fprintf(stderr, "--no-loop runs the released stack; it cannot be combined with "
-                        "--loop-layers\n");
+                        "--loop or --loop-layers\n");
         return 2;
     }
-    /* THE DEFAULT (Andrew, 2026-10-19: looping on by default, adaptive per-token depth,
-     * unmeasured; 2026-10-20: "On, R max 2"; docs/notes/layer-loop.md): the AttnRes block
-     * holding the middle layer, at most 2 passes, exit 0.05. Pass 2 always runs (the exit
-     * compares two passes), so at this cap every token runs both and the default is the
-     * fixed loop at count 2, bit for bit. Its span is settled once the layer count is
-     * known. --no-loop is the released model. */
-    loop_default = loop_a < 0 && !no_loop;
-    if (loop_a >= 0 || loop_default) {
-        if (!loop_count) loop_count = 2;
-        if (loop_default) loop_eps = 0.05;
+    if (want_loop && loop_a >= 0) {
+        fprintf(stderr, "--loop loops the AttnRes block holding the middle layer; for "
+                        "another span give --loop-layers alone\n");
+        return 2;
+    }
+    /* NO LOOP BY DEFAULT: the released model. The loop ran by default from 2026-10-19 to
+     * 2026-10-20 (Andrew's call); on 2026-10-20 he left the call to Claude ("whatever you
+     * think is good do it"), and it went opt-in because K3 was not trained to repeat
+     * layers, no quality measurement exists, and it costs layers per token
+     * (docs/notes/layer-loop.md). --loop is his original adaptive setting: the AttnRes
+     * block holding the middle layer, up to 4 passes, a token stopping once a pass moves
+     * its span output by under 5%. Its span is settled once the layer count is known. */
+    loop_preset = want_loop;
+    if (loop_a >= 0 || loop_preset) {
+        if (!loop_count) loop_count = loop_preset ? 4 : 2;
+        if (loop_preset && loop_eps < 0.0) loop_eps = 0.05;
         /* Every mode runs the loop: each keeps its per-layer state per EXECUTED position
          * (KDA slots, MLA rows, --spec logs, the state file's slots), the trunk binds and
          * the expert cache take any layer order, and --dump-cache-trace records requests
@@ -1766,7 +1775,7 @@ int main(int argc, char **argv)
     int NV = NL, n_mla_rep = 0;
     int *vmap = NULL, *vslot = NULL;
     char loop_json[192] = "null";
-    if (loop_default) {
+    if (loop_preset) {
         const int blk = c.attn_res_block, mid = NL / 2;
         loop_a = mid - mid % blk;
         loop_b = loop_a + blk - 1 < NL - 1 ? loop_a + blk - 1 : NL - 1;
@@ -1805,16 +1814,16 @@ int main(int argc, char **argv)
         if (loop_eps >= 0.0) snprintf(ej, sizeof ej, "%.9g", loop_eps);
         snprintf(loop_json, sizeof loop_json,
                  "{\"layers\":[%d,%d],\"count\":%d,\"executed_layers\":%d,\"exit\":%s,"
-                 "\"default\":%s}",
-                 loop_a, loop_b, loop_count, NV, ej, loop_default ? "true" : "false");
+                 "\"preset\":%s}",
+                 loop_a, loop_b, loop_count, NV, ej, loop_preset ? "true" : "false");
         if (loop_eps >= 0.0)
             printf("%s: layers %d-%d loop adaptively, 2 to %d passes per token (a token "
                    "stops once a pass moves its span output by under %g relative), up to %d "
                    "layers per token over %d bound. This is NOT the released model: K3 was "
                    "not trained to repeat layers, and no quality result attaches to the "
-                   "output.%s\n\n", loop_default ? "DEFAULT LAYER LOOP" : "EXPERIMENTAL",
+                   "output.%s\n\n", loop_preset ? "LAYER LOOP (--loop)" : "EXPERIMENTAL",
                    loop_a, loop_b, loop_count, loop_eps, NV, NL,
-                   loop_default ? " --no-loop runs the released model." : "");
+                   loop_preset ? " Without --loop the CLI runs the released model." : "");
         else
             printf("EXPERIMENTAL: --loop-layers %d-%d x %d runs %d layers per token over %d "
                    "bound. This is NOT the released model: K3 was not trained to repeat "

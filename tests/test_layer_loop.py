@@ -131,7 +131,7 @@ class LayerLoopTests(unittest.TestCase):
                 self.assertEqual(looped[0]["layers_completed"], executed)
                 self.assertEqual(looped[0]["loop"], {"layers": [lo, hi], "count": int(count),
                                                      "executed_layers": executed, "exit": None,
-                                                     "default": False})
+                                                     "preset": False})
                 self.assertLessEqual(self.rel(looped[1], r), BUDGET, "looped engine vs looped reference")
                 self.assertEqual(int(np.argmax(looped[1])), ref["argmax"])
                 # the plant: the unlooped engine must NOT pass against the looped reference

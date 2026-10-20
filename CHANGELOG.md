@@ -7,12 +7,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **The CLI now runs an adaptive layer loop BY DEFAULT, which changes the model** (Andrew's call, 2026-10-19: "Default on
-  now, unmeasured"; 2026-10-20: "On, R max 2"). With no loop flag, the AttnRes block holding the middle layer (36-47 on
-  K3) runs twice per token (at most 2 passes at exit 0.05; the exit compares two passes, so every token runs both). K3
-  was not trained for this and no quality measurement exists; it costs 13% more layers per token. Per-token depth is
-  `--loop-count 3` or more with `--loop-exit`. **`--no-loop` runs the released model**,
-  byte-identical to before; every gate that holds the released model to its reference now passes it.
+- **The layer loop is opt-in again: `--loop`.** With no loop flag the CLI runs the released model, as before 2026-10-19.
+  `--loop` is the adaptive middle-block loop: the AttnRes block holding the middle layer (36-47 on K3), 2 to 4 passes
+  per token, exit 0.05. `--no-loop` is still accepted. The run report's `loop.default` field is now `loop.preset`.
+  - The loop was the default for a day: first at up to 4 passes, then at 2, at which no token can exit early.
+  - On 2026-10-20 Andrew left the call to Claude ("whatever you think is good do it").
+  - K3 was not trained to repeat layers, its effect on quality is unmeasured, and it costs 13% to 39% more layers per
+    token. The released model is the safe default.
 
 ### Added
 
