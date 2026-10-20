@@ -81,6 +81,12 @@ jobs:
           K3_TEST_BIN: bin/zstd/k3
           K3_TEST_MUT_BIN: bin/zstd/k3-mut
         run: python3 -m unittest discover -s tests -p test_layer_loop.py -v
+      - name: Adaptive loop depth and the default loop (torch reference, every mode, mutant)
+        if: runner.os == 'Linux'
+        env:
+          K3_TEST_BIN: bin/zstd/k3
+          K3_TEST_MUT_BIN: bin/zstd/k3-mut
+        run: python3 -m unittest discover -s tests -p test_loop_adaptive.py -v
       - name: Preserve CI fixture measurements
         if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4

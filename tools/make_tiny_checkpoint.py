@@ -231,6 +231,30 @@ def build(seed: int):
     return cfg, model
 
 
+def to_shard_values(model):
+    """Round every weight to exactly what the shards hold (MXFP4 experts, bf16 where the
+    engine reads bf16), so a torch forward of the model is the TRUE answer for the bytes
+    bin/k3 reads."""
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            w = p.detach().float().cpu().numpy()
+            eng = engine_name(name)
+            if is_expert(name):
+                packed, scales = mxfp4_quant(w)
+                p.copy_(torch.from_numpy(mxfp4_dequant(packed, scales)))
+            elif is_reqn(eng, name):
+                p.copy_(torch.from_numpy(bf16_roundtrip(w)))
+            # else: keep exact fp32 (reqw path)
+    return model
+
+
+def reference_model(seed: int = 1234):
+    """The torch model whose weights are the tiny checkpoint's bytes for this seed: what
+    tests import to compute a reference the checkpoint did not write (adaptive depth)."""
+    cfg, model = build(seed)
+    return cfg, to_shard_values(model)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
@@ -254,16 +278,7 @@ def main():
 
     # ---- transform the model's weights to exactly what the shards will hold, so
     # the torch forward is the TRUE answer for the bytes bin/k3 reads ----
-    with torch.no_grad():
-        for name, p in model.named_parameters():
-            w = p.detach().float().cpu().numpy()
-            eng = engine_name(name)
-            if is_expert(name):
-                packed, scales = mxfp4_quant(w)
-                p.copy_(torch.from_numpy(mxfp4_dequant(packed, scales)))
-            elif is_reqn(eng, name):
-                p.copy_(torch.from_numpy(bf16_roundtrip(w)))
-            # else: keep exact fp32 (reqw path)
+    to_shard_values(model)
 
     # ---- torch reference forward over the transformed weights ----
     with torch.no_grad():

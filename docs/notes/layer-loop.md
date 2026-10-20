@@ -1,4 +1,4 @@
-# Layer looping, `--loop-layers` (experimental; changes the model)
+# Layer looping, `--loop-layers` and adaptive depth (ON BY DEFAULT; changes the model)
 
 **Status:** plan and design written 2026-10-19 before any code; the status table at the end is updated as work lands.
 
@@ -13,8 +13,9 @@ off-by-default flag that re-runs a span of K3's existing layers per token, with 
 - **It is not** a looped model in the trained sense. Ouro and Huginn are trained so that every loop is meaningful; K3 was
   trained as one 93-layer stack. **The expected effect on quality is a loss**, and the size of that loss is unmeasured. This
   repository has no full checkpoint to measure it on.
-- **It is not the default and never changes a run that does not ask for it.** Without `--loop-layers`, every code path is
-  byte-identical to before. The existing gates prove that, and a `--loop-count 1` gate proves the flag's own identity path.
+- **It is the default** since Andrew's word of 2026-10-19 (below): the middle block loops adaptively unless a run passes
+  `--no-loop`. With `--no-loop` every code path is byte-identical to the released model; the existing gates prove that, and
+  a `--loop-count 1` gate proves the flag's own identity path. (Until that word it was off by default.)
 - **It is not faster.** Each extra pass over a span costs that span's trunk and expert bytes again.
 
 ## Semantics
@@ -39,19 +40,62 @@ Execution order per token: layers `0..B`, then `A..B` another `R-1` times, then 
 4. **Weights are shared, never copied.** The trunk binds the physical layer and the expert cache serves physical
    `(layer, expert)` keys. A repeated layer re-reads or re-hits the same bytes.
 
+## Adaptive depth, `--loop-exit EPS`, and the default
+
+Andrew, 2026-10-19, verbatim: *"Also find a way in the looped layers to make it like recursive depth or something. Also
+make all the changes default in Kimi k3"*. Asked what he meant, he chose **"Adaptive per-token depth"** and **"Default on
+now, unmeasured"** (over keeping it opt-in, and over defaulting only after a quality gate), with span **"One middle block,
+36-47"**, cap **"R max 4"** and exit **"Threshold 0.05"**. Recorded in j-research `workspace/loopcd/PLAN.md`. On
+2026-10-20, shown the cost (1 to 3 extra passes, short-context tokens slower than the original engine), he chose **"On, R
+max 2"**: the default's cap is 2. Pass 2 always runs, so at that cap no token exits early and the default is the fixed loop
+at count 2; per-token depth is `--loop-count 3` or more with `--loop-exit`.
+
+**Semantics.** With `--loop-layers A-B --loop-count R --loop-exit EPS`:
+
+1. Layers `0..B` run on every token (pass 1 of the span is the stack's own).
+2. Pass `p = 2..R` of `A..B` runs on the tokens still active. After pass `p`, token `t` stops if
+   `||h_p - h_(p-1)|| / ||h_(p-1)|| < EPS`, where `h_p` is its running block sum after the span's last layer in pass `p`
+   (what K3 passes between layers; the snapshot the next boundary takes), or if `p = R`. The norms are one double sum
+   each over the row in index order. Pass 2 always runs: the first comparison needs two passes, so a token runs 2 to R
+   passes.
+3. **Pass `p`'s layers see exactly the tokens that reached pass `p`, in order.** Its KDA recurrent state and ShortConv
+   history advance only on them, and its MLA cache holds only their rows, compactly. K3's MLA carries no position
+   encoding (the rope slot is unrotated), so a compact cache attends exactly as a sparse one would. This is
+   Mixture-of-Recursions' recursion-wise caching, without the router.
+4. Layers `B+1..N-1` run on every token, each with its own AttnRes stack height: a token that ran `r` passes has
+   `r` snapshots of the span's last block. `k3_decoder_layer_inc_logv` takes one block count per token; with every
+   count equal it computes exactly `k3_decoder_layer_inc_log`'s floats.
+
+`EPS = 0` never stops early, so it is the fixed loop at count `R`, bit for bit; an `EPS` no change can reach stops every
+token after pass 2, the fixed loop at count 2. Batched prompts work: a pass gathers its active rows in order, runs, and
+scatters them back. Full recompute, incremental decode and every supported mode make the same decisions on the same
+floats, so they stay bit-identical to each other.
+
+**The default.** With no loop flag the CLI runs `--loop-layers` on the AttnRes block holding layer `N/2` of the bound
+stack (36-47 on K3; 6-8 on the 13-layer tiny model), `--loop-count 2 --loop-exit 0.05`, which is `--loop-count 2` bit
+for bit. `--no-loop` is the released
+model. The default refuses the modes the loop's gates do not yet cover and says to pass `--no-loop`. Every gate that
+holds the released model to its reference now passes `--no-loop`; `tests/test_loop_adaptive.py` gates the default.
+
+**Cost.** The default's 2 passes of a 12-layer block: 13% more layers per token (2 to 4 passes at `--loop-count 4`: 13% to
+39%), with their trunk and expert bytes. No
+quality measurement exists; K3 was not trained to repeat layers.
+
 ## Modes
 
-| mode | with `--loop-layers` | why |
+Every mode runs the loop, fixed or adaptive, and is held bit-identical to looped full recompute (or, for `--spec` and
+`--draft-trunk`, to looped serial decode):
+
+| mode | what the loop needed there | gate |
 |---|---|---|
-| full recompute, `--incremental`, `--kv-latent`, `--mla-split` | supported, gated | the per-executed-layer state/cache slots are the whole design |
-| `--trunk` ring and pinning, `--stream-lm-head`, `--expert-pipeline`, `--expert-profile`/`--pin-experts` | supported, gated | bind/prefetch/cache take any layer order; the prefetch hint follows the executed order |
-| `--score-prompt` | supported | the way to measure what looping does to perplexity on a real checkpoint |
-| `--layers N` | supported if the span lies inside the first `N` layers | |
-| `--spec`, `--draft-trunk` | **refused** | the rollback log is per physical KDA layer; extending it is future work |
-| `--save-state`, `--load-state` | **refused** | a saved state's slot layout would silently differ |
-| `--trunk-rows`, `--kvb-cache` | **refused** | the row pipeline is not covered by these gates |
-| `--ultra-low-memory` | **refused** | not covered by these gates |
-| `--dump-cache-trace`, `--tf-check` | **refused** | the trace would double-count repeated layers; tf-check is not covered |
+| full recompute, `--incremental`, `--kv-latent`, `--mla-split` | per-executed-position KDA slots and MLA rows; under adaptive depth, per-pass compact MLA rows (`loop_pcached`) | `test_layer_loop.py`, `test_loop_adaptive.py` mode parity |
+| `--trunk` ring and pinning, `--stream-lm-head`, `--expert-pipeline`, `--expert-profile`/`--pin-experts` | nothing: bind, prefetch and cache take any layer order; a hint for a pass that adaptive depth then skips is wasted, never wrong | mode parity |
+| `--trunk-rows`, `--kvb-cache`, `--ultra-low-memory` | nothing: rows bind on demand; ultra reuses one state slot because each executed position runs once per forward | `test_streaming_row_and_low_memory_modes_at_mixed_depths` |
+| `--spec`, `--draft-trunk` | a KDA rollback log per executed KDA position; under adaptive depth, a sweep commits to pass `p` only the kept positions that reached it, and cuts pass `p`'s MLA row count back the same way. The draft proposes unlooped; the looped model verifies | `test_spec_is_serial_decode_at_mixed_depths`, `test_draft_trunk_is_serial_decode_at_mixed_depths` |
+| `--save-state`, `--load-state` | state version 2: the loop record (span, count, exit, slots), each pass's cached count and each position's passes; a state is refused by a run under another loop; a state saved after `--spec` is the serial state byte for byte | `test_state_round_trips_under_the_loop_and_spec_saves_the_serial_state` |
+| `--tf-check`, `--score-prompt` | nothing beyond forward | `test_tf_check_counts_the_reference_agreement` (against the torch reference), `test_score_prompt_reports_the_adaptive_loop` |
+| `--dump-cache-trace` | records requests in executed order, repeats included. `tools/expert_profile.py` parses only unlooped prefix traces and rejects a looped one by its own validation; calibrate profiles with `--no-loop` | `test_cache_trace_records_the_executed_order` |
+| `--layers N` | the span must lie inside the first `N` layers; the default takes the middle block of the `N` | refusal and default tests |
 
 ## Gates (each must be able to fail)
 
@@ -78,6 +122,29 @@ it says nothing about whether the looped stack is any good.
 | engine (`src/cli/k3_run.c`, `k3_attn_res_stride()` in `include/k3/k3.h`) | built |
 | reference (`tools/k3_ref.py` `loop_order`, `tools/make_tiny_checkpoint.py --loop`) | built |
 | gates (`tests/test_layer_loop.py`, 7 tests; `make test` loop-layers contract; CI step in `offline-storage.yml`) | passing |
+| adaptive depth, the default loop, every mode (`--loop-exit`, `--no-loop`, `k3_decoder_layer_inc_logv`, `forward_adaptive`, state version 2, per-executed-position `--spec` logs) | built; `tests/test_loop_adaptive.py`, 15 tests, passing, and under ASan + UBSan |
+
+Adaptive depth and the default, measured on the tiny model, 2026-10-20, Linux x86-64, gcc 13.3:
+
+- **Identities:** `--loop-exit 0` is the fixed loop and `--loop-exit 1e300` the fixed loop at 2, bit for bit, in full
+  recompute, incremental and `--kv-latent`.
+- **Reference:** at an EPS chosen to split the 14-token prompt between depths (and checked to sit at least 2 % away from
+  every change the run measures), per-position depth equals `forward_adaptive`'s exactly on spans 3-5 x4, 3-8 x3 and
+  12-12 x4; per-pass changes agree to 1.4e-6 relative on 3-5 (under 1e-4 on all); last-position logits are inside the
+  6.8e-5 yardstick; 3-token greedy continuations match. The plant (every token at full depth) misses the reference's
+  changes by 2.2e-3 on 3-5, 1,500 times the real run's gap.
+- **Modes:** at mixed depths, incremental, `--kv-latent`, `--mla-split 2`, streamed trunk, `--stream-lm-head`,
+  `--expert-pipeline`, `--trunk-rows`, `--kvb-cache active` and `pin`, `--ultra-low-memory` are bit-identical to full
+  recompute; `--spec 3` and `--draft-trunk` are serial decode bit for bit, with drafts proposed and accepted; a state
+  saved after `--spec` is the serial state byte for byte and resumes as one uninterrupted run; a state is refused under
+  another loop; `--tf-check` counts the torch reference's agreement; the cache trace lists layers in executed order.
+- **Default:** no flag is `--loop-layers 6-8 --loop-count 2 --loop-exit 0.05` and `--loop-count 2` on the tiny model, bit
+  for bit; `--no-loop`
+  is `--loop-count 1`; the offline CLI, kv_b cache, MLA split, quality and expert-profile suites pass with `--no-loop`.
+- **Plants, each reverted:** stopped tokens run in later passes (`K3_LOOP_MUTANT_NO_COMPACT`): caught by the reference;
+  every post-span token reading token 0's block count: 12 parity failures; a sweep committing every position to every
+  pass: `--spec` and state gates; a state that drops each pass's cached count: state gates; a stale change reference:
+  the reference.
 
 Measured on the tiny model (13 layers, blocks of 3), 2026-10-19, Linux x86-64, gcc 13.3:
 

@@ -67,9 +67,13 @@ class OfflineCliTests(unittest.TestCase):
         self.counter += 1
         out = self.path / (str(self.counter) + ".json")
         logits = self.path / (str(self.counter) + ".f32")
+        # These gates hold the RELEASED model's modes to each other and to its reference,
+        # so they ask for it: the CLI's default is the adaptive layer loop
+        # (docs/notes/layer-loop.md), which tests/test_loop_adaptive.py gates.
+        released = [] if any(str(a).startswith("--loop") or a == "--no-loop" for a in args) else ["--no-loop"]
         result = subprocess.run([str(self.binary), str(model), "--gen", "2",
                                  "--cache-gb", "0.0001", "--out", str(out),
-                                 "--dump-logits", str(logits), *map(str, args)],
+                                 "--dump-logits", str(logits), *released, *map(str, args)],
                                 text=True, errors="replace", capture_output=True,
                                 env={**self.env, **(env or {})}, timeout=60)
         if not ok:
@@ -261,7 +265,7 @@ class OfflineCliTests(unittest.TestCase):
             with self.subTest(rows=rows):
                 out = self.path / ("more%d.json" % len(rows))
                 result = subprocess.run(
-                    [str(self.binary), str(self.packed), "--config", str(path), "--ids",
+                    [str(self.binary), str(self.packed), "--no-loop", "--config", str(path), "--ids",
                      "1,2,3", "--gen", "1", "--cache-gb", "0.0001", "--trunk",
                      str(self.trunk), "--trunk-gb", "0.001", *rows, "--out", str(out)],
                     text=True, errors="replace", capture_output=True, env=self.env,
@@ -278,7 +282,7 @@ class OfflineCliTests(unittest.TestCase):
         # overlap claim it did not measure.
         out = self.path / "rows-report.json"
         result = subprocess.run(
-            [str(self.binary), str(self.packed), "--ids", "1,2,3", "--gen", "2",
+            [str(self.binary), str(self.packed), "--no-loop", "--ids", "1,2,3", "--gen", "2",
              "--cache-gb", "0.0001", "--trunk", str(self.trunk), "--trunk-gb", "0.001",
              "--trunk-rows", "--out", str(out)],
             text=True, errors="replace", capture_output=True, env=self.env, timeout=60)
@@ -294,7 +298,7 @@ class OfflineCliTests(unittest.TestCase):
         cap = 64 << 20
         output, logits = self.path / "rows.json", self.path / "rows.f32"
         limits = self.path / "rows-cgroup.json"
-        command = [str(self.binary), str(self.selective), "--ids", "3,7,11", "--gen", "2",
+        command = [str(self.binary), str(self.selective), "--no-loop", "--ids", "3,7,11", "--gen", "2",
                    "--incremental", "--cache-gb", "0.0001", "--trunk", str(self.ztrunk),
                    "--trunk-gb", "0.00005", "--trunk-rows", "--out", str(output),
                    "--dump-logits", str(logits)]
@@ -330,7 +334,7 @@ class OfflineCliTests(unittest.TestCase):
                           + (maximum - logits[ids[position]]))
         for first in (1, 2):
             output = self.path / f"score-{first}.json"
-            process = subprocess.run([str(self.binary), str(self.packed), "--score-prompt",
+            process = subprocess.run([str(self.binary), str(self.packed), "--no-loop", "--score-prompt",
                                       "--ids", ",".join(map(str, ids)), "--score-start", str(first),
                                       "--trunk", str(self.ztrunk), "--trunk-gb", "0.001",
                                       "--cache-gb", "0.0001", "--out", str(output)],
@@ -363,7 +367,7 @@ class OfflineCliTests(unittest.TestCase):
         """A --score-prompt or --tf-check run: (its JSON, its stdout)."""
         self.counter += 1
         out = self.path / ("tf%d.json" % self.counter)
-        process = subprocess.run([str(self.binary), str(model), "--cache-gb", "0.0001",
+        process = subprocess.run([str(self.binary), str(model), "--no-loop", "--cache-gb", "0.0001",
                                   "--out", str(out), *map(str, args)],
                                  capture_output=True, text=True, errors="replace",
                                  env=self.env, timeout=60)
@@ -471,7 +475,7 @@ class OfflineCliTests(unittest.TestCase):
             self.counter += 1
             out = self.path / ("wide%d.json" % self.counter)
             dump = self.path / ("wide%d.f32" % self.counter)
-            process = subprocess.run([str(self.binary), str(model), "--cache-gb", "0.0001",
+            process = subprocess.run([str(self.binary), str(model), "--no-loop", "--cache-gb", "0.0001",
                                       "--out", str(out), "--dump-all-logits", str(dump),
                                       *map(str, args)], capture_output=True, text=True,
                                      errors="replace", env=self.env, timeout=120)
@@ -513,7 +517,7 @@ class OfflineCliTests(unittest.TestCase):
         def score(first, n, head):
             self.counter += 1
             out = self.path / ("wscore%d.json" % self.counter)
-            process = subprocess.run([str(self.binary), str(model), "--score-prompt",
+            process = subprocess.run([str(self.binary), str(model), "--no-loop", "--score-prompt",
                                       "--ids", ",".join(map(str, ids20[:n])),
                                       "--score-start", str(first), "--cache-gb", "0.0001",
                                       "--trunk", str(self.trunk), "--trunk-gb", "0.01",
@@ -580,7 +584,7 @@ class OfflineCliTests(unittest.TestCase):
             output = self.path / (arm + ".json")
             raw_logits = self.path / (arm + ".f32")
             limits = self.path / (arm + "-cgroup.json")
-            command = [str(self.binary), str(model), "--ids", "3,7,11", "--gen", "2",
+            command = [str(self.binary), str(model), "--no-loop", "--ids", "3,7,11", "--gen", "2",
                        "--cache-gb", "0.0001", "--trunk", str(self.trunk),
                        "--trunk-gb", f"{budget / 1e9:.9f}", "--out", str(output),
                        "--dump-logits", str(raw_logits)]

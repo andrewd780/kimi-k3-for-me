@@ -77,6 +77,7 @@ NOT IMPLEMENTED, deliberately
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 import torch
 import torch.nn as nn
@@ -505,6 +506,127 @@ class K3Model(nn.Module):
             logits, _ = self.forward(out, order=order)
             out = torch.cat([out, logits[:, -1].argmax(-1, keepdim=True)], dim=1)
         return out
+
+
+def apply_attn_res_masked(prefix_sum, block_residual, count, proj_w, norm_w, eps):
+    """apply_attn_res where token t's stack holds only its first count[t] snapshots: the
+    rest are padding, masked out of the softmax. With every count equal to the stack's
+    height it is apply_attn_res."""
+    _, n, _ = block_residual.shape
+    v = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1).float()
+    k = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+    scores = (k * (norm_w.float() * proj_w.float())).sum(-1)
+    keep = torch.arange(n + 1).unsqueeze(0) < count.unsqueeze(1)
+    keep[:, n] = True                                           # the prefix always counts
+    scores = scores.masked_fill(~keep, float("-inf"))
+    probs = scores.softmax(-1).unsqueeze(1)
+    return torch.matmul(probs, v).squeeze(1).to(prefix_sum.dtype)
+
+
+def layer_forward_counts(layer, h, br, count):
+    """DecoderLayer.forward with a block count per token (count[t] valid snapshots in
+    br[t]): the stack heights differ once tokens have stopped looping at different
+    passes. A boundary appends each token's prefix at its own count."""
+    _, T, E = h.shape
+    c, eps = layer.c, layer.c.rms_norm_eps
+    prefix_sum = h
+    has = count > 0
+    if bool(has.any()):
+        agg = apply_attn_res_masked(prefix_sum.view(-1, E), br, count,
+                                    layer.self_attention_res_proj.weight.squeeze(0),
+                                    layer.self_attention_res_norm.weight, eps).view(1, T, E)
+        h = torch.where(has.view(1, T, 1), agg, h)
+    if layer.idx % c.attn_res_block_size == 0:
+        need = int(count.max()) + 1
+        if br.shape[1] < need:
+            br = torch.cat([br, br.new_zeros(T, need - br.shape[1], E)], dim=1)
+        br = br.clone()
+        br[torch.arange(T), count] = prefix_sum.view(-1, E)
+        count = count + 1
+        prefix_sum = None
+    h = layer.input_layernorm(h)
+    h, _ = layer.self_attn(h, None)
+    prefix_sum = h if prefix_sum is None else prefix_sum + h
+    h = apply_attn_res_masked(prefix_sum.view(-1, E), br, count,
+                              layer.mlp_res_proj.weight.squeeze(0),
+                              layer.mlp_res_norm.weight, eps).view(1, T, E)
+    h = layer.post_attention_layernorm(h)
+    h = layer.mlp(h)
+    prefix_sum = h if prefix_sum is None else prefix_sum + h
+    return prefix_sum, br, count
+
+
+@torch.no_grad()
+def forward_adaptive(model, ids, a: int, b: int, rmax: int, exit_eps: float):
+    """bin/k3 --loop-layers a-b --loop-count rmax --loop-exit exit_eps
+    (docs/notes/layer-loop.md, adaptive depth), written from the semantics, not from the
+    engine: layers 0..b run on every token; pass p = 2..rmax of a..b runs on the tokens
+    still active, AS A SEQUENCE OF ITS OWN (fresh state, so its KDA recurrence and MLA
+    attention see exactly the tokens that reached pass p, in order); a token stops after
+    pass p once ||h_p - h_(p-1)|| / ||h_(p-1)|| < exit_eps, h_p its running block sum after
+    the span's last layer in pass p, or at rmax; layers b+1.. run on every token with its
+    own stack height. Returns (logits [T, vocab], passes [T], changes: per token, the
+    change after each pass from the second on)."""
+    c = model.c
+    loop_order(c.num_hidden_layers, c.attn_res_block_size, a, b, rmax)   # same refusals
+    ids = torch.as_tensor(ids).view(1, -1)
+    T = ids.shape[1]
+    h = model.embed_tokens(ids)
+    br = h.new_zeros(T, 0, c.hidden_size)
+    for i in range(b + 1):
+        h, br, _ = model.layers[i](h, br, None)
+    count = torch.full((T,), br.shape[1], dtype=torch.long)
+    prev = h[0].double().clone()
+    passes = [1] * T
+    changes = [[] for _ in range(T)]
+    active = list(range(T)) if rmax > 1 else []
+    for p in range(2, rmax + 1):
+        if not active:
+            break
+        idx = torch.tensor(active)
+        n = int(count[idx[0]])
+        hs, bs = h[:, idx], br[idx, :n]
+        for i in range(a, b + 1):
+            hs, bs, _ = model.layers[i](hs, bs, None)
+        nn_ = bs.shape[1]
+        if br.shape[1] < nn_:
+            br = torch.cat([br, br.new_zeros(T, nn_ - br.shape[1], c.hidden_size)], dim=1)
+        br = br.clone()
+        br[idx, :nn_] = bs
+        h = h.clone()
+        h[:, idx] = hs
+        count[idx] = nn_
+        still = []
+        for j, t in enumerate(active):
+            new = hs[0, j].double()
+            old = prev[t]
+            dd, oo = float(((new - old) ** 2).sum()), float((old ** 2).sum())
+            d = math.sqrt(dd / oo) if oo > 0 else (math.inf if dd > 0 else 0.0)
+            changes[t].append(d)
+            passes[t] = p
+            prev[t] = new
+            if not (d < exit_eps or p == rmax):
+                still.append(t)
+        active = still
+    for i in range(b + 1, c.num_hidden_layers):
+        h, br, count = layer_forward_counts(model.layers[i], h, br, count)
+    E = c.hidden_size
+    h = apply_attn_res_masked(h.view(-1, E), br, count,
+                              model.output_attn_res_proj.weight.squeeze(0),
+                              model.output_attn_res_norm.weight,
+                              c.rms_norm_eps).view(1, T, E)
+    return model.lm_head(model.norm(h))[0], passes, changes
+
+
+@torch.no_grad()
+def greedy_adaptive(model, ids, n_new: int, a: int, b: int, rmax: int, exit_eps: float):
+    """Greedy continuation under forward_adaptive, re-forwarding the whole sequence each
+    step, as K3Model.greedy does."""
+    out = list(ids)
+    for _ in range(n_new):
+        logits, _, _ = forward_adaptive(model, out, a, b, rmax, exit_eps)
+        out.append(int(logits[-1].argmax()))
+    return out[len(ids):]
 
 
 def loop_order(n_layers: int, block: int, a: int, b: int, count: int) -> list[int]:

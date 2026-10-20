@@ -2301,15 +2301,21 @@ void k3_decoder_layer_inc(float *h, float *block_residual, int *n_blocks,
 
 /* kda_log reaches only the KDA module; see K3KdaLog. Everything else in the layer is
  * per token (norms, AttnRes, the MoE) or positional (the MLA cache), so the log is the
- * only thing a speculative rollback needs from here. */
-void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
-                              const K3LayerW *w, const K3Cfg *c, int layer_idx,
-                              int T, float *state, float *scratch,
-                              float *kvc, float *ropec, int cached, int cap, int kv_latent,
-                              const K3KdaLog *kda_log)
+ * only thing a speculative rollback needs from here.
+ *
+ * Token t's block count is nbv[t * nbs]: nbs == 0 is one count shared by every token
+ * (incremented once at a boundary), nbs == 1 one per token (each incremented). The loops
+ * below are per token either way, so the two forms compute the same floats when the
+ * counts agree. */
+static void k3_decoder_layer_core(float *h, float *block_residual, int *nbv, int nbs,
+                                  const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                                  int T, float *state, float *scratch,
+                                  float *kvc, float *ropec, int cached, int cap,
+                                  int kv_latent, const K3KdaLog *kda_log)
 {
     const int E = c->hidden;
     const int maxb = k3_attn_res_stride(c);
+    #define K3_NB(t) nbv[(size_t)(t) * (size_t)nbs]
 
     float *pref   = scratch;                    /* [T][E] the running residual   */
     float *tmp    = pref + (size_t)T * E;       /* [T][E] module output          */
@@ -2331,24 +2337,25 @@ void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
     int have_prefix = 1;                        /* mirrors "prefix_sum is not None" */
 
     /* aggregation before attention, only when snapshots already exist */
-    if (*n_blocks > 0) {
-        for (int t = 0; t < T; t++) {
-            for (int b = 0; b < *n_blocks; b++)
-                memcpy(src + (size_t)b * E,
-                       block_residual + ((size_t)t * maxb + b) * E,
-                       (size_t)E * sizeof(float));
-            memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
+    for (int t = 0; t < T; t++) {
+        const int nb = K3_NB(t);
+        if (nb <= 0) continue;
+        for (int b = 0; b < nb; b++)
+            memcpy(src + (size_t)b * E,
+                   block_residual + ((size_t)t * maxb + b) * E,
                    (size_t)E * sizeof(float));
-            k3_attn_res(h + (size_t)t * E, src, foldA, *n_blocks + 1, E, c->rms_eps);
-        }
+        memcpy(src + (size_t)nb * E, pref + (size_t)t * E,
+               (size_t)E * sizeof(float));
+        k3_attn_res(h + (size_t)t * E, src, foldA, nb + 1, E, c->rms_eps);
     }
 
     /* block boundary: snapshot the running residual, then CLEAR it */
     if (layer_idx % c->attn_res_block == 0) {
         for (int t = 0; t < T; t++)
-            memcpy(block_residual + ((size_t)t * maxb + *n_blocks) * E,
+            memcpy(block_residual + ((size_t)t * maxb + K3_NB(t)) * E,
                    pref + (size_t)t * E, (size_t)E * sizeof(float));
-        (*n_blocks)++;
+        if (nbs == 0) nbv[0]++;
+        else for (int t = 0; t < T; t++) nbv[t]++;
         have_prefix = 0;
     }
 
@@ -2364,13 +2371,14 @@ void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
 
     /* aggregation before the MLP. NO emptiness guard in the reference. */
     for (int t = 0; t < T; t++) {
-        for (int b = 0; b < *n_blocks; b++)
+        const int nb = K3_NB(t);
+        for (int b = 0; b < nb; b++)
             memcpy(src + (size_t)b * E,
                    block_residual + ((size_t)t * maxb + b) * E,
                    (size_t)E * sizeof(float));
-        memcpy(src + (size_t)(*n_blocks) * E, pref + (size_t)t * E,
+        memcpy(src + (size_t)nb * E, pref + (size_t)t * E,
                (size_t)E * sizeof(float));
-        k3_attn_res(h + (size_t)t * E, src, foldM, *n_blocks + 1, E, c->rms_eps);
+        k3_attn_res(h + (size_t)t * E, src, foldM, nb + 1, E, c->rms_eps);
     }
 
     for (int t = 0; t < T; t++)
@@ -2405,6 +2413,27 @@ void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
 
     for (size_t i = 0; i < (size_t)T * E; i++) pref[i] += tmp[i];
     memcpy(h, pref, (size_t)T * E * sizeof(float));
+    #undef K3_NB
+}
+
+void k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
+                              const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                              int T, float *state, float *scratch,
+                              float *kvc, float *ropec, int cached, int cap, int kv_latent,
+                              const K3KdaLog *kda_log)
+{
+    k3_decoder_layer_core(h, block_residual, n_blocks, 0, w, c, layer_idx, T, state,
+                          scratch, kvc, ropec, cached, cap, kv_latent, kda_log);
+}
+
+void k3_decoder_layer_inc_logv(float *h, float *block_residual, int *n_blocks,
+                               const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                               int T, float *state, float *scratch,
+                               float *kvc, float *ropec, int cached, int cap, int kv_latent,
+                               const K3KdaLog *kda_log)
+{
+    k3_decoder_layer_core(h, block_residual, n_blocks, 1, w, c, layer_idx, T, state,
+                          scratch, kvc, ropec, cached, cap, kv_latent, kda_log);
 }
 
 void k3_decoder_layer(float *h, float *block_residual, int *n_blocks,

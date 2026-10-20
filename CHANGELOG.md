@@ -5,7 +5,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The CLI now runs an adaptive layer loop BY DEFAULT, which changes the model** (Andrew's call, 2026-10-19: "Default on
+  now, unmeasured"; 2026-10-20: "On, R max 2"). With no loop flag, the AttnRes block holding the middle layer (36-47 on
+  K3) runs twice per token (at most 2 passes at exit 0.05; the exit compares two passes, so every token runs both). K3
+  was not trained for this and no quality measurement exists; it costs 13% more layers per token. Per-token depth is
+  `--loop-count 3` or more with `--loop-exit`. **`--no-loop` runs the released model**,
+  byte-identical to before; every gate that holds the released model to its reference now passes it.
+
 ### Added
+
+- **Adaptive loop depth, `--loop-exit EPS`** (with `--loop-layers A-B --loop-count R`): passes 2..R of the span run
+  only on the tokens still active, and pass p's layers see exactly the tokens that reached pass p (KDA state and a
+  compact MLA cache per pass, Mixture-of-Recursions style, without a router). `k3_decoder_layer_inc_logv` takes one
+  AttnRes block count per token. `EPS 0` is the fixed loop and an unreachable EPS the fixed loop at 2, bit for bit;
+  mixed depths match an independent torch implementation (`tools/k3_ref.py` `forward_adaptive`) in per-position
+  depth and in logits; every mode is bit-identical to looped full recompute; a no-compaction mutant
+  (`K3_LOOP_MUTANT_NO_COMPACT`, test builds only) is caught. Gated by `tests/test_loop_adaptive.py`.
+- **The loop runs in every mode**: `--spec` and `--draft-trunk` (a rollback log per executed KDA position, per-pass
+  commits), `--save-state`/`--load-state` (state version 2 carries the loop; a state is refused under another loop;
+  version 1 files load as unlooped), `--trunk-rows`, `--kvb-cache`, `--ultra-low-memory`, `--tf-check`,
+  `--dump-cache-trace` (executed order). None of them is refused any more.
 
 - **Experimental layer looping, `--loop-layers A-B` / `--loop-count R`** (off by default;
   changes the model). Runs a span of whole AttnRes blocks R times per token, as if the
