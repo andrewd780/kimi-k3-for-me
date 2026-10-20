@@ -311,9 +311,11 @@ int main(int argc, char **argv)
     float *h = f32s(E, 1.0f), *h0 = (float *)xmalloc(E * sizeof(float));
     memcpy(h0, h, E * sizeof(float));
     float *br = f32s((size_t)maxb * E, 1.0f);
-    size_t ns = k3_layer_scratch(&c, 1);
-    const size_t nm = k3_mla_scratch_cached(&c, 1, cap, 1, 0);
-    if (nm > ns) ns = nm;
+    /* A layer call puts its MLA scratch AFTER the layer's own rows (k3_decoder_layer_inc),
+     * so the cached call inside it needs the layer's scratch PLUS the cached MLA scratch at
+     * this cache's capacity; max() of the two, as an earlier version took, overran the
+     * buffer from C = 1,024 up (an ASan heap-buffer-overflow). */
+    const size_t ns = k3_layer_scratch(&c, 1) + k3_mla_scratch_cached(&c, 1, cap, 1, 0);
     float *sc = (float *)xmalloc(ns * sizeof(float));
     float *lg = (float *)xmalloc((size_t)c.vocab * sizeof(float));
     float *xin = f32s(E, 1.0f), *yo = (float *)xmalloc(E * sizeof(float));
