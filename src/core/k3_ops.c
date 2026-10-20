@@ -44,6 +44,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #if defined(__AVX2__)
 #include <immintrin.h>
@@ -1284,67 +1287,87 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * accumulators, on one thread and on all of them. */
     if (!lat) {
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel
 #endif
-        for (int h = 0; h < H; h++) {
-            float *const scb = sc + (size_t)h * qb * (last + 1);
+        {
+            /* Each thread owns a contiguous range of heads, as schedule(static) would give it,
+             * and walks positions OUTSIDE its heads: one position's rows for those heads are one
+             * contiguous run of the cache, read front to back, rather than one row per position
+             * stride per head. */
+            int nth = 1, tid = 0;
+    #ifdef _OPENMP
+            nth = omp_get_num_threads();
+            tid = omp_get_thread_num();
+    #endif
+            const int hq = H / nth, hr = H % nth;
+            const int hlo = tid * hq + (tid < hr ? tid : hr), hhi = hlo + hq + (tid < hr ? 1 : 0);
             for (int t0 = 0; t0 < T; t0 += qb) {
                 const int nb = T - t0 < qb ? T - t0 : qb;
-                const int pl = cached + t0 + nb - 1;     /* the last position the block sees */
+                const int pl = cached + t0 + nb - 1;         /* the last position the block sees */
                 /* Scores, positions in groups of four; query t sees position s iff
                  * s <= cached + t. A group's missing lanes point at its first position and
                  * are never stored. */
                 for (int s0 = 0; s0 <= pl; s0 += 4) {
                     const int g = pl + 1 - s0 < 4 ? pl + 1 - s0 : 4;
-                    const float *ks[4], *kr[4];
-                    for (int b = 0; b < 4; b++) {
-                        const int s = s0 + (b < g ? b : 0);
-                        ks[b] = K3_KV_AT(s) + (size_t)h * kvd;
-                        kr[b] = K3_ROPE_AT(s);           /* shared slot */
-                    }
-                    for (int t = (s0 - cached > t0 ? s0 - cached : t0); t < t0 + nb; t++) {
-                        const float *qt = q + ((size_t)t * H + h) * qh;
-                        const int vis = cached + t + 1 - s0;   /* >= 1 here */
-                        float *r = scb + (size_t)(t - t0) * (last + 1) + s0;
-                        if (g == 4 && vis >= 4) {
-                            double d[4];
-                            k3_mla_dot4(d, qt, ks, kr, qn, qr);
-                            for (int b = 0; b < 4; b++) r[b] = (float)d[b] * scale;
-                        } else {
-                            const int e = g < vis ? g : vis;
-                            for (int b = 0; b < e; b++)
-                                r[b] = (float)k3_mla_dot(qt, ks[b], kr[b], qn, qr) * scale;
+                    for (int h = hlo; h < hhi; h++) {
+                        float *const scb = sc + (size_t)h * qb * (last + 1);
+                        const float *ks[4], *kr[4];
+                        for (int b = 0; b < 4; b++) {
+                            const int s = s0 + (b < g ? b : 0);
+                            ks[b] = K3_KV_AT(s) + (size_t)h * kvd;
+                            kr[b] = K3_ROPE_AT(s);           /* shared slot */
+                        }
+                        for (int t = (s0 - cached > t0 ? s0 - cached : t0); t < t0 + nb; t++) {
+                            const float *qt = q + ((size_t)t * H + h) * qh;
+                            const int vis = cached + t + 1 - s0;   /* >= 1 here */
+                            float *r = scb + (size_t)(t - t0) * (last + 1) + s0;
+                            if (g == 4 && vis >= 4) {
+                                double d[4];
+                                k3_mla_dot4(d, qt, ks, kr, qn, qr);
+                                for (int b = 0; b < 4; b++) r[b] = (float)d[b] * scale;
+                            } else {
+                                const int e = g < vis ? g : vis;
+                                for (int b = 0; b < e; b++)
+                                    r[b] = (float)k3_mla_dot(qt, ks[b], kr[b], qn, qr) * scale;
+                            }
                         }
                     }
                 }
-                /* Softmax per query row, s ascending in every sweep. */
-                for (int t = t0; t < t0 + nb; t++) {
-                    const int p = cached + t;
-                    float *sh = scb + (size_t)(t - t0) * (last + 1);
-                    const size_t row = (size_t)t * H + h;      /* trace row (t, h) */
-                    if (tr && tr->scores)
-                        memcpy(tr->scores + row * tr->n, sh, (size_t)(p + 1) * sizeof(float));
-                    float m = -INFINITY;
-                    for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
-                    double z = 0.0;
-                    for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
-                    if (tr && tr->z) tr->z[row] = z;
-                    double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
-                    for (int s = 0; s <= p; s++) {
-                        const double pq = sh[s] / z;
-                        if (qrow) qrow[s] = pq;
-                        sh[s] = (float)pq;
+                /* Softmax per (query, head) row, s ascending in every sweep. */
+                for (int h = hlo; h < hhi; h++) {
+                    float *const scb = sc + (size_t)h * qb * (last + 1);
+                    for (int t = t0; t < t0 + nb; t++) {
+                        const int p = cached + t;
+                        float *sh = scb + (size_t)(t - t0) * (last + 1);
+                        const size_t row = (size_t)t * H + h;      /* trace row (t, h) */
+                        if (tr && tr->scores)
+                            memcpy(tr->scores + row * tr->n, sh, (size_t)(p + 1) * sizeof(float));
+                        float m = -INFINITY;
+                        for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
+                        double z = 0.0;
+                        for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
+                        if (tr && tr->z) tr->z[row] = z;
+                        double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
+                        for (int s = 0; s <= p; s++) {
+                            const double pq = sh[s] / z;
+                            if (qrow) qrow[s] = pq;
+                            sh[s] = (float)pq;
+                        }
+                        float *o = acc + row * vh;
+                        for (int j = 0; j < vh; j++) o[j] = 0.0f;
                     }
-                    float *o = acc + row * vh;
-                    for (int j = 0; j < vh; j++) o[j] = 0.0f;
                 }
-                /* Values, positions ascending, each value row read once for the block. */
+                /* Values, positions ascending, each value row read once for the block; per
+                 * (query, head, j) the terms still arrive s ascending. */
                 for (int s = 0; s <= pl; s++) {
-                    const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
-                    for (int t = (s - cached > t0 ? s - cached : t0); t < t0 + nb; t++) {
-                        const float pr = scb[(size_t)(t - t0) * (last + 1) + s];
-                        float *o = acc + ((size_t)t * H + h) * vh;
-                        for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+                    for (int h = hlo; h < hhi; h++) {
+                        const float *scb = sc + (size_t)h * qb * (last + 1);
+                        const float *vs = K3_KV_AT(s) + (size_t)h * kvd + qn;
+                        for (int t = (s - cached > t0 ? s - cached : t0); t < t0 + nb; t++) {
+                            const float pr = scb[(size_t)(t - t0) * (last + 1) + s];
+                            float *o = acc + ((size_t)t * H + h) * vh;
+                            for (int j = 0; j < vh; j++) o[j] += pr * vs[j];
+                        }
                     }
                 }
             }
