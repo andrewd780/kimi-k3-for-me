@@ -76,8 +76,8 @@ other layout is refused by name instead of being read at the wrong stride.
 The rebuild costs one `kv_b` matmul's worth, 512 x 24,576 multiply-adds, per cached
 position per query token per layer. That is what makes the exact latent cache slow at
 long context: measured at K3's shapes on a 4-vCPU AVX-512 box, one MLA layer for one
-answer token took 0.66 s at 1,024 cached positions and 4.6 s at 8,192 (pilot of
-j-research `k3/DIAG-2026-10-20-absorb.md`).
+answer token took 0.68 s at 1,024 cached positions and 81.5 s at 131,072 (j-research
+findings/115, pre-registered in `k3/DIAG-2026-10-20-absorb.md`).
 
 `--kv-latent --mla-absorb` uses the algebra DeepSeek's MLA was designed for. With
 `W_uk[h]` and `W_uv[h]` head h's key and value rows of `kv_b`:
@@ -86,13 +86,15 @@ j-research `k3/DIAG-2026-10-20-absorb.md`).
     out[h]      = W_uv[h] (sum_s p[h][s] c_s)
 
 so `kv_b` is applied twice per query, not twice per cached position: about 96 x
-(576 + 512) multiply-adds per cached position per layer, about 1,000x fewer. At 8,192
-positions the same call took 0.057 s.
+(576 + 512) multiply-adds per cached position per layer, about 1,000x fewer. The same
+call took 0.024 s at 1,024 positions and 0.68 s at 131,072: 29x to 119x faster, about
+22 s an answer word at 128K (derived) against about 33 minutes.
 
 It is the same function in another floating-point order: the exact paths round k and v
 to float per position before scoring and weighting them, the absorbed form never forms
 them. Its logits therefore differ from the exact layouts by rounding: 4.7e-7 relative on
-the tiny model, 2.2e-6 on one MLA layer's output at K3's shapes and 8,192 positions.
+the tiny model; one MLA layer's output at K3's shapes differs by 8e-7 (relative L2) at
+1,024 positions, growing about as the square root of the context to 8e-6 at 131,072.
 That is why it is a flag and not a replacement. What is held exactly:
 
 - `tests/unit/test_mla_variants.c` check 10: the engine's absorbed form is the

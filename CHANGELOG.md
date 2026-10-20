@@ -10,7 +10,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`--mla-absorb`: absorbed attention over the latent cache (opt-in; rounding-level differences).** With
   `--kv-latent`, each query is scored against the cached latents through `kv_b`'s key rows once and weighted through
   its value rows once, instead of rebuilding k and v for every cached position for every query: one MLA layer for
-  one answer token at K3's shapes took 0.057 s at 8,192 cached positions against 4.6 s exactly (pilot). Logits differ
+  one answer token at K3's shapes took 0.68 s at 131,072 cached positions against 81.5 s exactly (j-research findings/115). Logits differ
   from the exact layouts by rounding (4.7e-7 relative on the tiny model). `tests/unit/test_mla_variants.c` check 10
   holds the engine's absorbed form to the benchmark's variant A bit for bit, and `make test` shows it failing with
   the rope term dropped (`K3_ABSORB_MUTANT_NO_ROPE`); `tests/test_mla_absorb.py` holds it to the exact layout and the
