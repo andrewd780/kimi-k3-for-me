@@ -45,10 +45,15 @@ def metric(losses):
 
 
 def validate_result(result, ids, first, expected_layers):
+    # under a layer loop (bin/k3's default; docs/notes/layer-loop.md) a complete window
+    # executes the loop's executed_layers, every one of the expected_layers at least once
+    loop = result.get("loop")
+    executed = loop.get("executed_layers") if isinstance(loop, dict) else expected_layers
     if (result.get("schema") != 1 or result.get("task") != "perplexity"
             or result.get("input_ids") != ids or result.get("score_start") != first
             or result.get("layers") != expected_layers
-            or result.get("layers_completed") != expected_layers
+            or type(executed) is not int or executed < expected_layers
+            or result.get("layers_completed") != executed
             or result.get("expert_drops") != 0):
         raise ValueError("native scorer returned a mismatched or incomplete window")
     losses = result.get("token_nll", [])
@@ -131,6 +136,9 @@ def main():
     parser.add_argument("--tokenizer", type=Path, help="local tokenizer files for text records")
     parser.add_argument("--tokenizer-binary", type=Path, default=Path("bin/test_tok"))
     parser.add_argument("--baseline", type=Path, help="compare mean NLL on the identical token set")
+    parser.add_argument("--no-loop", action="store_true",
+                        help="score the released model; without it bin/k3 runs its default adaptive "
+                             "layer loop (docs/notes/layer-loop.md), and the report says which")
     parser.add_argument("--checkpoint-label", default="unlabelled",
                         help="user-supplied revision/variant label; not weight authentication")
     args = parser.parse_args()
@@ -177,10 +185,14 @@ def main():
     if baseline is not None and (baseline.get("status") != "complete" or baseline.get("protocol") != protocol):
         raise ValueError("baseline used a different token set or scoring protocol")
     command = [str(binary), str(checkpoint), "--score-prompt", "--cache-gb", str(args.cache_gb)]
+    if args.no_loop:
+        command.append("--no-loop")
     if trunk:
         command += ["--trunk", str(trunk), "--trunk-gb", str(args.trunk_gb)]
     report = {"schema": 1, "status": "complete", "protocol": protocol,
               "checkpoint_label": args.checkpoint_label, "checkpoint": str(checkpoint),
+              "engine_model": "released (--no-loop)" if args.no_loop
+              else "engine default: adaptive layer loop (changes the model)",
               "checkpoint_files": identity, "config_sha256": sha256(config_path),
               "trunk": str(trunk) if trunk else None, "trunk_files": trunk_identity,
               "trunk_manifest_sha256": sha256(trunk / "trunk.json") if trunk else None,

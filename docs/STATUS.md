@@ -123,7 +123,7 @@ not built; **blocked** means it needs a machine holding the full checkpoint.
 
 | Technique | What it does | Status | How deep the evidence goes | What is left |
 |---|---|---|---|---|
-| Layer looping, `--loop-layers` / `--loop-count` | Re-runs a span of whole AttnRes blocks per token, as if it appeared again in the stack; the only "looped K3" that exists without training | built, opt-in, **not exact by design** | Tiny model: matches an independent torch reference on four spans; bit-identical across seven supported modes; flag off byte-identical to `main` in nine modes; shared-state mutant and two plants caught ([note](notes/layer-loop.md)) | Whether looping helps or hurts K3 is unmeasured; it needs `--score-prompt` on a machine holding the checkpoint. Expected: it hurts |
+| Layer looping, `--loop-layers` / `--loop-count` / `--loop-exit` | Re-runs a span of whole AttnRes blocks per token, as if it appeared again in the stack, at a fixed or adaptive per-token depth; the only "looped K3" that exists without training | built, **ON BY DEFAULT** (adaptive, middle block, 2 to 4 passes, exit 0.05; Andrew 2026-10-19), `--no-loop` for the released model; **not exact by design** | Tiny model: fixed and adaptive loops match an independent torch reference; bit-identical across every mode; `--no-loop` byte-identical to the released model; shared-state and no-compaction mutants caught ([note](notes/layer-loop.md)) | Whether looping helps or hurts K3 is unmeasured; it needs `--score-prompt` on a machine holding the checkpoint. Expected: it hurts |
 
 ### Blocked on a machine that holds the checkpoint
 

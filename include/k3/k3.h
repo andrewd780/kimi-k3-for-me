@@ -799,6 +799,19 @@ void   k3_decoder_layer_inc_log(float *h, float *block_residual, int *n_blocks,
                                 float *kvc, float *ropec, int cached, int cap,
                                 int kv_latent, const K3KdaLog *kda_log);
 
+/* The same with one block count PER TOKEN: n_blocks is [T], token t's stack holds
+ * n_blocks[t] snapshots. Adaptive loop depth (docs/notes/layer-loop.md) leaves tokens
+ * that stopped after different numbers of passes with stacks of different heights; each
+ * token's aggregations read its own count, and a block boundary appends at, and
+ * increments, each token's own. With every count equal this computes exactly the floats
+ * of k3_decoder_layer_inc_log: the per-token loops are the same loops, reading the count
+ * from another place. */
+void   k3_decoder_layer_inc_logv(float *h, float *block_residual, int *n_blocks,
+                                 const K3LayerW *w, const K3Cfg *c, int layer_idx,
+                                 int T, float *state, float *scratch,
+                                 float *kvc, float *ropec, int cached, int cap,
+                                 int kv_latent, const K3KdaLog *kda_log);
+
 /* ---------------------------------------------------------------- MXFP4 ---- */
 /* Dequantise OCP MX FP4, the format Kimi K3 ships its routed experts in.
  *
