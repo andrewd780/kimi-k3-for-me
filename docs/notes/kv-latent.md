@@ -70,3 +70,40 @@ gate compares floats and not argmaxes.
 flag is refused rather than ignored. The state file records floats-per-position in its
 header, so a latent state saves and resumes normally, and loading a state written in the
 other layout is refused by name instead of being read at the wrong stride.
+
+## `--mla-absorb`: the absorbed form, rounding-level and opt-in
+
+The rebuild costs one `kv_b` matmul's worth, 512 x 24,576 multiply-adds, per cached
+position per query token per layer. That is what makes the exact latent cache slow at
+long context: measured at K3's shapes on a 4-vCPU AVX-512 box, one MLA layer for one
+answer token took 0.66 s at 1,024 cached positions and 4.6 s at 8,192 (pilot of
+j-research `k3/DIAG-2026-10-20-absorb.md`).
+
+`--kv-latent --mla-absorb` uses the algebra DeepSeek's MLA was designed for. With
+`W_uk[h]` and `W_uv[h]` head h's key and value rows of `kv_b`:
+
+    score[h][s] = scale * ((W_uk[h]^T q_nope[h]) . c_s + q_rope[h] . r_s)
+    out[h]      = W_uv[h] (sum_s p[h][s] c_s)
+
+so `kv_b` is applied twice per query, not twice per cached position: about 96 x
+(576 + 512) multiply-adds per cached position per layer, about 1,000x fewer. At 8,192
+positions the same call took 0.057 s.
+
+It is the same function in another floating-point order: the exact paths round k and v
+to float per position before scoring and weighting them, the absorbed form never forms
+them. Its logits therefore differ from the exact layouts by rounding: 4.7e-7 relative on
+the tiny model, 2.2e-6 on one MLA layer's output at K3's shapes and 8,192 positions.
+That is why it is a flag and not a replacement. What is held exactly:
+
+- `tests/unit/test_mla_variants.c` check 10: the engine's absorbed form is the
+  benchmark's variant A bit for bit (outputs, scores, normalisers, quotients, appended
+  rows), which check 6 holds to a plain scalar rendering of the formula. `make test`
+  shows the gate failing on an engine with the rope term dropped.
+- `tests/test_mla_absorb.py`: within `tools/cmp_logits.py`'s yardstick of the exact
+  layout and of the torch reference, the same greedy ids, and bit-identical across
+  `--prefill-chunk`, thread counts, the layer loop and a resumed read-in.
+
+It reads `kv_b`'s rows directly, so it needs them resident in fp32 or bf16: it is refused
+with `--trunk-rows` and `--draft-trunk`, and with `--mla-split`, whose grouped rebuilds
+it replaces. The cache it reads and writes is the latent cache itself, so a state saved
+under one mode loads under the other.
