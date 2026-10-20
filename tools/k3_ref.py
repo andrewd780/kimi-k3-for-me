@@ -512,7 +512,7 @@ def apply_attn_res_masked(prefix_sum, block_residual, count, proj_w, norm_w, eps
     """apply_attn_res where token t's stack holds only its first count[t] snapshots: the
     rest are padding, masked out of the softmax. With every count equal to the stack's
     height it is apply_attn_res."""
-    T, n, _ = block_residual.shape
+    _, n, _ = block_residual.shape
     v = torch.cat([block_residual, prefix_sum.unsqueeze(1)], dim=1).float()
     k = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
     scores = (k * (norm_w.float() * proj_w.float())).sum(-1)
