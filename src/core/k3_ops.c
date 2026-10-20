@@ -1042,6 +1042,12 @@ K3MlaTrace *k3_mla_trace = NULL;
  * each visible position's key rows, then value rows, are rebuilt ONCE per block instead of once per query. 0 = the
  * per-query loop. Set before any scratch is sized: k3_mla_scratch_cached reads it. */
 int k3_mla_split_block = 0;
+/* --mla-absorb: the latent layout attends in DeepSeek's absorbed form. Each query's nope part is taken through the key
+ * rows of kv_b once (W_uk^T q), scored against the cached latents directly, and the probability-weighted latent sum is
+ * taken through the value rows once (W_uv u), instead of rebuilding k and v for every cached position for every query.
+ * It is the same function but not the same floating-point order, so its output differs from the exact paths by
+ * rounding; it is opt-in for that reason. Set before any scratch is sized: k3_mla_scratch_cached reads it. */
+int k3_mla_absorb = 0;
 /* the query-block height the last latent scratch sizing reserved score rows for: k3_mla_cached refuses a larger block, so
  * the block size cannot grow between sizing and use (Astra's K1 review; per-context ownership would be needed if concurrent
  * callers ever vary it) */
@@ -1067,6 +1073,10 @@ static void k3_mla_rebuild(float *kb, const float *lat, const K3MlaW *w, const K
  * head. Any block size gives the same floats; this one keeps the score block to
  * 6 KB per cached position at K3 geometry (0.26% of that position's expanded cache). */
 enum { K3_MLA_QBLOCK = 16 };
+
+/* --mla-absorb: the most heads one position's score chains are held for (K3 has 96), and the positions per block of
+ * the weighted latent sum, 64 x 2 KB of latent rows at K3 geometry, which stay in L2 while every head uses them. */
+enum { K3_MLA_ABSORB_MAX_HEADS = 256, K3_MLA_ABSORB_MAX_LORA = 1024, K3_MLA_ABSORB_BLOCK = 64 };
 
 /* One score chain of the expanded layout, query qt against cached key ks and the shared
  * rope slot kr: the qk_nope terms in order, then the qk_rope terms, in one double, which
@@ -1143,7 +1153,8 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
      * with a block of query rows each. Every row must survive until its own softmax. */
     float *sc   = gbuf + (size_t)T * H * vh;        /* latent [H][last+1], expanded [H][qb][last+1] */
     /* split: one [H][last+1] score block per query of the current query block */
-    const int split = (lat && T > 1 && k3_mla_split_block > 1) ? (T < k3_mla_split_block ? T : k3_mla_split_block) : 0;
+    const int absorb = lat && k3_mla_absorb;
+    const int split = (lat && !absorb && T > 1 && k3_mla_split_block > 1) ? (T < k3_mla_split_block ? T : k3_mla_split_block) : 0;
     /* the expanded layout's query block (K3_MLA_QBLOCK) */
     const int qb = T < K3_MLA_QBLOCK ? T : K3_MLA_QBLOCK;
     const size_t scn = (size_t)H * (size_t)(last + 1) * (size_t)(lat ? (split ? split : 1) : qb);
@@ -1153,6 +1164,12 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
     float *kb   = sc   + scn;                       /* latent: [H][kvd] one position */
     /* Without a cache the keys/values live in scratch and cover only this call. */
     float *kvs  = kb   + (lat ? (size_t)H * kvd : 0);       /* [T][H][kvd]    */
+    /* --mla-absorb, in kb's place: one query's q_abs [kv_lora][H] and q_rope [qk_rope][H] in double, head-minor so the
+     * score loop reads every head's chain side by side, then its weighted latent sums u [H][kv_lora]. */
+    const int kvl = c->kv_lora;
+    double *qa = (double *)(((uintptr_t)kb + 7) & ~(uintptr_t)7);
+    double *qp = qa + (size_t)kvl * H;
+    float  *ub = (float *)(qp + (size_t)qr * H);
     float *rps  = kvs  + (kvc ? 0 : (size_t)T * H * kvd);   /* [T][qr] */
 
     #define K3_KV_AT(p)   (kvc   ? kvc   + (size_t)(p) * H * kvd : kvs + (size_t)(p) * H * kvd)
@@ -1387,7 +1404,141 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
         if (tr && tr->acc)
             memcpy(tr->acc, acc, (size_t)T * H * vh * sizeof(float));
     }
-    for (int t = 0; lat && !split && t < T; t++) {
+    if (absorb && w->wdt != K3_WF32 && w->wdt != K3_WBF16) {
+        fprintf(stderr, "k3_mla_cached: --mla-absorb reads kv_b's rows directly and needs them resident in fp32 or "
+                        "bf16; this layer's kv_b has weight type %d\n", w->wdt);
+        abort();
+    }
+    if (absorb && (H > K3_MLA_ABSORB_MAX_HEADS || kvl > K3_MLA_ABSORB_MAX_LORA)) {
+        fprintf(stderr, "k3_mla_cached: --mla-absorb holds at most %d heads and a %d-wide latent, this model has %d "
+                        "and %d\n", K3_MLA_ABSORB_MAX_HEADS, K3_MLA_ABSORB_MAX_LORA, H, kvl);
+        abort();
+    }
+    /* ABSORBED (--mla-absorb, latent layout), one query token at a time:
+     *   q_abs[h] = W_uk[h]^T q_nope[h]         kv_b's key rows of head h, transposed, in double
+     *   score[h][s] = scale * (q_abs[h] . c_s + q_rope[h] . r_s)
+     *   u[h] = sum_s p[h][s] c_s               s ascending, in float, one thread per head
+     *   out[h] = W_uv[h] u[h]                  kv_b's value rows of head h, through k3_mmw
+     * Every sum keeps one order whatever the thread count, so the output is deterministic; it differs from the exact
+     * paths, which round k and v per position before scoring and weighting them, by rounding only. GATE MUTANTS (test
+     * builds only): K3_ABSORB_MUTANT_NO_ROPE drops the rope term from the scores, K3_ABSORB_MUTANT_CAUSAL lets a query
+     * see one position less; the tolerance gates must see each. */
+#ifdef K3_TEST_MUTANTS
+    static int ab_mutant = -1;
+    if (ab_mutant < 0) {
+        ab_mutant = getenv("K3_ABSORB_MUTANT_NO_ROPE") ? 1 : getenv("K3_ABSORB_MUTANT_CAUSAL") ? 2 : 0;
+    }
+#else
+    const int ab_mutant = 0;
+#endif
+    for (int t = 0; absorb && t < T; t++) {
+        const int p = cached + t - (ab_mutant == 2 && cached + t > 0);
+        const int nrope = ab_mutant == 1 ? 0 : qr;
+        float *acct = acc + (size_t)t * H * vh;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int h = 0; h < H; h++) {
+            const float *qt = q + ((size_t)t * H + h) * qh;
+            /* q_abs[h][j] = sum_i W[h*kvd + i][j] * q_nope[h][i], i ascending: every product of a widened weight and a
+             * float is exact in double, so each step is one rounding. Accumulated contiguously, rounded to float and
+             * stored head-minor: the arithmetic of benchmarks/mla_variants.h's variant A, which tests/unit/
+             * test_mla_variants.c holds to a plain scalar rendering of the formula and this path to A, bit for bit. */
+            double a[K3_MLA_ABSORB_MAX_LORA];
+            for (int j = 0; j < kvl; j++) a[j] = 0.0;
+            for (int i = 0; i < qn; i++) {
+                const double qi = (double)qt[i];
+                const size_t r = (size_t)h * kvd + i;
+                if (w->wdt == K3_WBF16) {
+                    const uint16_t *wr = (const uint16_t *)w->kv_b + r * kvl;
+                    for (int j = 0; j < kvl; j++) a[j] += (double)k3_bf16f(wr[j]) * qi;
+                } else {
+                    const float *wr = (const float *)w->kv_b + r * kvl;
+                    for (int j = 0; j < kvl; j++) a[j] += (double)wr[j] * qi;
+                }
+            }
+            for (int j = 0; j < kvl; j++) qa[(size_t)j * H + h] = (double)(float)a[j];
+            for (int i = 0; i < qr; i++) qp[(size_t)i * H + h] = (double)qt[qn + i];
+        }
+        /* scores: per position, every head's chain side by side; d[h] takes the latent terms j ascending, then the
+         * rope terms, whatever the vector width */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int s = 0; s <= p; s++) {
+            double d[K3_MLA_ABSORB_MAX_HEADS];
+            const float *cs = K3_LAT_AT(s), *kr = K3_ROPE_AT(s);
+            for (int h = 0; h < H; h++) d[h] = 0.0;
+            for (int j = 0; j < kvl; j++) {
+                const double cj = (double)cs[j];
+                const double *qj = qa + (size_t)j * H;
+                for (int h = 0; h < H; h++) d[h] += qj[h] * cj;
+            }
+            for (int i = 0; i < nrope; i++) {
+                const double ri = (double)kr[i];
+                const double *qi = qp + (size_t)i * H;
+                for (int h = 0; h < H; h++) d[h] += qi[h] * ri;
+            }
+            for (int h = 0; h < H; h++) sc[(size_t)h * (last + 1) + s] = (float)d[h] * scale;
+        }
+        /* softmax per head, the exact paths' form */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int h = 0; h < H; h++) {
+            float *sh = sc + (size_t)h * (last + 1);
+            const size_t row = (size_t)t * H + h;          /* trace row (t, h) */
+            if (tr && tr->scores)
+                memcpy(tr->scores + row * tr->n, sh, (size_t)(p + 1) * sizeof(float));
+            float m = -INFINITY;
+            for (int s = 0; s <= p; s++) if (sh[s] > m) m = sh[s];
+            double z = 0.0;
+            for (int s = 0; s <= p; s++) { sh[s] = expf(sh[s] - m); z += sh[s]; }
+            if (tr && tr->z) tr->z[row] = z;
+            double *qrow = tr && tr->quot ? tr->quot + row * tr->n : NULL;
+            for (int s = 0; s <= p; s++) {
+                const double pq = sh[s] / z;
+                if (qrow) qrow[s] = pq;
+                sh[s] = (float)pq;
+            }
+            float *uh = ub + (size_t)h * kvl;
+            for (int j = 0; j < kvl; j++) uh[j] = 0.0f;
+        }
+        /* u[h] = sum_s p[h][s] c_s, s ascending. Blocks of positions outer, so a block of latent rows serves every head
+         * while it is in cache; within the region each thread owns the same heads for every block (static schedules
+         * of equal trip counts assign alike), so no term changes place and no barrier is needed per block. */
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+        for (int s0 = 0; s0 <= p; s0 += K3_MLA_ABSORB_BLOCK) {
+            const int s1 = s0 + K3_MLA_ABSORB_BLOCK < p + 1 ? s0 + K3_MLA_ABSORB_BLOCK : p + 1;
+#ifdef _OPENMP
+#pragma omp for schedule(static) nowait
+#endif
+            for (int h = 0; h < H; h++) {
+                const float *ph = sc + (size_t)h * (last + 1);
+                float *uh = ub + (size_t)h * kvl;
+                for (int s = s0; s < s1; s++) {
+                    const float pr = ph[s];
+                    const float *cs = K3_LAT_AT(s);
+                    for (int j = 0; j < kvl; j++) uh[j] += pr * cs[j];
+                }
+            }
+        }
+        /* out[h] = W_uv[h] u[h]: head h's value rows of kv_b as a vh x kv_lora matrix */
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int h = 0; h < H; h++) {
+            const size_t r = (size_t)h * kvd + qn;
+            const void *wv = w->wdt == K3_WBF16 ? (const void *)((const uint16_t *)w->kv_b + r * kvl)
+                                                : (const void *)((const float *)w->kv_b + r * kvl);
+            k3_mmw(acct + (size_t)h * vh, ub + (size_t)h * kvl, wv, w->wdt, kvl, vh);
+        }
+        if (tr && tr->acc)
+            memcpy(tr->acc + (size_t)t * H * vh, acct, (size_t)H * vh * sizeof(float));
+    }
+    for (int t = 0; lat && !split && !absorb && t < T; t++) {
         const int p = (rel_mutant && T > 1) ? t : cached + t;
         float *acct = acc + (size_t)t * H * vh;
         {   /* the latent layout, one query token at a time (the split above takes blocks) */
@@ -1617,7 +1768,7 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
     size_t scores = (size_t)(cap > T ? cap : T) * (size_t)H;
     if (!lat) scores *= (size_t)(T < K3_MLA_QBLOCK ? T : K3_MLA_QBLOCK);
     /* --mla-split keeps a score block per query of a query block (k3_mla_cached) */
-    if (lat && T > 1 && k3_mla_split_block > 1) {
+    if (lat && !k3_mla_absorb && T > 1 && k3_mla_split_block > 1) {
         k3_mla_split_sized = T < k3_mla_split_block ? T : k3_mla_split_block;
         scores *= (size_t)k3_mla_split_sized;
     }
@@ -1627,7 +1778,9 @@ size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
              + (size_t)T * c->q_lora                   /* ql           */
              + (size_t)2 * T * H * vh                  /* acc, gbuf    */
              + scores;
-    if (lat) n += (size_t)H * kvd;                     /* rebuilt k/v  */
+    if (lat && k3_mla_absorb)                          /* q_abs, q_rope (doubles), u */
+        n += (size_t)2 * H * ((size_t)c->kv_lora + qh - c->qk_nope) + (size_t)H * c->kv_lora + 2;
+    else if (lat) n += (size_t)H * kvd;                /* rebuilt k/v  */
     if (!cached_mode) n += (size_t)T * H * kvd + (size_t)T * c->qk_rope;
     return n;
 }

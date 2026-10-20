@@ -527,6 +527,14 @@ static void usage(FILE *f)
 "                        block of B query positions (verify sweeps, prompts) instead of once\n"
 "                        per query; bit-identical; costs B x heads x context floats of\n"
 "                        scratch. 0 (default) = the per-query loop\n"
+"  --mla-absorb          with --kv-latent: attend in absorbed form, scoring each query\n"
+"                        against the cached latents through kv_b's key rows once, and\n"
+"                        weighting them through its value rows once, instead of\n"
+"                        rebuilding k and v for every cached position for every query.\n"
+"                        About 1,000x fewer operations per cached position at K3's\n"
+"                        shapes; the same function, but logits differ from the exact\n"
+"                        layouts by rounding (about 1e-6 relative). Not with --mla-split,\n"
+"                        --trunk-rows or --draft-trunk\n"
 "  --kvb-cache MODE      with --trunk-rows --kv-latent: active = hold the current layer's\n"
 "                        kv_b in one buffer, read once per layer visit; pin = keep every\n"
 "                        layer's kv_b; off (default) = reread per position. Charged to\n"
@@ -1363,6 +1371,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "K3_PREFILL_MUTANT_RELATIVE is a gate mutant for test builds (make mutants); this build refuses it\n");
         return 2;
     }
+    if (getenv("K3_ABSORB_MUTANT_NO_ROPE") || getenv("K3_ABSORB_MUTANT_CAUSAL")) {
+        fprintf(stderr, "K3_ABSORB_MUTANT_* is a gate mutant for test builds (make mutants); this build refuses it\n");
+        return 2;
+    }
 #endif
 
     const char *dir = argv[1];
@@ -1506,6 +1518,7 @@ int main(int argc, char **argv)
             }
             k3_mla_split_block = atoi(s);
         }
+        else if (!strcmp(argv[i], "--mla-absorb")) k3_mla_absorb = 1;
         else if (!strcmp(argv[i], "--kvb-cache") && i + 1 < argc) {
             const char *m = argv[++i];
             if (!strcmp(m, "off")) kvb_mode = K3_KVB_OFF;
@@ -1610,6 +1623,14 @@ int main(int argc, char **argv)
     if (kv_latent && !incremental) {
         fprintf(stderr, "--kv-latent needs --incremental: full recompute holds no KV "
                         "cache to compress\n");
+        return 2;
+    }
+    if (k3_mla_absorb && (!kv_latent || k3_mla_split_block > 0 || trunk_rows || draft_dir)) {
+        fprintf(stderr, "--mla-absorb %s\n",
+                !kv_latent ? "needs --kv-latent: it attends over the cached latents"
+                : k3_mla_split_block > 0 ? "replaces the rebuilds --mla-split groups; give one of them"
+                : trunk_rows ? "reads kv_b's rows directly, which --trunk-rows does not hold"
+                : "is not combined with --draft-trunk, whose kv_b may be int8");
         return 2;
     }
     if (ckpt_path && !incremental) {
@@ -3144,7 +3165,7 @@ int main(int argc, char **argv)
                 "\"expert_cache_slots\":%d,\"expert_profile_pins\":%d,"
                 "\"trunk_bytes_read\":%llu,\"embedding_bytes_read\":%llu,"
                 "\"lm_head_bytes_read\":%llu,\"ultra_low_memory\":%s,"
-                "\"lm_head_streamed\":%s,\"kv_latent\":%s,\"prefill_chunk\":%d,"
+                "\"lm_head_streamed\":%s,\"kv_latent\":%s,\"mla_absorb\":%s,\"prefill_chunk\":%d,"
                 "\"prefill_passes\":%ld,\"buffer_rows\":%d,\"checkpoint_resumed_ids\":%d,"
                 "\"checkpoints_written\":%d,\"trunk_ring_slots\":%d,"
                 "\"trunk_slot_bytes\":%lld,\"trunk_budget_bytes\":%.0f,"
@@ -3172,7 +3193,7 @@ int main(int argc, char **argv)
                 (unsigned long long)w.ms.embed_bytes_read,
                 (unsigned long long)w.ms.lm_head_bytes_read,
                 w.ultra ? "true" : "false", w.stream_lm_head ? "true" : "false",
-                w.kv_latent ? "true" : "false",
+                w.kv_latent ? "true" : "false", k3_mla_absorb ? "true" : "false",
                 incremental ? prefill_chunk : 0, w.prefill_passes, w.max_rows, ckpt_resumed,
                 ckpt.written,
                 w.trunk ? w.trunk->nslot : 0,

@@ -62,6 +62,12 @@
  *      the same story without the special layer: formed as e * (1 / z) it rounds twice
  *      and differs from e / z in about a fifth of all quotients, yet p almost never
  *      moves. The order witness prints both rates.
+ *  10. The engine's --mla-absorb (k3_mla_absorb) IS A: outputs, pre-gate accumulators,
+ *      raw scores, normalisers, quotients and appended latent rows bit for bit, on every
+ *      case and layer kind, on one thread and on all of them, with no kv_b application
+ *      to any cached position. With 6 that holds the engine's absorbed attention to the
+ *      plain scalar formula, which an engine that dropped the rope term or saw one
+ *      position too few would fail, where a logit tolerance on the tiny model need not.
  */
 #define _POSIX_C_SOURCE 200809L
 #include <math.h>
@@ -493,9 +499,12 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
     const size_t expb = (size_t)T * H * kvd * sizeof(float);
     const size_t ropb = (size_t)T * c->qk_rope * sizeof(float);
 
-    Run eng_x, eng_l, rE, rEP, rL0, rA;
+    Run eng_x, eng_l, eng_a, rE, rEP, rL0, rA;
     run_engine(&eng_x, &K, 0);
     run_engine(&eng_l, &K, 1);
+    k3_mla_absorb = 1;
+    run_engine(&eng_a, &K, 1);
+    k3_mla_absorb = 0;
     run_variant(&rE, &K, K.xnew, MLA_E, 0);
     run_variant(&rEP, &K, K.xnew, MLA_EP, 0);
     run_variant(&rL0, &K, K.xnew, MLA_L0, 0);
@@ -621,6 +630,18 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
               "%s C=%d T=%d: A far from E (acc %.3g, out %.3g)", geom, C, T, d_acc, d_out);
     }
 
+    /* 10. the engine's absorbed form is A */
+    CHECK(same(eng_a.out, rA.out, outb) && same(eng_a.acc, rA.acc, accb)
+              && same(eng_a.probe, rA.probe, prb) && same(eng_a.z, rA.z, zb)
+              && same(eng_a.quot, rA.quot, qb),
+          "%s C=%d T=%d: the engine's --mla-absorb is not A", geom, C, T);
+    CHECK(same(eng_a.cache.kv + (size_t)C * c->kv_lora, eng_l.cache.kv + (size_t)C * c->kv_lora, latb)
+              && same(eng_a.cache.rope + (size_t)C * c->qk_rope, eng_l.cache.rope + (size_t)C * c->qk_rope,
+                      ropb),
+          "%s C=%d T=%d: the engine's --mla-absorb appended different rows", geom, C, T);
+    CHECK(eng_a.kvb == 0.0, "%s C=%d T=%d: the engine's --mla-absorb rebuilt %.3g kv_b applications",
+          geom, C, T, eng_a.kvb);
+
     /* 4. causal masking across the new positions */
     if (T >= 2) {
         float *x2 = (float *)xmalloc((size_t)T * E * sizeof(float));
@@ -676,9 +697,21 @@ static int test_case(const char *geom, const K3Cfg *c, const K3MlaW *w, int C, i
                   && same(ex.cache.kv + (size_t)C * H * kvd, eng_x.cache.kv + (size_t)C * H * kvd, expb),
               "%s C=%d T=%d: the expanded engine changes with the thread count", geom, C, T);
         run_free(&ex);
+        /* so does --mla-absorb, which splits positions and heads across threads */
+        Run ea;
+        set_threads(g_threads);
+        k3_mla_absorb = 1;
+        run_engine(&ea, &K, 1);
+        k3_mla_absorb = 0;
+        set_threads(1);
+        CHECK(same(ea.out, eng_a.out, outb) && same(ea.acc, eng_a.acc, accb)
+                  && same(ea.probe, eng_a.probe, prb) && same(ea.z, eng_a.z, zb)
+                  && same(ea.quot, eng_a.quot, qb),
+              "%s C=%d T=%d: the engine's --mla-absorb changes with the thread count", geom, C, T);
+        run_free(&ea);
     }
 
-    run_free(&eng_x); run_free(&eng_l); run_free(&rE); run_free(&rEP); run_free(&rL0);
+    run_free(&eng_x); run_free(&eng_l); run_free(&eng_a); run_free(&rE); run_free(&rEP); run_free(&rL0);
     run_free(&rA);
     cache_free(&K.lat); cache_free(&K.exp_);
     free(K.xpre); free(K.xnew);

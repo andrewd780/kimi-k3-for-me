@@ -231,6 +231,8 @@ size_t k3_mla_scratch(const K3Cfg *c, int T);
  * kv_latent must match the layout the cache was allocated for: the latent path needs a
  * score row per head and a buffer for the position it is rebuilding. */
 extern int k3_mla_split_block;   /* --mla-split: 0 = per-query rebuilds; B > 1 = blocks of B queries */
+extern int k3_mla_absorb;        /* --mla-absorb: the latent layout attends in absorbed form (rounding-level
+                                  * differences from the exact paths); set before sizing scratch */
 size_t k3_mla_scratch_cached(const K3Cfg *c, int T, int cap, int cached_mode,
                              int kv_latent);
 
