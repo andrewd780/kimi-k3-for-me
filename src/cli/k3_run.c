@@ -296,6 +296,14 @@ static int k3_state_load(const char *path, const K3Cfg *c, const K3StateHdr *hd,
                         "  Raise --gen or shorten the prompt.\n", path, hd->cached, kv_cap);
         return -1;
     }
+    /* A saved sequence is the cached positions plus at most one pending id (the last one
+     * generated, not yet fed). Anything else was not written by k3_state_save. */
+    if (hd->cached < 0 || hd->nseq < hd->cached || hd->nseq > hd->cached + 1) {
+        fprintf(stderr, "REFUSING: %s holds %d ids for %d cached positions; a state file "
+                        "holds the cached positions and at most one pending id\n",
+                path, hd->nseq, hd->cached);
+        return -1;
+    }
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return -1; }
     const long off = (long)sizeof *hd + (hd->version >= 2 ? (long)sizeof *lp : 0L);
@@ -441,6 +449,8 @@ static void usage(FILE *f)
 "  --prompt-file PATH    read the prompt from a file; use this for non-ASCII, since\n"
 "                        argv is re-encoded by the shell\n"
 "  --ids 1,2,3           raw token ids; the reproducible channel used by the tests\n"
+"  --ids-file PATH       the same ids read from a file, for prompts longer than one\n"
+"                        command-line argument can carry (about 30K ids on Linux)\n"
 "  --reread-prompt       process an exact second copy of the prompt before generation\n"
 "                        Uses twice the prompt context and adds prefill work.\n"
 "                        Does not verify or guarantee the answer.\n"
@@ -487,7 +497,13 @@ static void usage(FILE *f)
 "                        config.json says 163586 (<|end_of_msg|>), tokenizer_config\n"
 "                        .json says 163585 ([EOS]), and the model emits 163585.\n"
 "                        Pass both to stop on either\n"
-"  --incremental         carry KV cache and recurrent state between tokens\n"
+"  --incremental         carry KV cache and recurrent state between tokens. The only\n"
+"                        mode for prompts over 32,768 ids (up to 1,048,576)\n"
+"  --prefill-chunk N     with --incremental: read the prompt in at most N positions per\n"
+"                        pass (1 to 32768, default 4096). Bit-identical to one pass;\n"
+"                        per-position buffers are sized for N, not for the prompt, and a\n"
+"                        long read-in reports its progress after each chunk. A streamed\n"
+"                        trunk and experts are read once per chunk\n"
 "  --kv-latent           cache MLA's compressed latent instead of the expanded k and\n"
 "                        v, and rebuild them on use: 0.055 MB per position instead of\n"
 "                        2.37, at the cost of one kv_b matmul's worth per cached\n"
@@ -719,6 +735,9 @@ typedef struct {
     float       *kvc, *ropec;
     int         *mla_slot;   /* [executed position] -> dense MLA index, or -1 */
     int          n_mla, kv_cap, cached;
+    int          max_rows;   /* positions one forward() may take: what h, br and the
+                              * scratch were sized for (the read-in chunk under
+                              * --incremental, the whole sequence otherwise) */
     int          kv_latent;  /* kvc holds the latent, not expanded k and v */
     int          draft_mode;   /* 1 for the hybrid draft: cache-only expert routing */
     const int   *score_targets; /* optional next-token targets for each input position */
@@ -742,6 +761,7 @@ typedef struct {
     float       *all_logits;
     long         forwards;     /* forward() calls, so the report can show there was no
                                 * replay: one per decode step */
+    long         prefill_passes;   /* of those, the read-in's (prefill()): one per chunk */
 } Weights;
 
 /* One full forward over T tokens, writing logits for the LAST position only. Every
@@ -766,6 +786,12 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     const int P = c->kda_heads * c->kda_head_dim;
     const size_t kper = (size_t)P * c->kda_head_dim + (size_t)3 * P * (c->conv_k - 1);
 
+    /* Every per-position buffer holds max_rows rows; more would overrun them silently. */
+    if (T < 1 || T > w->max_rows) {
+        fprintf(stderr, "forward of %d positions, but the buffers hold %d; refusing\n",
+                T, w->max_rows);
+        return -1;
+    }
     w->forwards++;
     for (int t = 0; t < T; t++) {
         if (w->ultra) {
@@ -1038,6 +1064,67 @@ static int forward(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, i
     return 0;
 }
 
+/* Rows every per-position buffer holds: the whole sequence under full recompute, which
+ * forwards all of it each step; under --incremental the read-in chunk, or a --spec verify
+ * sweep (K3_SPEC_MAX + 1) if that is more. forward() refuses anything larger. */
+static int pass_rows(int incremental, int chunk, int Tmax)
+{
+    if (!incremental) return Tmax;
+    const int r = chunk > K3_SPEC_MAX + 1 ? chunk : K3_SPEC_MAX + 1;
+    return r < Tmax ? r : Tmax;
+}
+
+/* Incremental read-in of n ids, at most `chunk` positions per forward(), advancing
+ * w->cached past each chunk. A position's arithmetic does not depend on which batch it
+ * rides in (GATE 3c of tests/unit/k3_model.c: T positions in one forward give the bits
+ * of T one-position steps), so the carried state and the last position's logits are
+ * those of one pass over all n; only the per-position buffers shrink, from n rows to
+ * chunk. `who` names the model in the progress lines a multi-chunk read-in prints;
+ * NULL prints none. */
+static int prefill(Weights *w, const K3Cfg *c, K3Cache *cache, const int *ids, int n,
+                   int chunk, float *lg, float *sc, float *h, float *br, float *ks,
+                   const char *who)
+{
+    const double t0 = now_s();
+    /* The time to go: a position's cost grows with the context its attention reads, so
+     * the rate per position is fitted as r0 + k * position from the first chunk and the
+     * latest one, and integrated over the positions left. */
+    double r1 = 0.0, m1 = 0.0;
+    for (int i = 0; i < n; ) {
+        const int q = n - i < chunk ? n - i : chunk;
+        const double tc = now_s();
+#ifdef K3_TEST_MUTANTS
+        /* GATE MUTANT (test builds only): K3_PREFILL_MUTANT_RESET starts every chunk after
+         * the first from cleared KDA and ShortConv state, as a read-in that forgot what
+         * the earlier chunks carried would. One pass, and decode, are untouched. */
+        if (i > 0 && getenv("K3_PREFILL_MUTANT_RESET")) {
+            const size_t P = (size_t)c->kda_heads * c->kda_head_dim;
+            const size_t kper = P * c->kda_head_dim + 3 * P * (size_t)(c->conv_k - 1);
+            memset(ks, 0, kper * (size_t)(w->vmap ? w->n_virt : w->n_bound) * sizeof(float));
+        }
+#endif
+        if (forward(w, c, cache, ids + i, q, lg, sc, h, br, ks, NULL) != 0) return -1;
+        w->prefill_passes++;
+        w->cached += q;
+        const double r = (now_s() - tc) / q, m = w->cached - 0.5 * q;   /* this chunk */
+        if (i == 0) { r1 = r; m1 = m; }
+        i += q;
+        if (who && n > chunk) {
+            const double s = now_s() - t0;
+            printf("  %s read in %d of %d positions (%.1f%%): %.1f s, %.3f s per "
+                   "position%s", who, i, n, 100.0 * i / n, s, s / i, i < n ? ", " : "\n");
+            if (i < n) {
+                double k = m > m1 ? (r - r1) / (m - m1) : 0.0;
+                if (k < 0.0) k = 0.0;
+                const double r0 = r1 - k * m1, a = w->cached, b = a + (n - i);
+                printf("about %.0f s to go\n", r0 * (b - a) + 0.5 * k * (b * b - a * a));
+            }
+            fflush(stdout);
+        }
+    }
+    return 0;
+}
+
 /* The adaptive loop's record for the report: per absolute position, the passes it ran
  * (0 = never forwarded) and the relative change after each pass from the second on.
  * Writes null when the loop is fixed or off. */
@@ -1164,6 +1251,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "K3_LOOP_MUTANT_NO_COMPACT is a gate mutant for test builds (make mutants); this build refuses it\n");
         return 2;
     }
+    if (getenv("K3_PREFILL_MUTANT_RESET")) {
+        fprintf(stderr, "K3_PREFILL_MUTANT_RESET is a gate mutant for test builds (make mutants); this build refuses it\n");
+        return 2;
+    }
+    if (getenv("K3_PREFILL_MUTANT_RELATIVE")) {
+        fprintf(stderr, "K3_PREFILL_MUTANT_RELATIVE is a gate mutant for test builds (make mutants); this build refuses it\n");
+        return 2;
+    }
 #endif
 
     const char *dir = argv[1];
@@ -1206,8 +1301,27 @@ int main(int argc, char **argv)
     int loop_a = -1, loop_b = -1, loop_count = 0;   /* --loop-layers A-B, --loop-count R */
     double loop_eps = -1.0;                         /* --loop-exit EPS; < 0 is the fixed loop */
     int no_loop = 0, want_loop = 0, loop_preset = 0; /* --no-loop; --loop; its span in force */
+    const char *ids_file = NULL;                    /* --ids-file */
+    /* --prefill-chunk: positions per forward of an incremental read-in. 4096 keeps the
+     * per-position buffers (about 0.67 MB per row at K3's shapes) near 2.7 GB whatever
+     * the prompt, against about 3.6 s of compute per position on a 4-vCPU AVX-512 box:
+     * re-reading a streamed trunk once per 4096 positions is small beside that. */
+    int prefill_chunk = 4096, prefill_chunk_set = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids_s = argv[++i];
+        else if (!strcmp(argv[i], "--ids-file") && i + 1 < argc) ids_file = argv[++i];
+        else if (!strcmp(argv[i], "--prefill-chunk") && i + 1 < argc) {
+            char *end;
+            errno = 0;
+            const long value = strtol(argv[++i], &end, 10);
+            if (!*argv[i] || *end || errno || value < 1 || value > K3_MAX_PASS) {
+                fprintf(stderr, "--prefill-chunk takes positions per pass from 1 to %d, "
+                                "got '%s'\n", K3_MAX_PASS, argv[i]);
+                return 2;
+            }
+            prefill_chunk = (int)value;
+            prefill_chunk_set = 1;
+        }
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--prompt-file") && i + 1 < argc) prompt_file = argv[++i];
         else if (!strcmp(argv[i], "--reread-prompt")) reread_prompt = 1;
@@ -1379,6 +1493,11 @@ int main(int argc, char **argv)
                         "cache to compress\n");
         return 2;
     }
+    if (prefill_chunk_set && !incremental) {
+        fprintf(stderr, "--prefill-chunk needs --incremental: full recompute carries no "
+                        "cache from one pass to the next, so it cannot read in parts\n");
+        return 2;
+    }
     const int head_streamed = ultra || stream_lm_head;
     /* An omitted --trunk-gb is not refused: the 16 GB default becomes the row budget,
      * which the row pipeline caps at two 8 MiB buffers plus the current layer's vectors,
@@ -1489,15 +1608,18 @@ int main(int argc, char **argv)
     if (draft_dir && spec_n <= 0) spec_n = 4;
     if (spec_n > K3_SPEC_MAX) spec_n = K3_SPEC_MAX;
     {
-        int nsrc = (ids_s != NULL) + (prompt_text != NULL) + (prompt_file != NULL);
+        int nsrc = (ids_s != NULL) + (ids_file != NULL) + (prompt_text != NULL)
+                 + (prompt_file != NULL);
         if (nsrc == 0) {
-            fprintf(stderr, "one of --ids, --prompt or --prompt-file is required\n");
+            fprintf(stderr, "one of --ids, --ids-file, --prompt or --prompt-file is "
+                            "required\n");
             return 2;
         }
         if (nsrc > 1) {
             /* Refuse rather than pick: silently preferring one source would make a
              * mistyped invocation run the WRONG prompt for tens of minutes. */
-            fprintf(stderr, "--ids, --prompt and --prompt-file are mutually exclusive\n");
+            fprintf(stderr, "--ids, --ids-file, --prompt and --prompt-file are mutually "
+                            "exclusive\n");
             return 2;
         }
     }
@@ -1596,10 +1718,23 @@ int main(int argc, char **argv)
     /* Heap, not stack. This was `int prompt[4096]` and it was the reason the engine
      * refused prompts longer than 4096 ids -- a stack-array size, not a model or memory
      * limit. */
-    int *prompt = (int *)malloc((size_t)K3_MAX_PROMPT * sizeof(int));
+    /* One id past the ceiling, so that a tokenized prompt which reaches it is seen to be
+     * too long: tok_encode stops at its max without saying so, which would otherwise
+     * answer a truncated prompt. */
+    int *prompt = (int *)malloc(((size_t)K3_MAX_PROMPT + 1) * sizeof(int));
     if (!prompt) { fprintf(stderr, "OOM allocating prompt buffer\n"); return 2; }
     int np = 0;
     Tok tok; int have_tok = 0;
+    char *ids_text = NULL;   /* --ids-file's contents, parsed as --ids would be */
+    if (ids_file) {
+        long ilen = 0;
+        ids_text = tk_read_file(ids_file, &ilen);   /* exits if unreadable */
+        if ((long)strlen(ids_text) != ilen) {
+            fprintf(stderr, "--ids-file %s contains a NUL byte\n", ids_file);
+            return 2;
+        }
+        ids_s = ids_text;
+    }
 
     if (prompt_text || prompt_file) {
         if (!tok_dir) {
@@ -1619,8 +1754,13 @@ int main(int argc, char **argv)
             if (!ptext) { fprintf(stderr, "OOM on prompt\n"); return 2; }
             memcpy(ptext, prompt_text, (size_t)plen + 1);
         }
-        np = tok_encode(&tok, ptext, (int)plen, prompt, K3_MAX_PROMPT);
+        np = tok_encode(&tok, ptext, (int)plen, prompt, K3_MAX_PROMPT + 1);
         free(ptext);
+        if (np > K3_MAX_PROMPT) {
+            fprintf(stderr, "prompt exceeds the %d-id ceiling (%ld bytes of text)\n",
+                    K3_MAX_PROMPT, plen);
+            return 2;
+        }
         printf("  tokenized: %ld bytes -> %d ids\n", plen, np);
     } else {
         for (const char *p = ids_s; *p; ) {
@@ -1642,6 +1782,9 @@ int main(int argc, char **argv)
             p = end;
         }
     }
+    free(ids_text);
+    ids_text = NULL;
+    ids_s = NULL;
     if (np <= 0) { fprintf(stderr, "no prompt ids parsed\n"); return 2; }
     if (score_prompt && score_start >= np) {
         fprintf(stderr, "--score-prompt needs at least one target after --score-start\n");
@@ -1693,6 +1836,16 @@ int main(int argc, char **argv)
                 np, K3_MAX_PROMPT, K3_MAX_PROMPT + K3_MAX_GEN);
         return 2;
     }
+    /* Full recompute, --score-prompt and --tf-check put the whole sequence through one
+     * forward pass, whose rows stay within K3_MAX_PASS; only --incremental reads in parts. */
+    if (!incremental && np > K3_MAX_PASS) {
+        fprintf(stderr, "prompt of %d ids exceeds the %d-id ceiling of one forward pass; "
+                        "with --incremental it is read in parts, up to %d ids%s\n",
+                np, K3_MAX_PASS, K3_MAX_PROMPT,
+                score_prompt || tf_check ? " (--score-prompt and --tf-check are one pass)"
+                                         : "");
+        return 2;
+    }
     K3StateHdr shd;
     K3StateLoop sloop;
     int prior = 0;
@@ -1703,6 +1856,17 @@ int main(int argc, char **argv)
         }
         if (k3_state_peek(load_state, &shd, &sloop) != 0) return 1;
         prior = shd.nseq;
+    }
+    /* The longest read-in this run makes: the prompt, after the saved pending id on a
+     * resume, or with a draft trunk on a resume the whole sequence (the draft's state is
+     * not saved). A chunk longer than that would only size buffers nothing fills. The
+     * header's counts are checked when the state loads; here they only bound a size. */
+    const int pending = !load_state ? 0 : prior - shd.cached < 0 ? 0
+                      : prior - shd.cached > 1 ? 1 : prior - shd.cached;
+    if (incremental) {
+        int longest = np + pending;
+        if (draft_dir && load_state && prior + np > longest) longest = prior + np;
+        if (prefill_chunk > longest) prefill_chunk = longest;
     }
     if (prior < 0 || prior > K3_MAX_PROMPT + K3_MAX_GEN - np - gen - 1) {
         fprintf(stderr, "history %d + prompt %d + gen %d + 1 exceeds the "
@@ -1718,8 +1882,14 @@ int main(int argc, char **argv)
         /* The per-position figure is the LAYOUT'S, not a constant: --kv-latent is the
          * one dial that moves it, so a plan printed with the expanded number while the
          * latent cache is allocated would overstate the limit 43-fold. */
-        const double per_pos = kv_latent ? K3_KV_LATENT_BYTES_PER_POS
-                                         : K3_KV_BYTES_PER_POS;
+        /* From the config, not the released checkpoint's constants (K3_KV_BYTES_PER_POS
+         * and K3_KV_LATENT_BYTES_PER_POS, which this reproduces for K3): a smaller model
+         * was refused by K3's figure. A loop's repeated MLA rows come on top; the full
+         * plan below counts them. */
+        int n_mla_cfg = 0;
+        for (int L = 0; L < c.n_layers; L++) n_mla_cfg += k3_is_mla(&c, L) != 0;
+        const double per_pos = (double)n_mla_cfg
+            * ((double)kv_floats_per_pos(&c, kv_latent) + c.qk_rope) * sizeof(float);
         const double kv_need = (double)(prior + np + gen + 1) * per_pos;
         const double avail   = mem_available_bytes();
         char kb[32], ab[32];
@@ -1732,14 +1902,17 @@ int main(int argc, char **argv)
             fprintf(stderr,
                 "\nREFUSING: the KV cache for %d positions needs %s but only %s is\n"
                 "available. This is a MEMORY limit, not an engine ceiling: MLA caches\n"
-                "expanded k and v in fp32 across 24 layers, so context costs ~2.37 MB per\n"
+                "%s in fp32 across %d layers, so context costs %.3f MB per\n"
                 "position regardless of budget. %s"
-                "Shorten the request, or use full\n"
-                "recompute (drop --incremental), which carries no KV cache at all.\n",
+                "Shorten the request%s.\n",
                 prior + np + gen + 1, kb, ab,
+                kv_latent ? "the compressed latent" : "expanded k and v", n_mla_cfg,
+                per_pos / 1e6,
                 kv_latent ? "" : "Try --kv-latent, which caches the\n"
-                                 "compressed latent instead at 0.055 MB per position "
-                                 "and rebuilds k and v.\n");
+                                 "compressed latent instead (0.055 MB per position on "
+                                 "K3) and rebuilds k and v.\n",
+                np <= K3_MAX_PASS ? ", or use full recompute (drop --incremental),\n"
+                                    "which carries no KV cache at all" : "");
             return 2;
         }
     }
@@ -1874,22 +2047,23 @@ int main(int argc, char **argv)
             + 3.0 * E64 * 4;
         const double w_cache = cache_gb * 1e9;
         const int Tm = prior + np + gen + 1;
+        const int Tr = pass_rows(incremental, prefill_chunk, Tm);   /* rows per pass */
         const int mb = k3_attn_res_stride(&c);
         const int Pp = c.kda_heads * c.kda_head_dim;
         const int state_layers = (ultra && !incremental) ? 1 : NV;
         const double w_state = (double)((size_t)Pp * c.kda_head_dim
                               + (size_t)3 * Pp * (c.conv_k - 1)) * state_layers * 4;
-        size_t scratch = k3_layer_scratch(&c, Tm);
-        if (incremental) {
-            const size_t cached = k3_mla_scratch_cached(&c, Tm, Tm, 1, kv_latent);
-            if (cached > scratch) scratch = cached;
-        }
-        const double w_buf = ((double)Tm * E64 + (double)Tm * mb * E64
+        /* the allocation below, the same call */
+        const size_t scratch = k3_layer_scratch_cached(&c, Tr, Tm, kv_latent);
+        const int adaptive = loop_eps >= 0.0 && loop_a >= 0;
+        const double w_buf = ((double)Tr * E64 + (double)Tr * mb * E64
                               + (double)scratch + (double)c.vocab
                               + (logit_rows > 1 ? (double)logit_rows * c.vocab : 0.0)
                               /* adaptive loop: last span outputs, a pass's compacted rows */
-                              + (loop_eps >= 0.0 && loop_a >= 0
-                                 ? 2.0 * Tm * E64 + (double)Tm * mb * E64 : 0.0)) * 4;
+                              + (adaptive ? 2.0 * Tr * E64 + (double)Tr * mb * E64 : 0.0)) * 4
+                           /* and what it records per absolute position */
+                           + (adaptive ? (double)Tm * (sizeof(int)
+                                         + sizeof(double) * ((size_t)loop_count + 1)) : 0.0);
         /* The KV cache MUST be in this total: it is the only term that grows with
          * context, so a guard that omits it is blind to the one thing it exists to
          * catch. k3_mla_cached stores expanded per-head k and v plus the shared rope
@@ -1949,6 +2123,14 @@ int main(int argc, char **argv)
         if (w_dump > 0.0) {
             human(w_dump, b7, sizeof b7);
             printf("  all-logits dump  %s  (every position of one verify sweep)\n", b7);
+        }
+        if (incremental) {
+            /* what step 0 feeds: the prompt, and on a resume the saved pending token */
+            const int n_in = np + pending;
+            const int passes = (n_in + prefill_chunk - 1) / prefill_chunk;
+            printf("                   (buffers hold %d positions; %d to read in, in %d "
+                   "pass%s of up to %d)\n", Tr, n_in, passes, passes == 1 ? "" : "es",
+                   prefill_chunk);
         }
         printf("  TOTAL            %s\n", b6);
         if (have > 0.0) {
@@ -2070,6 +2252,11 @@ int main(int argc, char **argv)
         printf("resuming from %s: %d prior positions, %d new\n\n", load_state, prior, np);
     }
     const int Tmax = prior + np + gen + 1;
+    /* Rows of h, br, the scratch and the adaptive loop's per-token buffers: one pass's
+     * positions, which under --incremental is the read-in chunk (or a verify sweep), not
+     * the whole context. Only the KV cache and the per-position records span Tmax. */
+    const int Tb = pass_rows(incremental, prefill_chunk, Tmax);
+    w.max_rows = Tb;
     const int E = c.hidden;
     const int maxb = k3_attn_res_stride(&c);
     const int P = c.kda_heads * c.kda_head_dim;
@@ -2083,7 +2270,7 @@ int main(int argc, char **argv)
      * rather than assumed. */
     {
         const size_t need_scratch = (size_t)(maxb + 2) * E;
-        const size_t have_scratch = k3_layer_scratch(&c, Tmax);
+        const size_t have_scratch = k3_layer_scratch(&c, Tb);
         if (have_scratch < need_scratch) {
             fprintf(stderr, "scratch is %zu floats, the attn-res aggregator needs %zu\n",
                     have_scratch, need_scratch);
@@ -2091,16 +2278,17 @@ int main(int argc, char **argv)
         }
     }
 
-    float *h  = (float *)malloc((size_t)Tmax * E * sizeof(float));
-    float *br = (float *)malloc((size_t)Tmax * maxb * E * sizeof(float));
+    float *h  = (float *)malloc((size_t)Tb * E * sizeof(float));
+    float *br = (float *)malloc((size_t)Tb * maxb * E * sizeof(float));
     const int state_layers = (ultra && !incremental) ? 1 : NV;
     float *ks = (float *)malloc(kper * (size_t)state_layers * sizeof(float));
-    size_t sc_need = k3_layer_scratch(&c, Tmax);
-    {   /* the cached MLA path sizes its score buffer by cache capacity, not by T, and
-         * the latent layout needs one such row per head plus a rebuild buffer */
-        const size_t ic = k3_mla_scratch_cached(&c, Tmax, Tmax, 1, kv_latent);
-        if (ic > sc_need) sc_need = ic;
-    }
+    /* The cached MLA path sizes its score buffer by cache capacity, not by T (the latent
+     * layout one row per head, and per query of an --mla-split block, plus a rebuild
+     * buffer), and it gets the region after the layer's own buffers. This was
+     * max(layer scratch, MLA scratch), short by those buffers whenever the MLA term won:
+     * --kv-latent --mla-split 300 over a 300-id prompt wrote past the end on the tiny
+     * model under AddressSanitizer. */
+    const size_t sc_need = k3_layer_scratch_cached(&c, Tb, Tmax, kv_latent);
     float *sc = (float *)malloc(sc_need * sizeof(float));
     float *lg = (float *)malloc((size_t)c.vocab * sizeof(float));
     if (!h || !br || !ks || !sc || !lg) { fprintf(stderr, "buffer allocation failed\n"); return 1; }
@@ -2109,14 +2297,15 @@ int main(int argc, char **argv)
          * compacted rows of a pass, and what every absolute position did (the report) */
         w.loop_pcached = (int *)calloc((size_t)w.loop_rmax + 1, sizeof(int));
         w.loop_sweep_pcached = (int *)calloc((size_t)w.loop_rmax + 1, sizeof(int));
-        w.loop_act     = (int *)calloc((size_t)Tmax, sizeof(int));
-        w.loop_idx     = (int *)calloc((size_t)Tmax, sizeof(int));
-        w.loop_nbt     = (int *)calloc((size_t)Tmax, sizeof(int));
+        /* per row of a pass: Tb; per absolute position (the report): Tmax */
+        w.loop_act     = (int *)calloc((size_t)Tb, sizeof(int));
+        w.loop_idx     = (int *)calloc((size_t)Tb, sizeof(int));
+        w.loop_nbt     = (int *)calloc((size_t)Tb, sizeof(int));
         w.loop_passes  = (int *)calloc((size_t)Tmax, sizeof(int));
         w.loop_d       = (double *)calloc((size_t)Tmax * (w.loop_rmax + 1), sizeof(double));
-        w.loop_hprev   = (float *)malloc((size_t)Tmax * E * sizeof(float));
-        w.loop_hc      = (float *)malloc((size_t)Tmax * E * sizeof(float));
-        w.loop_brc     = (float *)malloc((size_t)Tmax * maxb * E * sizeof(float));
+        w.loop_hprev   = (float *)malloc((size_t)Tb * E * sizeof(float));
+        w.loop_hc      = (float *)malloc((size_t)Tb * E * sizeof(float));
+        w.loop_brc     = (float *)malloc((size_t)Tb * maxb * E * sizeof(float));
         if (!w.loop_pcached || !w.loop_sweep_pcached || !w.loop_act || !w.loop_idx || !w.loop_nbt || !w.loop_passes ||
             !w.loop_d || !w.loop_hprev || !w.loop_hc || !w.loop_brc) {
             fprintf(stderr, "adaptive loop buffer allocation failed\n");
@@ -2277,6 +2466,7 @@ int main(int argc, char **argv)
         dw.mla_slot = w.mla_slot;  /* read-only map, safely shared */
         dw.n_mla = w.n_mla;
         dw.kv_cap = w.kv_cap;
+        dw.max_rows = w.max_rows;     /* it runs in the same h, br and scratch */
         dw.kv_latent = w.kv_latent;   /* one layout for both models, or one stride
                                        * is wrong and the draft reads garbage */
         dw.cached = 0;
@@ -2420,8 +2610,10 @@ int main(int argc, char **argv)
              * from a context one token short: fluent, plausible, and wrong. */
             const int base = w.cached;
             const int nT0 = T - base;
-            frc = forward(&w, &c, &cache, seq + base, nT0, lg, sc, h, br, ks, NULL);
-            if (frc == 0) { w.cached = base + nT0; emit[emitn++] = argmax_(lg, c.vocab); }
+            /* in passes of at most --prefill-chunk positions; w.cached ends at T */
+            frc = prefill(&w, &c, &cache, seq + base, nT0, prefill_chunk, lg, sc, h, br, ks,
+                          "prompt");
+            if (frc == 0) emit[emitn++] = argmax_(lg, c.vocab);
             /* The draft model must absorb the same context, or its first proposals
              * come from a shorter one; one draft sweep, paid once. Saved state does
              * not include the draft's, so a resumed run replays the WHOLE sequence
@@ -2429,10 +2621,10 @@ int main(int argc, char **argv)
              * acceptance does. */
             if (dw.trunk && frc == 0) {
                 const int db = load_state ? 0 : base;
-                if (forward(&dw, &c, &cache, seq + db, base + nT0 - db, dlg, sc, h, br,
-                            dks, NULL) == 0)
-                    dw.cached = base + nT0;
-                else frc = -1;
+                dw.cached = db;
+                if (prefill(&dw, &c, &cache, seq + db, base + nT0 - db, prefill_chunk, dlg,
+                            sc, h, br, dks, "draft") != 0)
+                    frc = -1;
             }
         } else if (incremental) {
             const int base = w.cached;
@@ -2457,9 +2649,9 @@ int main(int argc, char **argv)
                          * draft trails by at most one token whenever it drafts. Should
                          * that change, absorb the backlog unrecorded, never past the
                          * log. */
-                        if (forward(&dw, &c, &cache, seq + dw.cached, dlag, dlg, sc, h, br,
-                                    dks, NULL) != 0) frc = -1;
-                        else { dw.cached = base; dlag = 0; }
+                        if (prefill(&dw, &c, &cache, seq + dw.cached, dlag, prefill_chunk,
+                                    dlg, sc, h, br, dks, NULL) != 0) frc = -1;
+                        else dlag = 0;          /* prefill left dw.cached at base */
                     }
                     if (frc == 0) {
                         dw.log_row0 = 0;
@@ -2742,7 +2934,8 @@ int main(int argc, char **argv)
                 "\"expert_cache_slots\":%d,\"expert_profile_pins\":%d,"
                 "\"trunk_bytes_read\":%llu,\"embedding_bytes_read\":%llu,"
                 "\"lm_head_bytes_read\":%llu,\"ultra_low_memory\":%s,"
-                "\"lm_head_streamed\":%s,\"kv_latent\":%s,\"trunk_ring_slots\":%d,"
+                "\"lm_head_streamed\":%s,\"kv_latent\":%s,\"prefill_chunk\":%d,"
+                "\"prefill_passes\":%ld,\"buffer_rows\":%d,\"trunk_ring_slots\":%d,"
                 "\"trunk_slot_bytes\":%lld,\"trunk_budget_bytes\":%.0f,"
                 "\"model_resident_bytes\":%zu,\"model_stream_buffer_bytes\":%zu,"
                 "\"memory_plan_bytes\":%.0f,\"trunk_rows\":%s,"
@@ -2769,6 +2962,7 @@ int main(int argc, char **argv)
                 (unsigned long long)w.ms.lm_head_bytes_read,
                 w.ultra ? "true" : "false", w.stream_lm_head ? "true" : "false",
                 w.kv_latent ? "true" : "false",
+                incremental ? prefill_chunk : 0, w.prefill_passes, w.max_rows,
                 w.trunk ? w.trunk->nslot : 0,
                 (long long)(w.trunk ? w.trunk->slot_bytes : 0),
                 w.trunk ? trunk_gb * 1e9 : 0.0, w.mb.nbytes, w.ms.bufcap,

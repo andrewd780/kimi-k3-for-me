@@ -81,6 +81,12 @@ jobs:
           K3_TEST_BIN: bin/zstd/k3
           K3_TEST_MUT_BIN: bin/zstd/k3-mut
         run: python3 -m unittest discover -s tests -p test_layer_loop.py -v
+      - name: Chunked reading-in is one pass in every mode, past the old 32K ceiling, mutants caught
+        if: runner.os == 'Linux'
+        env:
+          K3_TEST_BIN: bin/zstd/k3
+          K3_TEST_MUT_BIN: bin/zstd/k3-mut
+        run: python3 -m unittest discover -s tests -p test_prefill_chunk.py -v
       - name: Adaptive loop depth and the --loop preset (torch reference, every mode, mutant)
         if: runner.os == 'Linux'
         env:

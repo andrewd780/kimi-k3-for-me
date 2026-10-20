@@ -1207,6 +1207,18 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
 #else
     const int split_mutant = 0;   /* production builds carry no mutant (the CLI refuses the switch) */
 #endif
+    /* GATE MUTANT (test builds only): K3_PREFILL_MUTANT_RELATIVE makes the latent per-query loop's causal cut use a
+     * query's row in this call instead of its absolute position whenever T > 1, the classic chunked read-in bug: one pass
+     * from position 0 and one-token decode are untouched, a read-in in chunks attends to too little. */
+#ifdef K3_TEST_MUTANTS
+    static int rel_mutant = -1;
+    if (rel_mutant < 0) {
+        const char *m = getenv("K3_PREFILL_MUTANT_RELATIVE");
+        rel_mutant = m != NULL && m[0] != '\0' && strcmp(m, "0") != 0;
+    }
+#else
+    const int rel_mutant = 0;
+#endif
     if (split > k3_mla_split_sized) {
         fprintf(stderr, "k3_mla_cached: --mla-split block of %d rows, but the scratch was sized for %d; the block size must "
                         "not change after sizing\n", split, k3_mla_split_sized);
@@ -1376,7 +1388,7 @@ void k3_mla_cached(float *out, const float *x, const K3MlaW *w, const K3Cfg *c,
             memcpy(tr->acc, acc, (size_t)T * H * vh * sizeof(float));
     }
     for (int t = 0; lat && !split && t < T; t++) {
-        const int p = cached + t;
+        const int p = (rel_mutant && T > 1) ? t : cached + t;
         float *acct = acc + (size_t)t * H * vh;
         {   /* the latent layout, one query token at a time (the split above takes blocks) */
             /* Pass one: rebuild each cached position's KEYS once and score it against
@@ -2279,6 +2291,16 @@ size_t k3_layer_scratch(const K3Cfg *c, int T)
          + (size_t)2 * c->hidden
          + (size_t)k3_attn_res_stride(c) * c->hidden
          + layer_region(c, T);
+}
+
+size_t k3_layer_scratch_cached(const K3Cfg *c, int T, int cap, int kv_latent)
+{
+    /* the layer's own buffers and the dense MLP's [2*dense_inter], i.e. everything
+     * before the sub-block k3_mla_cached is handed */
+    const size_t base = k3_layer_scratch(c, T);
+    const size_t own  = base - layer_region(c, T) + (size_t)2 * c->dense_inter;
+    const size_t mla  = own + k3_mla_scratch_cached(c, T, cap, 1, kv_latent);
+    return mla > base ? mla : base;
 }
 
 /* The incremental form. Everything except MLA already carries its own state:
